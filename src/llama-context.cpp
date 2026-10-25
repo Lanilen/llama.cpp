@@ -569,6 +569,7 @@ llama_context::llama_context(
             mcp.margin    = params.moe_cache_margin;
             mcp.budget    = (size_t) (std::max(0.0f, params.moe_cache_budget_mib)*1024*1024);
             mcp.save      = params.moe_cache_save ? params.moe_cache_save : "";
+            mcp.refill    = params.moe_cache_refill;
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
         }
 
@@ -4050,6 +4051,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_margin            =*/ 0.5f,
         /*.moe_cache_budget_mib        =*/ 10.0f,
         /*.moe_cache_save              =*/ nullptr,
+        /*.moe_cache_refill            =*/ 128,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

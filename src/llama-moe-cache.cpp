@@ -281,6 +281,7 @@ struct llama_moe_cache::impl {
         bool dirty = false;           // the shadows changed since they were uploaded
 
         std::vector<float>    score;  // [n_expert] decayed number of selections
+        std::vector<float>    score_gen; // [n_expert] the same for the tokens generated since the last prompt, until the refill
         std::vector<uint32_t> count;  // [n_expert] selections since the last update, see llama_moe_cache_record
         std::vector<uint8_t>  uploading; // [n_expert] the expert is being uploaded in the background
     };
@@ -320,6 +321,8 @@ struct llama_moe_cache::impl {
     spare_stats * spare_cur = nullptr; // the stats of the running update
     bool rebalance = false;  // large ubatches were processed since the last refresh
     bool warm      = false;  // the resident experts were loaded from a file
+    int64_t refill_tokens = 0; // generated tokens after which the cache is rebalanced from their scores, 0 = never
+    int64_t refill_left   = 0; // generated tokens until that rebalance, 0 = none pending
     std::string save_path;   // the resident experts are written there at exit
     std::vector<pending_upload> pending_uploads;
     std::vector<ggml_backend_t> layer_backends; // [n_layer] backend of the device of each layer
@@ -351,6 +354,8 @@ struct llama_moe_cache::impl {
         if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && !model.hparams.no_alloc) {
             save_path = params.save;
         }
+        refill_tokens = std::max<int64_t>(0, params.refill);
+        refill_left   = refill_tokens; // also for a first prompt too short to count as one
         const size_t size = params.size;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -550,6 +555,7 @@ struct llama_moe_cache::impl {
                     ggml_format_name(l.hit_dev,  "moe_cache.hit_map-%d",  il);
                     l.slot_of.assign(g.ref[0]->ne[2], -1);
                     l.score.assign(g.ref[0]->ne[2], 0.0f);
+                    l.score_gen.assign(g.ref[0]->ne[2], 0.0f);
                     l.count.assign(g.ref[0]->ne[2], 0);
                     l.uploading.assign(g.ref[0]->ne[2], 0);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
@@ -915,15 +921,29 @@ struct llama_moe_cache::impl {
                     l.count[e] = 0;
                 }
                 l.score[e] = l.score[e]*decay + c;
+                if (small && refill_left > 0) {
+                    l.score_gen[e] = l.score_gen[e]*decay + c;
+                }
             }
         }
 
         activate_uploads();
 
-        // large ubatches (the prompt) only update the scores, the first small ubatch after them rebalances the cache without a budget
         if (half_life > 0.0f) {
             if (!small) {
+                // large ubatches (the prompt) only update the scores, the first small ubatch after them rebalances the cache without a budget
+                // then the generated tokens are counted apart, for one more rebalance from them alone
                 rebalance = true;
+                start_refill();
+            } else if (refill_left > 0 && (refill_left -= std::min<int64_t>(refill_left, n_tokens)) == 0) {
+                // the first generated tokens predict the rest of the generation better than the prompt
+                for (layer & l : layers) {
+                    if (l.ig >= 0) {
+                        l.score = l.score_gen;
+                    }
+                }
+                refresh(SIZE_MAX, st);
+                rebalance = false;
             } else {
                 // a resident set from --moe-cache-hot predicts the generation better than the prompt, so it only changes within the budget
                 refresh(rebalance && !warm ? SIZE_MAX : budget*n_tokens, st);
@@ -1037,6 +1057,16 @@ struct llama_moe_cache::impl {
         for (device & d : devices) {
             if (d.upload_bg != nullptr) {
                 submit_bg(d);
+            }
+        }
+    }
+
+    // hot spare mode: count the next generated tokens apart, for one rebalance from their scores
+    void start_refill() {
+        refill_left = refill_tokens;
+        for (layer & l : layers) {
+            if (l.ig >= 0) {
+                std::fill(l.score_gen.begin(), l.score_gen.end(), 0.0f);
             }
         }
     }

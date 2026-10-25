@@ -16,6 +16,7 @@ struct llama_moe_cache_params {
     std::string device; // hot spare mode: cache device, empty = the device of each layer
     std::string hot;    // hot spare mode: file with the resident experts
     std::string save;   // hot spare mode: file the resident experts are written to at exit
+    int64_t refill = 0; // hot spare mode: generated tokens after a prompt for one rebalance from their scores alone, 0 = none
 
     // hot spare mode: refresh of the resident experts between ubatches
     float  half_life = 0.0f; // tokens, 0 = the resident experts never change

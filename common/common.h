@@ -604,6 +604,7 @@ struct common_params {
     float moe_cache_margin     = 0.5f;  // hot spare mode: score margin to replace a resident expert
     float moe_cache_budget_mib = 10.0f; // hot spare mode: MiB uploaded per token
     std::string moe_cache_save;         // hot spare mode: resident experts file written at exit
+    int32_t moe_cache_refill = 128;     // hot spare mode: generated tokens after a prompt for one rebalance from them
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
