@@ -923,9 +923,27 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// GGML_SCHED_TIMING: host time per backend copying the inputs of the splits and computing them, per kind of graph
+// asynchronous backends return from the compute at once, so waiting for them shows in the next copy from them
+#define GGML_SCHED_TIMING_MAX_KINDS 8
+struct ggml_backend_sched_timing {
+    int     n_splits;
+    int     n_nodes;
+    int64_t n_graphs;
+    int64_t t_total_us;
+    int64_t t_copy_us[GGML_SCHED_MAX_BACKENDS];
+    int64_t t_compute_us[GGML_SCHED_MAX_BACKENDS];
+    int64_t n_splits_backend[GGML_SCHED_MAX_BACKENDS];
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+
+    bool timing;
+    int n_timing;
+    struct ggml_backend_sched_timing timings[GGML_SCHED_TIMING_MAX_KINDS];
+    char timing_names[GGML_SCHED_MAX_BACKENDS][64]; // the backends may be freed before the scheduler
 
     int n_backends;
 
@@ -1868,10 +1886,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    struct ggml_backend_sched_timing * tm = NULL;
+    if (sched->timing) {
+        const int n_nodes = sched->graph.n_nodes;
+        for (int i = 0; i < sched->n_timing && tm == NULL; i++) {
+            if (sched->timings[i].n_splits == sched->n_splits && sched->timings[i].n_nodes == n_nodes) {
+                tm = &sched->timings[i];
+            }
+        }
+        if (tm == NULL && sched->n_timing < GGML_SCHED_TIMING_MAX_KINDS) {
+            tm = &sched->timings[sched->n_timing++];
+            tm->n_splits = sched->n_splits;
+            tm->n_nodes  = n_nodes;
+        }
+    }
+    const int64_t t_graph_us = tm ? ggml_time_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t t_copy_us = tm ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1896,13 +1931,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_compute_us = tm ? ggml_time_us() : 0;
+        if (tm) {
+            tm->t_copy_us[split_backend_id] += t_compute_us - t_copy_us;
+            tm->n_splits_backend[split_backend_id]++;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            if (tm) {
+                tm->t_compute_us[split_backend_id] += ggml_time_us() - t_compute_us;
+            }
         } else {
             // similar to ggml_backend_compare_graph_backend
+            const int64_t t_cb_us = tm ? ggml_time_us() : 0;
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
@@ -1933,6 +1978,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+            if (tm) {
+                tm->t_compute_us[split_backend_id] += ggml_time_us() - t_cb_us;
+            }
         }
 
         // record the event of this split
@@ -1941,6 +1989,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (tm) {
+        tm->n_graphs++;
+        tm->t_total_us += ggml_time_us() - t_graph_us;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1961,6 +2014,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+    sched->timing = getenv("GGML_SCHED_TIMING") != NULL;
+    for (int b = 0; b < n_backends; b++) {
+        snprintf(sched->timing_names[b], sizeof(sched->timing_names[b]), "%s", ggml_backend_name(backends[b]));
+    }
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
@@ -2021,6 +2078,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    for (int i = 0; i < sched->n_timing; i++) {
+        const struct ggml_backend_sched_timing * tm = &sched->timings[i];
+        if (tm->n_graphs == 0) {
+            continue;
+        }
+        GGML_LOG_INFO("%s: timing: %lld graphs of %d splits, %d nodes: %.3f ms per graph in compute_splits\n",
+            __func__, (long long) tm->n_graphs, tm->n_splits, tm->n_nodes, tm->t_total_us/1000.0/tm->n_graphs);
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (tm->n_splits_backend[b] == 0) {
+                continue;
+            }
+            GGML_LOG_INFO("%s: timing:   %-10s %6.1f splits, copy inputs %8.3f ms, compute %8.3f ms per graph\n",
+                __func__, sched->timing_names[b], (double) tm->n_splits_backend[b]/tm->n_graphs,
+                tm->t_copy_us[b]/1000.0/tm->n_graphs, tm->t_compute_us[b]/1000.0/tm->n_graphs);
+        }
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
