@@ -403,7 +403,7 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         enum llama_moe_cache_mode moe_cache_mode; // [EXPERIMENTAL]
-        const char * moe_cache_device; // hot spare mode: name of the cache device, nullptr = the first GPU [EXPERIMENTAL]
+        const char * moe_cache_device; // hot spare mode: name of the cache device for all layers, nullptr = the device of each layer [EXPERIMENTAL]
         const char * moe_cache_hot;    // hot spare mode: file with the resident experts, "layer expert" per line, most used first, nullptr = none [EXPERIMENTAL]
 
         // Abort callback

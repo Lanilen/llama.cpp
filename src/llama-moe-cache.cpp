@@ -297,12 +297,12 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // hot spare mode caches all host-resident layers on one device
+        // hot spare mode with a cache device caches all host-resident layers on it, otherwise each layer on its own device
         int32_t spare_id = -1;
-        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && !params.device.empty()) {
             for (size_t id = 0; id < devices.size() && spare_id < 0; ++id) {
                 const char * name = ggml_backend_dev_name(ggml_backend_get_device(devices[id].backend));
-                if (params.device.empty() || params.device == name) {
+                if (params.device == name) {
                     spare_id = (int32_t) id;
                 }
             }
