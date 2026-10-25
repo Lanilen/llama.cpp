@@ -2846,7 +2846,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE_MARGIN"));
     add_opt(common_arg(
         {"--moe-cache-budget"}, "MIB",
-        string_format("hot spare mode: MiB of experts uploaded per token to replace resident ones, empty slots are filled for free (default: %.0f)", (double) params.moe_cache_budget_mib),
+        string_format("hot spare mode: MiB of experts uploaded per token to replace resident ones, not counting empty slots and the rebalance after a prompt (default: %.0f)", (double) params.moe_cache_budget_mib),
         [](common_params & params, const std::string & value) {
             params.moe_cache_budget_mib = std::stof(value);
         }

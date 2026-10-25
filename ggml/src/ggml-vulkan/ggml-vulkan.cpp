@@ -5843,6 +5843,12 @@ vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
         ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
     }
 
+    // the semaphore of the completed background uploads makes their writes visible to the compute
+    if (ctx->bg_waited < ctx->bg_ready) {
+        result->s->wait_semaphores.push_back({ ctx->bg_semaphore.s, ctx->bg_ready });
+        ctx->bg_waited = ctx->bg_ready;
+    }
+
     return result;
 }
 
@@ -13095,6 +13101,15 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
+    if (ctx->bg_initialized) {
+        if (ctx->bg_semaphore.value > 0) {
+            vk::SemaphoreWaitInfo wi{ {}, 1, &ctx->bg_semaphore.s, &ctx->bg_semaphore.value };
+            VK_CHECK(ctx->device->device.waitSemaphores(wi, UINT64_MAX), "bg waitSemaphores", ctx->device);
+        }
+        ctx->bg_ctx.reset();
+        ctx->device->device.destroySemaphore(ctx->bg_semaphore.s);
+        ctx->bg_cmd_pool.destroy(ctx->device->device);
+    }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
     }
@@ -15374,6 +15389,157 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     return vk_backend;
 }
 
+// background uploads: copies from pinned host memory that run on the transfer queue while the backend computes
+// they start when their batch is submitted, the compute waits for a batch only after ggml_backend_vk_upload_bg_done reported it complete
+static bool ggml_vk_bg_init(ggml_backend_vk_context * ctx) {
+    if (ctx->bg_initialized) {
+        return true;
+    }
+    if (ctx->device->single_queue) {
+        return false;
+    }
+    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo ci{};
+    ci.setPNext(&tci);
+    ctx->bg_semaphore.s = ctx->device->device.createSemaphore(ci);
+    ctx->bg_semaphore.value = 0;
+    ctx->bg_cmd_pool.init(ctx->device, ctx->device->transfer_queue.get());
+    ctx->bg_initialized = true;
+    return true;
+}
+
+// records a copy of size bytes from pinned host memory at data to tensor at offset, false if a background upload is not possible
+static bool ggml_backend_vk_upload_bg(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (size == 0 || tensor->buffer == nullptr || tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) || !ggml_vk_bg_init(ctx)) {
+        return false;
+    }
+
+    vk_buffer src;
+    size_t src_offset;
+    ggml_vk_host_get(ctx->device, data, src, src_offset);
+    if (src == nullptr) {
+        return false;
+    }
+
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) tensor->buffer->context;
+    const size_t dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    if (!ctx->bg_ctx) {
+        ctx->bg_ctx = ggml_vk_create_temporary_context(ctx->bg_cmd_pool);
+        ggml_vk_ctx_begin(ctx->device, ctx->bg_ctx);
+    }
+    vk::BufferCopy bc{ src_offset, dst_offset, size };
+    ctx->bg_ctx->s->buffer->buf.copyBuffer(src->buffer, buf_ctx->dev_buffer->buffer, { bc });
+    return true;
+}
+
+// submits the recorded background uploads, returns their ticket (the ticket of the last batch if nothing was recorded)
+static uint64_t ggml_backend_vk_upload_bg_submit(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx->bg_ctx) {
+        return ctx->bg_initialized ? ctx->bg_semaphore.value : 0;
+    }
+    vk_command_buffer * cmd_buf = ctx->bg_ctx->s->buffer;
+    ggml_vk_ctx_end(ctx->bg_ctx);
+    ctx->bg_semaphore.value++;
+    ctx->bg_ctx->seqs.back().back().signal_semaphores.push_back(ctx->bg_semaphore);
+    ggml_vk_submit(ctx->bg_ctx, {});
+    ctx->bg_ctx.reset();
+    ctx->bg_inflight.emplace_back(ctx->bg_semaphore.value, cmd_buf);
+    return ctx->bg_semaphore.value;
+}
+
+// true if the background uploads of the ticket are complete, waits for them if wait is set
+// from then on the compute of the backend sees their data
+static bool ggml_backend_vk_upload_bg_done(ggml_backend_t backend, uint64_t ticket, bool wait) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx->bg_initialized || ticket == 0) {
+        return true;
+    }
+    uint64_t done = ctx->device->device.getSemaphoreCounterValue(ctx->bg_semaphore.s);
+    if (done < ticket && wait) {
+        vk::SemaphoreWaitInfo wi{ {}, 1, &ctx->bg_semaphore.s, &ticket };
+        VK_CHECK(ctx->device->device.waitSemaphores(wi, UINT64_MAX), "bg waitSemaphores", ctx->device);
+        done = ctx->device->device.getSemaphoreCounterValue(ctx->bg_semaphore.s);
+    }
+    while (!ctx->bg_inflight.empty() && ctx->bg_inflight.front().first <= done) {
+        ctx->bg_inflight.front().second->in_use = false;
+        ctx->bg_inflight.front().second->buf.reset();
+        ctx->bg_inflight.erase(ctx->bg_inflight.begin());
+    }
+    if (done < ticket) {
+        return false;
+    }
+    ctx->bg_ready = std::max(ctx->bg_ready, ticket);
+    return true;
+}
+
+// pinned host memory of one device, the host buffer type is pinned for device 0 only when the devices cannot import host memory
+struct ggml_backend_vk_pinned_buffer_type_context {
+    size_t device;
+    std::string name;
+};
+
+static const char * ggml_backend_vk_pinned_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_vk_pinned_buffer_type_context *) buft->context)->name.c_str();
+}
+
+static void ggml_backend_vk_pinned_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_vk_host_free_device(buffer->context);
+}
+
+static ggml_backend_buffer_t ggml_backend_vk_pinned_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    vk_device device = ggml_vk_get_device(((ggml_backend_vk_pinned_buffer_type_context *) buft->context)->device);
+
+    size += 32;  // Behave like the CPU buffer type
+    void * ptr = ggml_vk_host_malloc_device(device, size);
+    if (ptr == nullptr) {
+        GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory\n");
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_vk_pinned_buffer_free_buffer;
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_vk_device_pinned_buffer_type(ggml_backend_dev_t dev) {
+    ggml_vk_instance_init();
+    if (vk_instance.multi_device) {
+        return ggml_backend_vk_host_buffer_type();
+    }
+
+    static std::mutex mutex;
+    static std::map<size_t, std::unique_ptr<ggml_backend_buffer_type>> bufts;
+    static std::map<size_t, std::unique_ptr<ggml_backend_vk_pinned_buffer_type_context>> ctxs;
+
+    const size_t device = ((ggml_backend_vk_device_context *) dev->context)->device;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = bufts.find(device);
+    if (it == bufts.end()) {
+        ctxs[device].reset(new ggml_backend_vk_pinned_buffer_type_context{ device, GGML_VK_NAME + std::to_string(device) + "_Pinned" });
+        ggml_backend_buffer_type_t host = ggml_backend_vk_host_buffer_type();
+        bufts[device].reset(new ggml_backend_buffer_type{
+            /* .iface    = */ {
+                /* .get_name            = */ ggml_backend_vk_pinned_buffer_type_name,
+                /* .alloc_buffer        = */ ggml_backend_vk_pinned_buffer_type_alloc_buffer,
+                /* .alloc_buffer_n      = */ nullptr,
+                /* .get_alignment       = */ host->iface.get_alignment,
+                /* .get_max_size        = */ host->iface.get_max_size,
+                /* .get_alloc_size      = */ host->iface.get_alloc_size,
+                /* .get_alloc_size_n    = */ host->iface.get_alloc_size_n,
+                /* .is_host             = */ host->iface.is_host,
+            },
+            /* .device   = */ dev,
+            /* .context  = */ ctxs[device].get(),
+        });
+        it = bufts.find(device);
+    }
+    return it->second.get();
+}
+
 bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
 }
@@ -16403,11 +16569,29 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_dev_pinned_buffer_type") == 0) {
+        return (void *) ggml_backend_vk_device_pinned_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg") == 0) {
+        return (void *) ggml_backend_vk_upload_bg;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg_submit") == 0) {
+        return (void *) ggml_backend_vk_upload_bg_submit;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg_done") == 0) {
+        return (void *) ggml_backend_vk_upload_bg_done;
+    }
+    return nullptr;
+
+    UNUSED(reg);
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

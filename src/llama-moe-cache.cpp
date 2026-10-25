@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -159,8 +160,11 @@ struct moe_cache_slru {
 
 // hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the count vector of the layer
 static void llama_moe_cache_record(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
-    GGML_UNUSED(ith);
     GGML_UNUSED(nth);
+    // every thread of the CPU backend runs the op, one does the work
+    if (ith != 0) {
+        return;
+    }
     auto & count = *(std::vector<uint32_t> *) userdata;
     int32_t * out = (int32_t *) dst->data;
     for (int64_t i1 = 0; i1 < a->ne[1]; ++i1) {
@@ -226,6 +230,15 @@ struct llama_moe_cache::impl {
         size_t    staging_size = 0;
         size_t    staging_used = 0;
         bool      pending      = false; // uploads were queued since the last synchronization
+
+        // background uploads, if the backend has them (see ggml_backend_upload_bg_t)
+        // the staging memory is used in two halves, a half is reused once its uploads are done
+        ggml_backend_upload_bg_t        upload_bg        = nullptr;
+        ggml_backend_upload_bg_submit_t upload_bg_submit = nullptr;
+        ggml_backend_upload_bg_done_t   upload_bg_done   = nullptr;
+        int      half        = 0;
+        uint64_t half_ticket[2] = { 0, 0 };
+        bool     bg_recorded = false;    // background uploads were recorded since the last submission
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -240,7 +253,16 @@ struct llama_moe_cache::impl {
 
         // hot spare mode
         std::vector<int32_t> key_of_slot; // [n_slots] il*n_expert + expert, -1 if empty
+        std::vector<uint8_t> slot_pending; // [n_slots] the expert of the slot is being uploaded
         int32_t n_resident = 0;
+    };
+
+    // hot spare mode: an expert being uploaded in the background, it becomes resident when its ticket is done
+    struct pending_upload {
+        int32_t  ig;
+        int32_t  key;
+        int32_t  slot;
+        uint64_t ticket; // 0 until its batch is submitted
     };
 
     struct layer {
@@ -259,6 +281,7 @@ struct llama_moe_cache::impl {
 
         std::vector<float>    score;  // [n_expert] decayed number of selections
         std::vector<uint32_t> count;  // [n_expert] selections since the last update, see llama_moe_cache_record
+        std::vector<uint8_t>  uploading; // [n_expert] the expert is being uploaded in the background
     };
 
     // hot spare mode statistics
@@ -269,6 +292,7 @@ struct llama_moe_cache::impl {
         size_t swaps  = 0;
         size_t bytes  = 0;
         int64_t t_us  = 0;
+        int64_t t_copy_us = 0; // of t_us, copying the experts to the staging memory
     };
 
     struct binding {
@@ -292,6 +316,9 @@ struct llama_moe_cache::impl {
     size_t budget;
     spare_stats spare_small; // ubatches that run on the hot spare
     spare_stats spare_large;
+    spare_stats * spare_cur = nullptr; // the stats of the running update
+    bool rebalance = false;  // large ubatches were processed since the last refresh
+    std::vector<pending_upload> pending_uploads;
     std::vector<ggml_backend_t> layer_backends; // [n_layer] backend of the device of each layer
 
     stats stats_small; // up to 8 tokens per ubatch
@@ -451,6 +478,7 @@ struct llama_moe_cache::impl {
             }
             if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
                 g.key_of_slot.assign(g.n_slots, -1);
+                g.slot_pending.assign(g.n_slots, 0);
                 n_tensors[g.id] += 2*g.layers.size();
             } else {
                 g.slru.init(model.layers.size(), n_expert, g.n_slots);
@@ -517,6 +545,7 @@ struct llama_moe_cache::impl {
                     l.slot_of.assign(g.ref[0]->ne[2], -1);
                     l.score.assign(g.ref[0]->ne[2], 0.0f);
                     l.count.assign(g.ref[0]->ne[2], 0);
+                    l.uploading.assign(g.ref[0]->ne[2], 0);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
                     devices[g.id].buf_size += 2*GGML_PAD(ggml_nbytes(l.slot_dev), ggml_backend_buft_get_alignment(devices[g.id].buft));
                 } else {
@@ -627,9 +656,21 @@ struct llama_moe_cache::impl {
                     expert_size_max = std::max(expert_size_max, (size_t) t->nb[2]);
                 }
             }
-            d.staging_size = std::max({ budget, 4*expert_size_max, (size_t) 64*1024*1024 });
+            d.staging_size = 2*std::max({ budget, 4*expert_size_max, (size_t) 64*1024*1024 });
 
-            ggml_backend_buffer_type_t buft_pinned = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(d.backend));
+            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto dev_pinned_buffer_type = (ggml_backend_dev_pinned_buffer_type_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_pinned_buffer_type");
+            d.upload_bg        = (ggml_backend_upload_bg_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg");
+            d.upload_bg_submit = (ggml_backend_upload_bg_submit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_submit");
+            d.upload_bg_done   = (ggml_backend_upload_bg_done_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_done");
+            // LLAMA_MOE_CACHE_BG=0 keeps the uploads on the compute queue, to compare
+            const char * env_bg = getenv("LLAMA_MOE_CACHE_BG");
+            if (!d.upload_bg || !d.upload_bg_submit || !d.upload_bg_done || (env_bg != nullptr && atoi(env_bg) == 0)) {
+                d.upload_bg = nullptr;
+            }
+
+            ggml_backend_buffer_type_t buft_pinned = dev_pinned_buffer_type ? dev_pinned_buffer_type(dev) : ggml_backend_dev_host_buffer_type(dev);
             uint8_t * base = nullptr;
             if (buft_pinned != nullptr) {
                 d.pinned.reset(ggml_backend_buft_alloc_buffer(buft_pinned, maps_size + d.staging_size));
@@ -654,6 +695,10 @@ struct llama_moe_cache::impl {
                 }
             }
             d.staging = base;
+
+            LLAMA_LOG_INFO("%s: %10s hot spare uploads: %s, %s\n", __func__, ggml_backend_name(d.backend),
+                d.pinned ? ggml_backend_buft_name(ggml_backend_buffer_get_type(d.pinned.get())) : "unpinned memory",
+                d.upload_bg ? "in the background" : "on the compute queue");
         }
 
         for (layer & l : layers) {
@@ -692,7 +737,7 @@ struct llama_moe_cache::impl {
                 const int32_t s = g.n_resident++;
                 g.key_of_slot[s] = il*(int32_t) l.slot_of.size() + e;
                 set_resident(l, e, s);
-                upload_expert(g, l, e, s);
+                upload_expert(g, l, e, s, false);
             }
         }
 
@@ -717,21 +762,90 @@ struct llama_moe_cache::impl {
     }
 
     // hot spare mode: copy expert e of layer l to the staging memory and queue its upload to slot s
-    // the device runs its queue in order, so the next ubatch reads the whole expert
-    void upload_expert(const group & g, const layer & l, int32_t e, int32_t s) {
+    // in the background if the device has background uploads and bg is set: then it returns true and the expert becomes resident when its batch is done
+    // otherwise on the compute queue: the device runs it in order, so the next ubatch reads the whole expert
+    bool upload_expert(const group & g, const layer & l, int32_t e, int32_t s, bool bg) {
         device & d = devices[g.id];
+        bg = bg && d.upload_bg != nullptr;
+        const size_t half_size = d.staging_size/2;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const size_t expert_size = l.experts[ip]->nb[2];
+            if (bg) {
+                // a full half is submitted, the other half is reused once its uploads are done
+                if (d.staging_used + expert_size > half_size) {
+                    submit_bg(d);
+                    d.half ^= 1;
+                    d.upload_bg_done(d.backend, d.half_ticket[d.half], true);
+                    d.staging_used = 0;
+                }
+                uint8_t * src = d.staging + d.half*half_size + d.staging_used;
+                copy_to_staging(src, (const uint8_t *) l.experts[ip]->data + e*expert_size, expert_size);
+                if (d.upload_bg(d.backend, g.banks[ip], src, s*expert_size, expert_size)) {
+                    d.staging_used += GGML_PAD(expert_size, 64);
+                    d.bg_recorded = true;
+                    continue;
+                }
+                // the backend cannot upload this one in the background, so none of this device
+                d.upload_bg = nullptr;
+                bg = false;
+                GGML_ASSERT(ip == 0 && "background upload failed after the first tensor of an expert");
+                ggml_backend_synchronize(d.backend);
+                d.staging_used = 0;
+            }
             if (d.staging_used + expert_size > d.staging_size) {
                 ggml_backend_synchronize(d.backend);
                 d.staging_used = 0;
             }
             uint8_t * src = d.staging + d.staging_used;
-            memcpy(src, (const uint8_t *) l.experts[ip]->data + e*expert_size, expert_size);
+            copy_to_staging(src, (const uint8_t *) l.experts[ip]->data + e*expert_size, expert_size);
             ggml_backend_tensor_set_async(d.backend, g.banks[ip], src, s*expert_size, expert_size);
             d.staging_used += GGML_PAD(expert_size, 64);
             d.pending = true;
         }
+        return bg;
+    }
+
+    void copy_to_staging(uint8_t * dst, const uint8_t * src, size_t size) {
+        const int64_t t_start_us = ggml_time_us();
+        memcpy(dst, src, size);
+        if (spare_cur != nullptr) {
+            spare_cur->t_copy_us += ggml_time_us() - t_start_us;
+        }
+    }
+
+    // hot spare mode: submit the recorded background uploads of device d and give their ticket to the uploads that wait for one
+    void submit_bg(device & d) {
+        if (!d.bg_recorded) {
+            return;
+        }
+        const uint64_t ticket = d.upload_bg_submit(d.backend);
+        d.half_ticket[d.half] = ticket;
+        d.bg_recorded = false;
+        for (pending_upload & pu : pending_uploads) {
+            if (pu.ticket == 0 && &devices[groups[pu.ig].id] == &d) {
+                pu.ticket = ticket;
+            }
+        }
+    }
+
+    // hot spare mode: the experts whose background uploads are done become resident
+    void activate_uploads() {
+        size_t n_keep = 0;
+        for (size_t i = 0; i < pending_uploads.size(); ++i) {
+            const pending_upload pu = pending_uploads[i];
+            group & g = groups[pu.ig];
+            device & d = devices[g.id];
+            if (pu.ticket == 0 || !d.upload_bg_done(d.backend, pu.ticket, false)) {
+                pending_uploads[n_keep++] = pu;
+                continue;
+            }
+            const int32_t n_expert = g.ref[0]->ne[2];
+            layer & l = layers[pu.key / n_expert];
+            l.uploading[pu.key % n_expert] = 0;
+            g.slot_pending[pu.slot] = 0;
+            set_resident(l, pu.key % n_expert, pu.slot);
+        }
+        pending_uploads.resize(n_keep);
     }
 
     // hot spare mode: queue the uploads of the changed device maps, after the experts they point to
@@ -761,19 +875,26 @@ struct llama_moe_cache::impl {
         }
         const int64_t t_start_us = ggml_time_us();
 
-        // the uploads of the previous update are done, so the staging memory can be reused
+        // the compute of this ubatch is done, so the slots of the victims can be overwritten
+        // the uploads on the compute queue are done too, so their staging memory can be reused
         for (device & d : devices) {
-            if (d.pending) {
-                ggml_backend_synchronize(d.backend);
-                d.pending = false;
+            if (!d.buf) {
+                continue;
             }
-            d.staging_used = 0;
+            ggml_backend_synchronize(d.backend);
+            if (d.pending) {
+                d.pending = false;
+                if (d.upload_bg == nullptr) {
+                    d.staging_used = 0;
+                }
+            }
         }
 
         // the selections of this ubatch ran on the hot spare if they were resident, for small ubatches
         const bool small = n_tokens <= max_batch;
         spare_stats & st = small ? spare_small : spare_large;
         st.tokens += n_tokens;
+        spare_cur = &st;
 
         const float decay = half_life > 0.0f ? powf(0.5f, (float) n_tokens/half_life) : 1.0f;
         for (layer & l : layers) {
@@ -790,11 +911,22 @@ struct llama_moe_cache::impl {
             }
         }
 
+        activate_uploads();
+
+        // large ubatches (the prompt) only update the scores, the first small ubatch after them rebalances the cache without a budget
         if (half_life > 0.0f) {
-            refresh(budget*n_tokens, st);
+            if (!small) {
+                rebalance = true;
+            } else {
+                refresh(rebalance ? SIZE_MAX : budget*n_tokens, st);
+                rebalance = false;
+            }
         }
 
+        flush_maps();
+
         st.t_us += ggml_time_us() - t_start_us;
+        spare_cur = nullptr;
     }
 
     // hot spare mode: replace the weakest resident experts by stronger ones, empty slots first
@@ -827,12 +959,15 @@ struct llama_moe_cache::impl {
             for (int32_t il : g.layers) {
                 const layer & l = layers[il];
                 for (int32_t e = 0; e < n_expert; ++e) {
-                    if (l.slot_of[e] < 0 && l.score[e] > 0.0f) {
+                    if (l.slot_of[e] < 0 && !l.uploading[e] && l.score[e] > 0.0f) {
                         best.emplace_back(l.score[e], il*n_expert + e);
                     }
                 }
             }
             for (int32_t s = 0; s < g.n_slots; ++s) {
+                if (g.slot_pending[s]) {
+                    continue;
+                }
                 const int32_t key = g.key_of_slot[s];
                 if (key < 0) {
                     n_empty++;
@@ -842,7 +977,7 @@ struct llama_moe_cache::impl {
                 }
             }
 
-            const size_t n = std::min({ best.size(), worst.size(), (size_t) n_empty + budget_bytes/expert_size });
+            const size_t n = std::min({ best.size(), worst.size(), budget_bytes == SIZE_MAX ? worst.size() : (size_t) n_empty + budget_bytes/expert_size });
             if (n == 0) {
                 continue;
             }
@@ -869,7 +1004,7 @@ struct llama_moe_cache::impl {
             }
             const int32_t old_key = g.key_of_slot[sw.slot];
             if (old_key >= 0) {
-                if (spent + expert_size > budget_bytes) {
+                if (budget_bytes != SIZE_MAX && spent + expert_size > budget_bytes) {
                     continue;
                 }
                 spent += expert_size;
@@ -878,14 +1013,24 @@ struct llama_moe_cache::impl {
                 g.n_resident++;
             }
             layer & l = layers[sw.key / n_expert];
+            const int32_t e = sw.key % n_expert;
             g.key_of_slot[sw.slot] = sw.key;
-            set_resident(l, sw.key % n_expert, sw.slot);
-            upload_expert(g, l, sw.key % n_expert, sw.slot);
+            if (upload_expert(g, l, e, sw.slot, true)) {
+                l.uploading[e] = 1;
+                g.slot_pending[sw.slot] = 1;
+                pending_uploads.push_back({ (int32_t) sw.ig, sw.key, sw.slot, 0 });
+            } else {
+                set_resident(l, e, sw.slot);
+            }
             st.swaps++;
             st.bytes += expert_size;
         }
 
-        flush_maps();
+        for (device & d : devices) {
+            if (d.upload_bg != nullptr) {
+                submit_bg(d);
+            }
+        }
     }
 
     bool get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const {
@@ -902,6 +1047,12 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        // the background uploads read the staging memory until they are done
+        for (device & d : devices) {
+            if (d.upload_bg != nullptr) {
+                d.upload_bg_done(d.backend, std::max(d.half_ticket[0], d.half_ticket[1]), true);
+            }
+        }
         log_stats();
     }
 
@@ -1046,9 +1197,10 @@ struct llama_moe_cache::impl {
                 return;
             }
             const size_t n = st.hits + st.misses;
-            LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: %zu tokens,%s %zu swaps, uploaded = %.2f MiB (%.2f MiB/token), update = %.3f ms/token\n",
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: %zu tokens,%s %zu swaps, uploaded = %.2f MiB (%.2f MiB/token), update = %.3f ms/token (copy %.3f, %.2f GB/s)\n",
                 name, st.tokens, hits ? format(" hit rate = %.2f%%,", n > 0 ? 100.0*st.hits/n : 0.0).c_str() : "",
-                st.swaps, st.bytes/1024.0/1024.0, st.bytes/1024.0/1024.0/st.tokens, st.t_us/1000.0/st.tokens);
+                st.swaps, st.bytes/1024.0/1024.0, st.bytes/1024.0/1024.0/st.tokens, st.t_us/1000.0/st.tokens,
+                st.t_copy_us/1000.0/st.tokens, st.t_copy_us > 0 ? st.bytes/1e3/st.t_copy_us : 0.0);
         };
         log_spare("ubatch <= 32", spare_small, true);
         log_spare("ubatch  > 32", spare_large, false);

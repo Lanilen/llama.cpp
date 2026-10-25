@@ -19,7 +19,7 @@ struct llama_moe_cache_params {
     // hot spare mode: refresh of the resident experts between ubatches
     float  half_life = 0.0f; // tokens, 0 = the resident experts never change
     float  margin    = 0.5f; // a new expert replaces a resident one if its decayed score is higher by this much
-    size_t budget    = 0;    // bytes uploaded per token, unlimited for empty slots
+    size_t budget    = 0;    // bytes uploaded per token, unlimited for empty slots and after the prompt
 };
 
 // hot spare mode: per layer maps from the selected experts to the ids of the CPU branch and the slots of the cache branch
