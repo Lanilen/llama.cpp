@@ -1414,6 +1414,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.n_parallel = -1;     // auto by default
     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
+    } else if (ex == LLAMA_EXAMPLE_MOE_TRACE) {
+        params.n_ctx         = 16384;
+        params.n_predict     = 128;
+        params.sampling.temp = 0.0f; // greedy by default
+        params.out_file      = "moe-trace";
     } else if (ex == LLAMA_EXAMPLE_TTS) {
         params.out_file = "output.wav";
         params.sampling.penalty_repeat = 1.05f;
@@ -1920,7 +1925,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.conversation_mode = value ? COMMON_CONVERSATION_MODE_ENABLED : COMMON_CONVERSATION_MODE_DISABLED;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_MOE_TRACE}));
     add_opt(common_arg(
         {"-st", "--single-turn"},
         "run conversation for a single turn only, then exit when done\n"
@@ -3171,7 +3176,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.out_file = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_CVECTOR_GENERATOR, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FINETUNE,
-                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI}));
+                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MOE_TRACE}));
     add_opt(common_arg(
         {"-ofreq", "--output-frequency"}, "N",
         string_format("output the imatrix every N iterations (default: %d)", params.n_out_freq),
