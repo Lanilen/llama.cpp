@@ -197,6 +197,11 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_LRU   = 0, // the selected experts are uploaded to the cache before they run on the device
+        LLAMA_MOE_CACHE_MODE_SPLIT = 1, // the resident experts run on the cache device while the CPU runs the others
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -397,6 +402,9 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        enum llama_moe_cache_mode moe_cache_mode; // [EXPERIMENTAL]
+        const char * moe_cache_device; // split mode: name of the cache device, nullptr = the first GPU [EXPERIMENTAL]
+        const char * moe_cache_hot;    // split mode: file with the resident experts, "layer expert" per line, most used first, nullptr = none [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

@@ -399,11 +399,29 @@ def main():
     ap.add_argument("--no-scored", action="store_true", help="skip the scored refresh sweep")
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
     ap.add_argument("--json", help="also write all results to this file")
+    ap.add_argument("--write-hot", metavar="FILE", help="write the experts of the trace, most used first, for --moe-cache-hot, and exit")
+    ap.add_argument("--hot-rows", choices=["generated", "prompt", "all"], default="generated", help="tokens counted by --write-hot")
     args = ap.parse_args()
 
     tr, meta = load_trace(args.trace)
     n_tok, n_layers, n_used = tr.ids.shape
     n_gen = n_tok - tr.n_prompt
+
+    if args.write_hot:
+        rows = {"generated": slice(tr.n_prompt, n_tok), "prompt": slice(0, tr.n_prompt), "all": slice(0, n_tok)}[args.hot_rows]
+        E = int(tr.n_expert.max())
+        sel = tr.ids[rows]
+        keys = (np.arange(n_layers)[None, :, None] * E + sel)[sel >= 0]
+        freq = np.bincount(keys, minlength=n_layers * E)
+        order = np.argsort(-freq, kind="stable")
+        order = order[freq[order] > 0]
+        with open(args.write_hot, "w") as f:
+            f.write(f"# {meta.get('model_name')}: experts of {args.trace} ({args.hot_rows} tokens), most used first, \"layer expert\" per line\n")
+            for k in order:
+                f.write(f"{meta['moe_layers'][k // E]} {k % E}\n")
+        print(f"wrote {len(order)} experts to {args.write_hot}")
+        return
+
     if n_gen <= 0:
         sys.exit("the trace has no generated tokens")
 

@@ -2801,6 +2801,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-mode"}, "{lru,split}",
+        "MoE cache mode (default: lru)\n"
+        "- lru: the selected experts are uploaded to the cache before they run on the GPU\n"
+        "- split: the resident experts run on the cache device while the CPU runs the others",
+        [](common_params & params, const std::string & value) {
+            if (value == "lru") {
+                params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
+            } else if (value == "split") {
+                params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_SPLIT;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MODE"));
+    add_opt(common_arg(
+        {"--moe-cache-device"}, "NAME",
+        "split mode: device of the MoE cache, one of the devices of -dev (default: the first GPU)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_device = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_DEVICE"));
+    add_opt(common_arg(
+        {"--moe-cache-hot"}, "FNAME",
+        "split mode: file with the resident experts, one \"layer expert\" pair per line, most used first",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_hot = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_HOT"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

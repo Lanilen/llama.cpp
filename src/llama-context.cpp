@@ -369,6 +369,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_mode = params.moe_cache_mode;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -559,7 +560,12 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            llama_moe_cache_params mcp;
+            mcp.size   = cparams.moe_cache_size;
+            mcp.mode   = cparams.moe_cache_mode;
+            mcp.device = params.moe_cache_device ? params.moe_cache_device : "";
+            mcp.hot    = params.moe_cache_hot    ? params.moe_cache_hot    : "";
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
         }
 
         sched_reserve();
@@ -2555,6 +2561,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // the split MoE cache builds the experts of each layer twice, see llm_graph_context::build_moe_ffn
+    if (cparams.moe_cache_size > 0 && cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_SPLIT) {
+        res += 64u * model.hparams.n_layer();
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
@@ -4020,6 +4031,9 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_LRU,
+        /*.moe_cache_device            =*/ nullptr,
+        /*.moe_cache_hot               =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

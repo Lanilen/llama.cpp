@@ -58,6 +58,7 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    enum llama_moe_cache_mode moe_cache_mode;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
