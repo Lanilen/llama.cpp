@@ -694,6 +694,43 @@ struct vk_op_lightning_indexer_push_constants {
 
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
 
+struct vk_op_top_k_mask_push_constants {
+    uint32_t n_kv;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t n_rows;
+    uint32_t m1;
+    uint32_t m2;
+    uint32_t m3;
+    uint32_t n_top;
+    uint32_t n_pick;
+    uint32_t n_blk;
+    uint32_t n_extra;
+    uint32_t has_score;
+    uint32_t m_nb1;
+    uint32_t m_nb2;
+    uint32_t m_nb3;
+    uint32_t d_nb1;
+    uint32_t d_nb2;
+    uint32_t d_nb3;
+    uint32_t k_nb0;
+    uint32_t k_nb1;
+    uint32_t k_nb2;
+    uint32_t k_nb3;
+    uint32_t s_nb0;
+    uint32_t s_nb1;
+    uint32_t s_nb2;
+    uint32_t s_nb3;
+    uint32_t b_nb0;
+    uint32_t b_nb1;
+    uint32_t e_nb0;
+    uint32_t e_nb1;
+    uint32_t e_nb2;
+    uint32_t e_nb3;
+};
+
+static_assert(sizeof(vk_op_top_k_mask_push_constants) <= 128);
+
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;

@@ -1155,6 +1155,9 @@ void process_shaders() {
     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", merge_maps(li_dict, {{"FLOAT16", "1"}}));
     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", li_dict, false);
 
+    string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"A_TYPE", "float"}});
+    string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"A_TYPE", "float16_t"}});
+
     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 
     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));

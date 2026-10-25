@@ -3657,6 +3657,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), device->fp16 ? lightning_indexer_f32_len : lightning_indexer_f32_fp32_len, device->fp16 ? lightning_indexer_f32_data : lightning_indexer_f32_fp32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f32, "top_k_mask_f32", top_k_mask_f32_len, top_k_mask_f32_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {}, 1);
+
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
         const char * gdn_names[][2] = {
@@ -9256,6 +9259,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_lightning_indexer_f32[src1->type];
         }
         return nullptr;
+    case GGML_OP_TOP_K_MASK:
+        if (dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_top_k_mask_f32;
+        }
+        if (dst->type == GGML_TYPE_F16) {
+            return ctx->device->pipeline_top_k_mask_f16;
+        }
+        return nullptr;
     case GGML_OP_GATED_DELTA_NET:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
@@ -10326,6 +10337,61 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, m), ggml_vk_tensor_subbuffer(ctx, dst)},
         pc, {n_tiles_kv, n_tiles_t, n_streams});
+}
+
+void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * mask   = dst->src[0];
+    const ggml_tensor * top_k  = dst->src[1];
+    const ggml_tensor * score  = dst->src[2];
+    const ggml_tensor * blocks = dst->src[3];
+    const ggml_tensor * extra  = dst->src[4];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, mask, top_k, score, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_rows = (uint32_t)ggml_nrows(dst);
+
+    // strides are passed in elements, the strides of the missing inputs are unused
+    const size_t ts = ggml_type_size(dst->type);
+    const size_t si = sizeof(int32_t);
+    const size_t sf = sizeof(float);
+
+    const vk_op_top_k_mask_push_constants pc = {
+        (uint32_t)mask->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], n_rows,
+        (uint32_t)mask->ne[1], (uint32_t)mask->ne[2], (uint32_t)mask->ne[3],
+        (uint32_t)top_k->ne[0],
+        (uint32_t)(blocks ? blocks->ne[1] : score ? score->ne[0] : mask->ne[0]),
+        (uint32_t)(blocks ? blocks->ne[0] : 0),
+        (uint32_t)(extra ? extra->ne[0] : 0),
+        score ? 1u : 0u,
+        (uint32_t)(mask->nb[1] / ts), (uint32_t)(mask->nb[2] / ts), (uint32_t)(mask->nb[3] / ts),
+        (uint32_t)(dst->nb[1] / ts),  (uint32_t)(dst->nb[2] / ts),  (uint32_t)(dst->nb[3] / ts),
+        (uint32_t)(top_k->nb[0] / si), (uint32_t)(top_k->nb[1] / si), (uint32_t)(top_k->nb[2] / si), (uint32_t)(top_k->nb[3] / si),
+        score  ? (uint32_t)(score->nb[0] / sf)  : 0, score ? (uint32_t)(score->nb[1] / sf) : 0, score ? (uint32_t)(score->nb[2] / sf) : 0, score ? (uint32_t)(score->nb[3] / sf) : 0,
+        blocks ? (uint32_t)(blocks->nb[0] / si) : 0, blocks ? (uint32_t)(blocks->nb[1] / si) : 0,
+        extra  ? (uint32_t)(extra->nb[0] / si)  : 0, extra ? (uint32_t)(extra->nb[1] / si) : 0, extra ? (uint32_t)(extra->nb[2] / si) : 0, extra ? (uint32_t)(extra->nb[3] / si) : 0,
+    };
+
+    std::array<uint32_t, 3> elements;
+    if (n_rows > 262144) {
+        elements = { 512, 512, CEIL_DIV(n_rows, 262144) };
+    } else if (n_rows > 512) {
+        elements = { 512, CEIL_DIV(n_rows, 512), 1 };
+    } else {
+        elements = { n_rows, 1, 1 };
+    }
+
+    // the shader always declares 6 bindings, bind top_k in place of the missing inputs
+    vk_subbuffer top_k_buf = ggml_vk_tensor_subbuffer(ctx, top_k);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, mask), top_k_buf,
+         score  ? ggml_vk_tensor_subbuffer(ctx, score)  : top_k_buf,
+         blocks ? ggml_vk_tensor_subbuffer(ctx, blocks) : top_k_buf,
+         extra  ? ggml_vk_tensor_subbuffer(ctx, extra)  : top_k_buf,
+         ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, elements);
 }
 
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -12832,6 +12898,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_LIGHTNING_INDEXER:
         ggml_vk_lightning_indexer(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_TOP_K_MASK:
+        ggml_vk_top_k_mask(ctx, compute_ctx, node);
 
         break;
 
@@ -16034,6 +16105,29 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                     // the strides get scaled down from bytes, so the division must be exact
                     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                        if (t->nb[i] % ggml_type_size(t->type) != 0) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+        case GGML_OP_TOP_K_MASK:
+            {
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+                    return false;
+                }
+
+                // the shader indexes the buffers by element stride, and is dispatched without allow_misalign
+                const ggml_tensor * tensors[] = {op, op->src[0], op->src[1], op->src[2], op->src[3], op->src[4]};
+                for (const ggml_tensor * t : tensors) {
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    if ((vk_tensor_offset(t) + t->view_offs) % device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+                        return false;
+                    }
+                    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
                         if (t->nb[i] % ggml_type_size(t->type) != 0) {
                             return false;
                         }

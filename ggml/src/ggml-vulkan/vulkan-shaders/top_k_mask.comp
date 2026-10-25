@@ -1,0 +1,104 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer MBuf { A_TYPE mask[]; };
+layout(binding = 1) readonly buffer TBuf { int top_k[]; };
+layout(binding = 2) readonly buffer SBuf { float score[]; };
+layout(binding = 3) readonly buffer BBuf { int blocks[]; };
+layout(binding = 4) readonly buffer EBuf { int extra[]; };
+layout(binding = 5) writeonly buffer DBuf { A_TYPE dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_kv;
+    uint ne1;
+    uint ne2;
+    uint n_rows;
+    uint m1;
+    uint m2;
+    uint m3;
+    uint n_top;
+    uint n_pick;
+    uint n_blk;
+    uint n_extra;
+    uint has_score;
+    uint m_nb1;
+    uint m_nb2;
+    uint m_nb3;
+    uint d_nb1;
+    uint d_nb2;
+    uint d_nb3;
+    uint k_nb0;
+    uint k_nb1;
+    uint k_nb2;
+    uint k_nb3;
+    uint s_nb0;
+    uint s_nb1;
+    uint s_nb2;
+    uint s_nb3;
+    uint b_nb0;
+    uint b_nb1;
+    uint e_nb0;
+    uint e_nb1;
+    uint e_nb2;
+    uint e_nb3;
+};
+
+void keep(const uint d_row, const uint m_row, const int c) {
+    if (c >= 0 && c < int(n_kv)) {
+        dst[d_row + c] = mask[m_row + c];
+    }
+}
+
+// one workgroup per row: fill the row with -inf, then copy the mask cells of the live picks and the extra cells
+void main() {
+    const uint ir = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (ir >= n_rows) {
+        return;
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i1 = ir % ne1;
+    const uint i2 = (ir / ne1) % ne2;
+    const uint i3 = ir / (ne1 * ne2);
+
+    const uint m_row = (i1 % m1) * m_nb1 + (i2 % m2) * m_nb2 + (i3 % m3) * m_nb3;
+    const uint d_row = i1 * d_nb1 + i2 * d_nb2 + i3 * d_nb3;
+
+    const float ninf = uintBitsToFloat(0xFF800000u);
+
+    for (uint c = tid; c < n_kv; c += WG_SIZE) {
+        dst[d_row + c] = A_TYPE(ninf);
+    }
+
+    // the -inf fill must land before the copies below, which can write the same cells
+    memoryBarrierBuffer();
+    barrier();
+
+    // one invocation per pick or extra cell, cells kept twice get the same value
+    for (uint i = tid; i < n_top + n_extra; i += WG_SIZE) {
+        if (i >= n_top) {
+            keep(d_row, m_row, extra[(i - n_top) * e_nb0 + i1 * e_nb1 + i2 * e_nb2 + i3 * e_nb3]);
+            continue;
+        }
+
+        const int p = top_k[i * k_nb0 + i1 * k_nb1 + i2 * k_nb2 + i3 * k_nb3];
+        if (p < 0 || p >= int(n_pick)) {
+            continue;
+        }
+        if (has_score != 0 && !(score[p * s_nb0 + i1 * s_nb1 + i2 * s_nb2 + i3 * s_nb3] > ninf)) {
+            continue;
+        }
+        if (n_blk == 0) {
+            keep(d_row, m_row, p);
+            continue;
+        }
+        for (uint k = 0; k < n_blk; ++k) {
+            keep(d_row, m_row, blocks[k * b_nb0 + p * b_nb1]);
+        }
+    }
+}
