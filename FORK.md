@@ -30,7 +30,17 @@ Speed, Qwen3.8-Flash-Next UD-IQ4_XS on one RX 480 with experts partly on the CPU
 | + indexer patch | 50.91 | 9.78 | 98 (inferred) |
 | + top-k mask patch | 51.87 | 9.87 | 98 |
 
-Generation is about 6% faster. The remaining splits all come from the token embedding lookup and the experts placed on the CPU, so more speed in this setup will come from expert placement, not from these ops. Prompt processing is unchanged within noise.
+At an empty context, generation is about 6% faster and prompt processing is unchanged within noise. The remaining splits all come from the token embedding lookup and the experts placed on the CPU.
+
+The gain grows with context, because upstream runs the indexer on the CPU over every cached key. Generation at increasing context depth (`llama-bench -d`), same settings, separate run from the table above:
+
+| Context depth | upstream tg32 (t/s) | patched tg32 (t/s) | Speedup |
+|---|---|---|---|
+| 0 | 9.05 ± 0.15 | 9.79 ± 0.04 | +8% |
+| 8192 | 8.49 ± 0.14 | 9.50 ± 0.06 | +12% |
+| 16384 | 7.87 ± 0.07 | 9.35 ± 0.01 | +19% |
+
+From 0 to 16384 tokens of context, upstream loses 13% of its generation speed; the patched build loses 4.5%.
 
 ## Build
 
