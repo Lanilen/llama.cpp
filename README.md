@@ -1,5 +1,7 @@
 # llama.cpp
 
+> **Fork note:** this fork adds Vulkan support for sparse-attention ops on GPUs without fp16 (e.g. AMD RX 480). See [FORK.md](FORK.md) for what changed, results and how it was made.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
