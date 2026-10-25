@@ -1414,6 +1414,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.n_parallel = -1;     // auto by default
     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
+    } else if (ex == LLAMA_EXAMPLE_MOE_TRACE) {
+        params.n_ctx         = 16384;
+        params.n_predict     = 128;
+        params.sampling.temp = 0.0f; // greedy by default
+        params.out_file      = "moe-trace";
     } else if (ex == LLAMA_EXAMPLE_TTS) {
         params.out_file = "output.wav";
         params.sampling.penalty_repeat = 1.05f;
@@ -1920,7 +1925,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.conversation_mode = value ? COMMON_CONVERSATION_MODE_ENABLED : COMMON_CONVERSATION_MODE_DISABLED;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_MOE_TRACE}));
     add_opt(common_arg(
         {"-st", "--single-turn"},
         "run conversation for a single turn only, then exit when done\n"
@@ -2796,6 +2801,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-mode"}, "{lru,split}",
+        "MoE cache mode (default: lru)\n"
+        "- lru: the selected experts are uploaded to the cache before they run on the GPU\n"
+        "- split: the resident experts run on the cache device while the CPU runs the others",
+        [](common_params & params, const std::string & value) {
+            if (value == "lru") {
+                params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
+            } else if (value == "split") {
+                params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_SPLIT;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MODE"));
+    add_opt(common_arg(
+        {"--moe-cache-device"}, "NAME",
+        "split mode: device of the MoE cache, one of the devices of -dev (default: the first GPU)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_device = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_DEVICE"));
+    add_opt(common_arg(
+        {"--moe-cache-hot"}, "FNAME",
+        "split mode: file with the resident experts, one \"layer expert\" pair per line, most used first",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_hot = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_HOT"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
@@ -3171,7 +3205,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.out_file = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_CVECTOR_GENERATOR, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FINETUNE,
-                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI}));
+                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MOE_TRACE}));
     add_opt(common_arg(
         {"-ofreq", "--output-frequency"}, "N",
         string_format("output the imatrix every N iterations (default: %d)", params.n_out_freq),

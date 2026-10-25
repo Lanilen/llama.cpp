@@ -111,6 +111,7 @@ enum llama_example {
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
     LLAMA_EXAMPLE_TOKENIZE,
+    LLAMA_EXAMPLE_MOE_TRACE,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -596,6 +597,9 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
+    std::string moe_cache_device; // split mode: cache device name
+    std::string moe_cache_hot;    // split mode: resident experts file
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
