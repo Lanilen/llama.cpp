@@ -13,13 +13,13 @@ struct llama_model;
 struct llama_moe_cache_params {
     size_t size = 0;
     llama_moe_cache_mode mode = LLAMA_MOE_CACHE_MODE_LRU;
-    std::string device; // split mode: cache device, empty = the first GPU
-    std::string hot;    // split mode: file with the resident experts
+    std::string device; // hot spare mode: cache device, empty = the first GPU
+    std::string hot;    // hot spare mode: file with the resident experts
 };
 
-// split mode: per layer maps from the selected experts to the ids of the CPU branch and the slots of the cache branch
+// hot spare mode: per layer maps from the selected experts to the ids of the CPU branch and the slots of the cache branch
 // -1 skips the expert in that branch (see ggml_mul_mat_id)
-struct llama_moe_cache_split_maps {
+struct llama_moe_cache_hot_spare_maps {
     ggml_tensor * miss = nullptr; // I32 [1, n_expert] in host memory: e if expert e is not resident, else -1
     ggml_tensor * slot = nullptr; // I32 [1, n_expert] on the cache device: the slot of e if it is resident, else -1
     ggml_tensor * hit  = nullptr; // I32 [1, n_expert] on the cache device: e if it is resident, else -1
@@ -27,12 +27,12 @@ struct llama_moe_cache_split_maps {
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // lru mode: each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
-// split mode: one device keeps a set of resident experts, they run there while the CPU runs the other selected experts
+// hot spare mode: one device keeps a set of resident experts, they run there while the CPU runs the other selected experts
 class llama_moe_cache {
 public:
     // backends are all the backends of the context
     // lru mode: each GPU gets its own cache of the given size for the layers assigned to it
-    // split mode: the cache device gets the whole size for all host-resident layers
+    // hot spare mode: the cache device gets the whole size for all host-resident layers
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_params & params);
     ~llama_moe_cache();
 
@@ -42,8 +42,8 @@ public:
     // the backend of the device layer il is assigned to
     ggml_backend_t layer_backend(int32_t il) const;
 
-    // split mode: the maps of layer il, if its experts can be split for n_tokens tokens, false otherwise
-    bool get_split_maps(int32_t il, int64_t n_tokens, llama_moe_cache_split_maps & maps) const;
+    // hot spare mode: the maps of layer il, if its experts can run on the hot spare for n_tokens tokens, false otherwise
+    bool get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;

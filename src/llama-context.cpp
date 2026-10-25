@@ -2561,8 +2561,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
-    // the split MoE cache builds the experts of each layer twice, see llm_graph_context::build_moe_ffn
-    if (cparams.moe_cache_size > 0 && cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_SPLIT) {
+    // the hot spare MoE cache builds the experts of each layer twice, see llm_graph_context::build_moe_ffn
+    if (cparams.moe_cache_size > 0 && cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
         res += 64u * model.hparams.n_layer();
     }
 

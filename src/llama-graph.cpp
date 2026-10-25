@@ -2590,10 +2590,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return moe_out;
     };
 
-    // split mode: the resident experts run on the cache device while the CPU runs the others, the two sums are added
-    llama_moe_cache_split_maps maps;
+    // hot spare mode: the resident experts run on the cache device while the CPU runs the others, the two sums are added
+    llama_moe_cache_hot_spare_maps maps;
     ggml_tensor * exps[] = { up_exps, gate_exps, down_exps, gate_up_exps };
-    if (moe_cache != nullptr && moe_cache->get_split_maps(il, n_tokens, maps) &&
+    if (moe_cache != nullptr && moe_cache->get_hot_spare_maps(il, n_tokens, maps) &&
             std::all_of(std::begin(exps), std::end(exps), [&](ggml_tensor * w) { return w == nullptr || moe_cache->get_experts(w) != nullptr; })) {
         ggml_backend_t backend_cache = moe_cache->backend(il);
 

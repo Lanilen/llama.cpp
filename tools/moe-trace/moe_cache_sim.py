@@ -2,7 +2,7 @@
 """Replay a llama-moe-trace routing trace against MoE expert cache policies.
 
 For each policy and cache size it reports the hit rate (generated and prompt tokens), the MiB uploaded per
-generated token and a projected time per generated token for a "split" cache, where the resident experts run
+generated token and a projected time per generated token for a "hot spare" cache, where the resident experts run
 on a GPU in parallel with the CPU running the others.
 """
 

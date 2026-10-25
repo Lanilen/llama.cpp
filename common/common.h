@@ -598,8 +598,8 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
-    std::string moe_cache_device; // split mode: cache device name
-    std::string moe_cache_hot;    // split mode: resident experts file
+    std::string moe_cache_device; // hot spare mode: cache device name
+    std::string moe_cache_hot;    // hot spare mode: resident experts file
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
