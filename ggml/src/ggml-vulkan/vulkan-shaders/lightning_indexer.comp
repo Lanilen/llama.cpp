@@ -2,7 +2,13 @@
 
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
+
+#ifdef FLOAT16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define TILE_TYPE f16vec4
+#else
+#define TILE_TYPE vec4
+#endif
 
 #define BINDING_IDX_K 0u
 
@@ -53,8 +59,8 @@ layout(push_constant) uniform PushConstants {
 };
 
 // the row padding keeps the keys of consecutive invocations in distinct banks
-shared f16vec4 k_tile[BK][HEAD_SIZE / 4 + 1];
-shared f16vec4 q_tile[BT][HEAD_SIZE / 4];
+shared TILE_TYPE k_tile[BK][HEAD_SIZE / 4 + 1];
+shared TILE_TYPE q_tile[BT][HEAD_SIZE / 4];
 shared float   w_tile[BT];
 
 void main() {
@@ -82,7 +88,7 @@ void main() {
             const uint e = k_offset / k_elem_bytes + c4 * 4;
 
             if (FaTypeK == GGML_TYPE_F16) {
-                v = vec4(k_f16[e], k_f16[e + 1], k_f16[e + 2], k_f16[e + 3]);
+                v = vec4(float(k_f16[e]), float(k_f16[e + 1]), float(k_f16[e + 2]), float(k_f16[e + 3]));
             } else if (FaTypeK == GGML_TYPE_F32) {
                 v = vec4(k_f32[e], k_f32[e + 1], k_f32[e + 2], k_f32[e + 3]);
             } else if (FaTypeK == GGML_TYPE_BF16) {
@@ -92,7 +98,7 @@ void main() {
             }
         }
 
-        k_tile[r][c4] = f16vec4(v);
+        k_tile[r][c4] = TILE_TYPE(v);
     }
 
     const uint kl = tid % BK;
@@ -117,7 +123,7 @@ void main() {
                 const uint q_base = h * q_nb1 + t * q_nb2 + s * q_nb3 + c4 * 4;
                 v = vec4(q[q_base], q[q_base + 1], q[q_base + 2], q[q_base + 3]);
             }
-            q_tile[r][c4] = f16vec4(v);
+            q_tile[r][c4] = TILE_TYPE(v);
         }
 
         if (tid < BT) {
@@ -133,9 +139,9 @@ void main() {
         }
 
         [[unroll]] for (uint c4 = 0; c4 < HEAD_SIZE / 4; ++c4) {
-            const f16vec4 kv = k_tile[kl][c4];
+            const TILE_TYPE kv = k_tile[kl][c4];
             [[unroll]] for (uint j = 0; j < TPI; ++j) {
-                const f16vec4 qv = q_tile[tl + j * TS][c4];
+                const TILE_TYPE qv = q_tile[tl + j * TS][c4];
                 qk[j] += float(dot(kv, qv));
             }
         }

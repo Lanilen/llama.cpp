@@ -3654,7 +3654,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (ggml_type k_type : lightning_indexer_k_types) {
         const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
-        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), device->fp16 ? lightning_indexer_f32_len : lightning_indexer_f32_fp32_len, device->fp16 ? lightning_indexer_f32_data : lightning_indexer_f32_fp32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
     }
 
     {
@@ -16007,13 +16007,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 // the q/w/m types and the shape relationships between q, k, w, m and dst
                 // are already asserted in ggml_lightning_indexer()
-                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
+                if (!ggml_vk_lightning_indexer_k_type_supported(k->type)) {
                     return false;
                 }
 
                 // the shader block size is hardcoded to head size 128
                 if (q->ne[0] != 128) {
                     return false;
+                }
+
+                // without fp16 the k/q tiles are vec4, see lightning_indexer.comp
+                if (!device->fp16) {
+                    const size_t BK = 64, BT = 8, D = 128;
+                    const size_t shmem_size = (BK * (D / 4 + 1) + BT * D / 4) * 4 * sizeof(float) + BT * sizeof(float) + 16 * sizeof(float);
+                    if (shmem_size > device->properties.limits.maxComputeSharedMemorySize) {
+                        return false;
+                    }
                 }
 
                 // the shader indexes the buffers by element stride, and is dispatched

@@ -1152,7 +1152,8 @@ void process_shaders() {
     // Compile IQ4_NL support in so its shared LUT is available when K uses it.
     // K quant type is selected at runtime via the FaTypeK spec constant.
     std::map<std::string, std::string> li_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}};
-    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", li_dict);
+    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", merge_maps(li_dict, {{"FLOAT16", "1"}}));
+    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", li_dict, false);
 
     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 
