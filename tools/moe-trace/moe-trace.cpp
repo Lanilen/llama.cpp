@@ -143,12 +143,15 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // LLAMA_MOE_TRACE_OFF=1 runs the same generation without observing the graph, to check that tracing does not change it
+    // LLAMA_MOE_TRACE_OFF=1 runs the same generation without observing the graph, to check that tracing does not change it and to time it
     moe_trace_data data;
     data.enabled = getenv("LLAMA_MOE_TRACE_OFF") == nullptr;
 
-    params.cb_eval = moe_trace_cb_eval;
-    params.cb_eval_user_data = &data;
+    // without tracing the callback is not set: with one, the scheduler waits for each split to finish
+    if (data.enabled) {
+        params.cb_eval = moe_trace_cb_eval;
+        params.cb_eval_user_data = &data;
+    }
     params.warmup = false;
 
     auto llama_init = common_init_from_params(params);
