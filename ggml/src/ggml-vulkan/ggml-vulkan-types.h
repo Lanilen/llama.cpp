@@ -1259,6 +1259,11 @@ struct ggml_backend_vk_context {
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
 
+    // GGML_VK_HOST_TIMING: host time of graph_compute by phase
+    struct {
+        int64_t calls = 0, nodes = 0, total_us = 0, setup_us = 0, fusion_us = 0, build_us = 0, submit_us = 0;
+    } host_timing;
+
     // background uploads on the transfer queue, see ggml_backend_vk_upload_bg
     bool bg_initialized = false;
     vk_command_pool bg_cmd_pool;

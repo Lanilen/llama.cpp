@@ -899,6 +899,9 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
     return &p.cmd_buffers[p.cmd_buffers.size()-1];
 }
 
+static bool vk_host_timing_enabled = getenv("GGML_VK_HOST_TIMING") != nullptr;
+static thread_local int64_t vk_host_timing_submit_us = 0;
+
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (ctx->seqs.empty()) {
         if (fence) {
@@ -971,7 +974,11 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    const int64_t t_submit_us = vk_host_timing_enabled ? ggml_time_us() : 0;
     ctx->p->q->handle->submit(submit_infos, fence);
+    if (vk_host_timing_enabled) {
+        vk_host_timing_submit_us += ggml_time_us() - t_submit_us;
+    }
 
     ctx->seqs.clear();
 }
@@ -13375,6 +13382,14 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
+    if (vk_host_timing_enabled && ctx->host_timing.calls > 0) {
+        const auto & ht = ctx->host_timing;
+        const double c = (double) ht.calls;
+        GGML_LOG_INFO("%s: host timing: %lld graph_compute calls, %.1f nodes per call, per call: total %.3f ms = setup %.3f + fusion checks %.3f + recording %.3f (of which queue submits %.3f) + tail %.3f; %.2f us per node\n",
+            ctx->name.c_str(), (long long) ht.calls, ht.nodes/c, ht.total_us/1000.0/c, ht.setup_us/1000.0/c, ht.fusion_us/1000.0/c, ht.build_us/1000.0/c,
+            ht.submit_us/1000.0/c, (ht.total_us - ht.setup_us - ht.fusion_us - ht.build_us)/1000.0/c, (double) ht.total_us/std::max<int64_t>(ht.nodes, 1));
+    }
+
     ggml_vk_cleanup(ctx);
 
     delete ctx;
@@ -14402,6 +14417,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    const int64_t t_start_us = vk_host_timing_enabled ? ggml_time_us() : 0;
+    const int64_t submit_start_us = vk_host_timing_submit_us;
+    int64_t t_node_us = 0;
+
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
     ctx->device->diag_prev_end = -1;
@@ -14525,6 +14544,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         submit_count++;
     };
+
+    if (vk_host_timing_enabled) {
+        t_node_us = ggml_time_us();
+        ctx->host_timing.setup_us += t_node_us - t_start_us;
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
@@ -14813,7 +14837,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        int64_t t_build_us = 0;
+        if (vk_host_timing_enabled) {
+            t_build_us = ggml_time_us();
+            ctx->host_timing.fusion_us += t_build_us - t_node_us;
+        }
+
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+
+        if (vk_host_timing_enabled) {
+            t_node_us = ggml_time_us();
+            ctx->host_timing.build_us += t_node_us - t_build_us;
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -14895,6 +14930,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
+    }
+
+    if (vk_host_timing_enabled) {
+        ctx->host_timing.calls++;
+        ctx->host_timing.nodes += cgraph->n_nodes;
+        ctx->host_timing.total_us  += ggml_time_us() - t_start_us;
+        ctx->host_timing.submit_us += vk_host_timing_submit_us - submit_start_us;
     }
 
     return GGML_STATUS_SUCCESS;
