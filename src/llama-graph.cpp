@@ -2365,7 +2365,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // the experts selected by ids_b run where their weights are, or in the MoE cache at slots_b
-    // an id of -1 skips the expert, ids_s are the selected experts for the per-expert scales
+    // an id of -1 skips the expert and zeroes its output, ids_s are the selected experts for the per-expert scales
+    // returns the output of each selected expert, [n_embd, n_expert_used, n_tokens]
     auto build_experts = [&](ggml_tensor * x, ggml_tensor * ids_b, ggml_tensor * slots_b, ggml_tensor * ids_s) -> ggml_tensor * {
         x = ggml_reshape_3d(ctx0, x, n_embd, 1, n_tokens);
 
@@ -2544,6 +2545,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(experts, "ffn_moe_down_biased", il);
         }
 
+        return experts;
+    };
+
+    // weight the expert outputs and sum them
+    auto aggregate_experts = [&](ggml_tensor * experts) -> ggml_tensor * {
         // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
         if (post_exp_norm) {
             experts = ggml_mul(ctx0, experts, post_exp_norm);
@@ -2590,7 +2596,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return moe_out;
     };
 
-    // hot spare mode: the resident experts run on the cache device while the CPU runs the others, the two sums are added
+    // hot spare mode: the resident experts run on the cache device while the CPU runs the others, their outputs are added
     llama_moe_cache_hot_spare_maps maps;
     ggml_tensor * exps[] = { up_exps, gate_exps, down_exps, gate_up_exps };
     if (moe_cache != nullptr && moe_cache->get_hot_spare_maps(il, n_tokens, maps) &&
@@ -2613,8 +2619,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             slots_c = ggml_reshape_2d(ctx0, slots_c, selected_experts->ne[0], selected_experts->ne[1]);
             ids_c   = ggml_reshape_2d(ctx0, ids_c,   selected_experts->ne[0], selected_experts->ne[1]);
 
-            ggml_tensor * moe_c = build_experts(cur, ids_c, slots_c, selected_experts);
-            cb(moe_c, "ffn_moe_out_cache", il);
+            ggml_tensor * experts_c = build_experts(cur, ids_c, slots_c, selected_experts);
+            cb(experts_c, "ffn_moe_down_cache", il);
 
             // every op of the cache branch runs on the cache device, otherwise the scheduler may move the activations between devices
             for (ggml_tensor * t = first_c; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
@@ -2622,20 +2628,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     ggml_backend_sched_set_tensor_backend(sched, t, backend_cache);
                 }
             }
-            ggml_build_forward_expand(gf, moe_c);
+            ggml_build_forward_expand(gf, experts_c);
 
             ggml_tensor * ids_h = ggml_get_rows(ctx0, maps.miss, ids);
             ggml_backend_sched_set_tensor_backend(sched, ids_h, backend_cpu);
             cb(ids_h, "ffn_moe_misses", il);
             ids_h = ggml_reshape_2d(ctx0, ids_h, selected_experts->ne[0], selected_experts->ne[1]);
 
-            ggml_tensor * moe_h = build_experts(cur, ids_h, nullptr, selected_experts);
-            cb(moe_h, "ffn_moe_out_host", il);
+            ggml_tensor * experts_h = build_experts(cur, ids_h, nullptr, selected_experts);
+            cb(experts_h, "ffn_moe_down_host", il);
 
-            ggml_tensor * moe_out = ggml_add(ctx0, moe_c, moe_h);
+            // each expert output comes from one branch and is zero in the other, so the sum is exact
+            ggml_tensor * experts = ggml_add(ctx0, experts_c, experts_h);
             if (ggml_backend_t backend_layer = moe_cache->layer_backend(il)) {
-                ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_layer);
+                ggml_backend_sched_set_tensor_backend(sched, experts, backend_layer);
             }
+            cb(experts, "ffn_moe_down", il);
+
+            ggml_tensor * moe_out = aggregate_experts(experts);
             cb(moe_out, "ffn_moe_out", il);
 
             return moe_out;
@@ -2645,7 +2655,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
-    ggml_tensor * moe_out = build_experts(cur, selected_experts, slots, selected_experts);
+    ggml_tensor * moe_out = aggregate_experts(build_experts(cur, selected_experts, slots, selected_experts));
 
     cb(moe_out, "ffn_moe_out", il);
 
