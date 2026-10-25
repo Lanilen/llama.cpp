@@ -292,6 +292,7 @@ struct llama_moe_cache::impl {
     size_t budget;
     spare_stats spare_small; // ubatches that run on the hot spare
     spare_stats spare_large;
+    bool rebalance = false;  // large ubatches were processed since the last refresh
     std::vector<ggml_backend_t> layer_backends; // [n_layer] backend of the device of each layer
 
     stats stats_small; // up to 8 tokens per ubatch
@@ -790,8 +791,14 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // large ubatches (the prompt) only update the scores, the first small ubatch after them rebalances the cache without a budget
         if (half_life > 0.0f) {
-            refresh(budget*n_tokens, st);
+            if (!small) {
+                rebalance = true;
+            } else {
+                refresh(rebalance ? SIZE_MAX : budget*n_tokens, st);
+                rebalance = false;
+            }
         }
 
         st.t_us += ggml_time_us() - t_start_us;
@@ -842,7 +849,7 @@ struct llama_moe_cache::impl {
                 }
             }
 
-            const size_t n = std::min({ best.size(), worst.size(), (size_t) n_empty + budget_bytes/expert_size });
+            const size_t n = std::min({ best.size(), worst.size(), budget_bytes == SIZE_MAX ? worst.size() : (size_t) n_empty + budget_bytes/expert_size });
             if (n == 0) {
                 continue;
             }
@@ -869,7 +876,7 @@ struct llama_moe_cache::impl {
             }
             const int32_t old_key = g.key_of_slot[sw.slot];
             if (old_key >= 0) {
-                if (spent + expert_size > budget_bytes) {
+                if (budget_bytes != SIZE_MAX && spent + expert_size > budget_bytes) {
                     continue;
                 }
                 spent += expert_size;
