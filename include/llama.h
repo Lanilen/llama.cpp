@@ -408,6 +408,7 @@ extern "C" {
         float moe_cache_half_life;     // hot spare mode: half-life in tokens of the expert scores, 0 = the resident experts never change [EXPERIMENTAL]
         float moe_cache_margin;        // hot spare mode: score margin for a new expert to replace a resident one [EXPERIMENTAL]
         float moe_cache_budget_mib;    // hot spare mode: MiB uploaded per token to replace resident experts [EXPERIMENTAL]
+        const char * moe_cache_save;   // hot spare mode: file the resident experts are written to at exit, for moe_cache_hot, nullptr = none [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
