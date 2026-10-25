@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -318,6 +319,8 @@ struct llama_moe_cache::impl {
     spare_stats spare_large;
     spare_stats * spare_cur = nullptr; // the stats of the running update
     bool rebalance = false;  // large ubatches were processed since the last refresh
+    bool warm      = false;  // the resident experts were loaded from a file
+    std::string save_path;   // the resident experts are written there at exit
     std::vector<pending_upload> pending_uploads;
     std::vector<ggml_backend_t> layer_backends; // [n_layer] backend of the device of each layer
 
@@ -345,6 +348,9 @@ struct llama_moe_cache::impl {
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_params & params) :
             n_expert_used(model.hparams.n_expert_used_max()), mode(params.mode),
             half_life(params.half_life), margin(params.margin), budget(params.budget), layers(model.layers.size()) {
+        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && !model.hparams.no_alloc) {
+            save_path = params.save;
+        }
         const size_t size = params.size;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -738,6 +744,7 @@ struct llama_moe_cache::impl {
                 g.key_of_slot[s] = il*(int32_t) l.slot_of.size() + e;
                 set_resident(l, e, s);
                 upload_expert(g, l, e, s, false);
+                warm = true;
             }
         }
 
@@ -918,7 +925,8 @@ struct llama_moe_cache::impl {
             if (!small) {
                 rebalance = true;
             } else {
-                refresh(rebalance ? SIZE_MAX : budget*n_tokens, st);
+                // a resident set from --moe-cache-hot predicts the generation better than the prompt, so it only changes within the budget
+                refresh(rebalance && !warm ? SIZE_MAX : budget*n_tokens, st);
                 rebalance = false;
             }
         }
@@ -1054,6 +1062,38 @@ struct llama_moe_cache::impl {
             }
         }
         log_stats();
+        if (!save_path.empty()) {
+            save_hot_spare(save_path);
+        }
+    }
+
+    // hot spare mode: write the resident experts, then the other experts with a score, best first, in the format of --moe-cache-hot
+    void save_hot_spare(const std::string & path) const {
+        std::vector<std::tuple<bool, float, int32_t, int32_t>> experts; // resident, score, il, expert
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const layer & l = layers[il];
+            if (l.ig < 0) {
+                continue;
+            }
+            for (size_t e = 0; e < l.slot_of.size(); ++e) {
+                if (l.slot_of[e] >= 0 || l.score[e] > 0.0f) {
+                    experts.emplace_back(l.slot_of[e] >= 0, l.score[e], (int32_t) il, (int32_t) e);
+                }
+            }
+        }
+        std::sort(experts.begin(), experts.end(), [](const auto & a, const auto & b) {
+            return std::get<0>(a) != std::get<0>(b) ? std::get<0>(a) : std::get<1>(a) > std::get<1>(b);
+        });
+        std::ofstream f(path);
+        if (!f) {
+            LLAMA_LOG_WARN("%s: failed to write the MoE cache hot file %s\n", __func__, path.c_str());
+            return;
+        }
+        f << "# MoE cache hot spare: resident experts, then the other experts with a score, best first, \"layer expert\" per line\n";
+        for (const auto & [resident, score, il, e] : experts) {
+            f << il << " " << e << "\n";
+        }
+        LLAMA_LOG_INFO("%s: wrote %zu experts to %s\n", __func__, experts.size(), path.c_str());
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {

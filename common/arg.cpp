@@ -2825,7 +2825,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE_DEVICE"));
     add_opt(common_arg(
         {"--moe-cache-hot"}, "FNAME",
-        "hot spare mode: file with the resident experts, one \"layer expert\" pair per line, most used first",
+        "hot spare mode: file with the resident experts, one \"layer expert\" pair per line, most used first; they change after the prompt only within the budget",
         [](common_params & params, const std::string & value) {
             params.moe_cache_hot = value;
         }
@@ -2851,6 +2851,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_budget_mib = std::stof(value);
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_BUDGET"));
+    add_opt(common_arg(
+        {"--moe-cache-save"}, "FNAME",
+        "hot spare mode: write the resident experts to this file at exit, to start the next run from them with --moe-cache-hot",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_save = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_SAVE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
