@@ -405,6 +405,9 @@ extern "C" {
         enum llama_moe_cache_mode moe_cache_mode; // [EXPERIMENTAL]
         const char * moe_cache_device; // hot spare mode: name of the cache device for all layers, nullptr = the device of each layer [EXPERIMENTAL]
         const char * moe_cache_hot;    // hot spare mode: file with the resident experts, "layer expert" per line, most used first, nullptr = none [EXPERIMENTAL]
+        float moe_cache_half_life;     // hot spare mode: half-life in tokens of the expert scores, 0 = the resident experts never change [EXPERIMENTAL]
+        float moe_cache_margin;        // hot spare mode: score margin for a new expert to replace a resident one [EXPERIMENTAL]
+        float moe_cache_budget_mib;    // hot spare mode: MiB uploaded per token to replace resident experts [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

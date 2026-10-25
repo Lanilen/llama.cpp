@@ -2609,6 +2609,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
+        // the CPU branch counts the selected experts for the refresh of the resident ones
+        ggml_tensor * ids_rec = moe_cache->record(ctx0, il, selected_experts);
+        GGML_ASSERT(ids_rec != nullptr);
+        ggml_backend_sched_set_tensor_backend(sched, ids_rec, backend_cpu);
+        cb(ids_rec, "ffn_moe_picks", il);
+
         // the cache branch comes first, so its split is launched before the CPU computes the misses
         ggml_tensor * slots_c = ggml_get_rows(ctx0, maps.slot, ids); // [1, n_expert_used*n_tokens]
         ggml_tensor * first_c = slots_c;
@@ -2630,7 +2636,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
             ggml_build_forward_expand(gf, experts_c);
 
-            ggml_tensor * ids_h = ggml_get_rows(ctx0, maps.miss, ids);
+            ggml_tensor * ids_h = ggml_get_rows(ctx0, maps.miss, ggml_reshape_1d(ctx0, ids_rec, ggml_nelements(ids_rec)));
             ggml_backend_sched_set_tensor_backend(sched, ids_h, backend_cpu);
             cb(ids_h, "ffn_moe_misses", il);
             ids_h = ggml_reshape_2d(ctx0, ids_h, selected_experts->ne[0], selected_experts->ne[1]);
@@ -2649,6 +2655,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(moe_out, "ffn_moe_out", il);
 
             return moe_out;
+        }
+    }
+
+    // large ubatches do not use the hot spare, but their selections still count for its refresh
+    if (moe_cache != nullptr) {
+        if (ggml_tensor * picks = moe_cache->record(ctx0, il, selected_experts)) {
+            ggml_backend_sched_set_tensor_backend(sched, picks, backend_cpu);
+            cb(picks, "ffn_moe_picks", il);
+            ggml_build_forward_expand(gf, picks);
         }
     }
 

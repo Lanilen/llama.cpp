@@ -1757,6 +1757,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_mode   = params.moe_cache_mode;
     cparams.moe_cache_device = params.moe_cache_device.empty() ? nullptr : params.moe_cache_device.c_str();
     cparams.moe_cache_hot    = params.moe_cache_hot.empty()    ? nullptr : params.moe_cache_hot.c_str();
+    cparams.moe_cache_half_life  = params.moe_cache_half_life;
+    cparams.moe_cache_margin     = params.moe_cache_margin;
+    cparams.moe_cache_budget_mib = params.moe_cache_budget_mib;
 
     return cparams;
 }
