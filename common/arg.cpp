@@ -2817,7 +2817,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE_MODE"));
     add_opt(common_arg(
         {"--moe-cache-device"}, "NAME",
-        "hot spare mode: device of the MoE cache, one of the devices of -dev (default: the first GPU)",
+        "hot spare mode: device of the MoE cache for all layers, one of the devices of -dev\n"
+        "(default: each GPU caches the layers assigned to it, the size is split among them like the layers)",
         [](common_params & params, const std::string & value) {
             params.moe_cache_device = value;
         }

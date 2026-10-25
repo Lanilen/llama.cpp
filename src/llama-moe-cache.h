@@ -13,7 +13,7 @@ struct llama_model;
 struct llama_moe_cache_params {
     size_t size = 0;
     llama_moe_cache_mode mode = LLAMA_MOE_CACHE_MODE_LRU;
-    std::string device; // hot spare mode: cache device, empty = the first GPU
+    std::string device; // hot spare mode: cache device, empty = the device of each layer
     std::string hot;    // hot spare mode: file with the resident experts
 };
 
@@ -32,7 +32,7 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context
     // lru mode: each GPU gets its own cache of the given size for the layers assigned to it
-    // hot spare mode: the cache device gets the whole size for all host-resident layers
+    // hot spare mode: the cache device gets the whole size for all host-resident layers, without a cache device it is like lru mode
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_params & params);
     ~llama_moe_cache();
 
