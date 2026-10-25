@@ -118,6 +118,12 @@ void compute_outputs(const uint first_row, const uint num_rows) {
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
+#ifdef MUL_MAT_ID
+    if (skip_expert(first_row)) {
+        return;
+    }
+#endif
+
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
         compute_outputs(first_row, NUM_ROWS);

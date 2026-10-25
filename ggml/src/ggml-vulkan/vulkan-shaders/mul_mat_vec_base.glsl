@@ -93,6 +93,28 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+#ifdef MUL_MAT_ID
+// an id of -1 skips the slot: the workgroup only zeroes its rows of the result, without reading the weights
+// the slot is the same for the whole workgroup, so all its invocations return together
+bool skip_expert(const uint first_row) {
+    const uint expert_i0 = gl_WorkGroupID.y;
+    if (data_ids[expert_i0 + p.expert_i1 * p.nbi1] != -1) {
+        return false;
+    }
+    if (gl_LocalInvocationIndex == 0) {
+        const uint d_offset = expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (first_row + n < p.stride_d) {
+                    data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(0);
+                }
+            }
+        }
+    }
+    return true;
+}
+#endif
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
