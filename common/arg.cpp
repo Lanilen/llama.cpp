@@ -2801,15 +2801,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
-        {"--moe-cache-mode"}, "{lru,split}",
+        {"--moe-cache-mode"}, "{lru,hot-spare}",
         "MoE cache mode (default: lru)\n"
         "- lru: the selected experts are uploaded to the cache before they run on the GPU\n"
-        "- split: the resident experts run on the cache device while the CPU runs the others",
+        "- hot-spare: the resident experts run on the cache device while the CPU runs the others",
         [](common_params & params, const std::string & value) {
             if (value == "lru") {
                 params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
-            } else if (value == "split") {
-                params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_SPLIT;
+            } else if (value == "hot-spare") {
+                params.moe_cache_mode = LLAMA_MOE_CACHE_MODE_HOT_SPARE;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -2817,14 +2817,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE_MODE"));
     add_opt(common_arg(
         {"--moe-cache-device"}, "NAME",
-        "split mode: device of the MoE cache, one of the devices of -dev (default: the first GPU)",
+        "hot spare mode: device of the MoE cache, one of the devices of -dev (default: the first GPU)",
         [](common_params & params, const std::string & value) {
             params.moe_cache_device = value;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_DEVICE"));
     add_opt(common_arg(
         {"--moe-cache-hot"}, "FNAME",
-        "split mode: file with the resident experts, one \"layer expert\" pair per line, most used first",
+        "hot spare mode: file with the resident experts, one \"layer expert\" pair per line, most used first",
         [](common_params & params, const std::string & value) {
             params.moe_cache_hot = value;
         }

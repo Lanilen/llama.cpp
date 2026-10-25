@@ -30,7 +30,7 @@ Cache sizes are converted to slots per group of layers with the same expert layo
 
 `layer`, `group` and `global` in the tables are the pools: the slots of a group split evenly over its layers, shared by the group, or shared by all layers.
 
-The projected time per generated token assumes a split cache: hits run on the cache device while the CPU runs the misses. With `k` hits of `n_used` in a layer:
+The projected time per generated token assumes a hot spare cache: hits run on the cache device while the CPU runs the misses. With `k` hits of `n_used` in a layer:
 
 - serial: `base - sum(cpu_layer*k/n_used) + rt*(layers with k > 0)`
 - overlapped: `base - sum(cpu_layer - max(cpu_layer*(n_used - k)/n_used, rt*[k > 0]))`

@@ -210,7 +210,7 @@ struct llama_moe_cache::impl {
         int32_t n_slots = 0;
         moe_cache_slru slru;
 
-        // split mode
+        // hot spare mode
         std::vector<int32_t> key_of_slot; // [n_slots] il*n_expert + expert, -1 if empty
         int32_t n_resident = 0;
     };
@@ -220,7 +220,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
 
-        // split mode, see llama_moe_cache_split_maps
+        // hot spare mode, see llama_moe_cache_hot_spare_maps
         ggml_tensor * miss_map = nullptr;
         ggml_tensor * slot_dev = nullptr;
         ggml_tensor * hit_dev  = nullptr;
@@ -297,16 +297,16 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // split mode caches all host-resident layers on one device
-        int32_t split_id = -1;
-        if (mode == LLAMA_MOE_CACHE_MODE_SPLIT) {
-            for (size_t id = 0; id < devices.size() && split_id < 0; ++id) {
+        // hot spare mode caches all host-resident layers on one device
+        int32_t spare_id = -1;
+        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+            for (size_t id = 0; id < devices.size() && spare_id < 0; ++id) {
                 const char * name = ggml_backend_dev_name(ggml_backend_get_device(devices[id].backend));
                 if (params.device.empty() || params.device == name) {
-                    split_id = (int32_t) id;
+                    spare_id = (int32_t) id;
                 }
             }
-            if (split_id < 0) {
+            if (spare_id < 0) {
                 throw std::runtime_error("MoE cache device " + params.device + " is not a GPU of the context, see -dev");
             }
         }
@@ -317,7 +317,7 @@ struct llama_moe_cache::impl {
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
             }
-            int32_t id = split_id;
+            int32_t id = spare_id;
             if (id < 0) {
                 const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
                 if (it_dev == devices.end()) {
@@ -399,7 +399,7 @@ struct llama_moe_cache::impl {
                 g.n_slots = 0;
                 continue;
             }
-            if (mode == LLAMA_MOE_CACHE_MODE_SPLIT) {
+            if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
                 g.key_of_slot.assign(g.n_slots, -1);
                 n_tensors[g.id] += 2*g.layers.size();
             } else {
@@ -457,7 +457,7 @@ struct llama_moe_cache::impl {
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
-                if (mode == LLAMA_MOE_CACHE_MODE_SPLIT) {
+                if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
                     l.miss_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                     l.slot_dev = ggml_new_tensor_2d(ctx,            GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                     l.hit_dev  = ggml_new_tensor_2d(ctx,            GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
@@ -511,8 +511,8 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_clear(buf_host.get(), 0xff); // all slots are -1
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
-            if (mode == LLAMA_MOE_CACHE_MODE_SPLIT) {
-                init_split(params.hot);
+            if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+                init_hot_spare(params.hot);
             } else {
                 for (group & g : groups) {
                     for (int32_t il : g.layers) {
@@ -539,7 +539,7 @@ struct llama_moe_cache::impl {
             }
             LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts%s\n", __func__,
                 ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0,
-                mode == LLAMA_MOE_CACHE_MODE_SPLIT ? ", split mode" : "");
+                mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE ? ", hot spare mode" : "");
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%), %d resident\n", __func__,
@@ -557,8 +557,8 @@ struct llama_moe_cache::impl {
         return layer_backends[il];
     }
 
-    // split mode: upload the resident experts listed in the hot file, most used first, and fill the maps
-    void init_split(const std::string & path) {
+    // hot spare mode: upload the resident experts listed in the hot file, most used first, and fill the maps
+    void init_hot_spare(const std::string & path) {
         std::vector<std::pair<int32_t, int32_t>> hot;
         if (!path.empty()) {
             std::ifstream f(path);
@@ -619,8 +619,8 @@ struct llama_moe_cache::impl {
         }
     }
 
-    bool get_split_maps(int32_t il, int64_t n_tokens, llama_moe_cache_split_maps & maps) const {
-        if (mode != LLAMA_MOE_CACHE_MODE_SPLIT || il < 0 || il >= (int32_t) layers.size() || layers[il].miss_map == nullptr) {
+    bool get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const {
+        if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size() || layers[il].miss_map == nullptr) {
             return false;
         }
         // large batches use most experts of a layer, they keep running all host experts with the scheduler's offload
@@ -637,7 +637,7 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
-        if (mode == LLAMA_MOE_CACHE_MODE_SPLIT || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
         const layer & l = layers[il];
@@ -656,7 +656,7 @@ struct llama_moe_cache::impl {
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
         const auto it = bindings.find(w);
-        if (mode == LLAMA_MOE_CACHE_MODE_SPLIT || it == bindings.end()) {
+        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE || it == bindings.end()) {
             return 0;
         }
         const binding & b = it->second;
@@ -790,8 +790,8 @@ ggml_backend_t llama_moe_cache::layer_backend(int32_t il) const {
     return pimpl->layer_backend(il);
 }
 
-bool llama_moe_cache::get_split_maps(int32_t il, int64_t n_tokens, llama_moe_cache_split_maps & maps) const {
-    return pimpl->get_split_maps(il, n_tokens, maps);
+bool llama_moe_cache::get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const {
+    return pimpl->get_hot_spare_maps(il, n_tokens, maps);
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
