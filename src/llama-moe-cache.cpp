@@ -159,8 +159,11 @@ struct moe_cache_slru {
 
 // hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the count vector of the layer
 static void llama_moe_cache_record(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
-    GGML_UNUSED(ith);
     GGML_UNUSED(nth);
+    // every thread of the CPU backend runs the op, one does the work
+    if (ith != 0) {
+        return;
+    }
     auto & count = *(std::vector<uint32_t> *) userdata;
     int32_t * out = (int32_t *) dst->data;
     for (int64_t i1 = 0; i1 < a->ne[1]; ++i1) {
