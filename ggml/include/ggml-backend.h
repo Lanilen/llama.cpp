@@ -225,6 +225,14 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // Pinned host memory of one device, for faster uploads to that device
+    typedef ggml_backend_buffer_type_t   (*ggml_backend_dev_pinned_buffer_type_t)(ggml_backend_dev_t device);
+    // Background uploads from pinned host memory that run while the backend computes:
+    // record copies, submit them as a batch (returns a ticket), then check (or wait for) the ticket
+    // the compute of the backend sees the data once the ticket was reported complete
+    typedef bool                         (*ggml_backend_upload_bg_t)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+    typedef uint64_t                     (*ggml_backend_upload_bg_submit_t)(ggml_backend_t backend);
+    typedef bool                         (*ggml_backend_upload_bg_done_t)(ggml_backend_t backend, uint64_t ticket, bool wait);
 
     //
     // Backend registry

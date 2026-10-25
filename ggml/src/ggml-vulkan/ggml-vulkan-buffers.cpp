@@ -353,6 +353,58 @@ void ggml_vk_host_free(void * ptr) {
     }
 }
 
+// pinned host memory of one device, for the devices that cannot import the memory of ggml_vk_host_malloc
+void * ggml_vk_host_malloc_device(vk_device& device, size_t size) {
+    VK_LOG_MEMORY("ggml_vk_host_malloc_device(" << device->name << ", " << size << ")");
+
+    vk_buffer buf;
+    try {
+        buf = ggml_vk_create_buffer(device, size,
+            {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+    } catch (vk::SystemError&) {
+        return nullptr;
+    }
+
+    if (!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+        ggml_vk_destroy_buffer(buf);
+        return nullptr;
+    }
+
+    vk_host_allocation entry;
+    entry.base               = buf->ptr;
+    entry.size               = size;
+    entry.views[device->idx] = buf;
+
+    std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+    vk_instance.host_allocations.push_back(std::move(entry));
+    return buf->ptr;
+}
+
+void ggml_vk_host_free_device(void * ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    VK_LOG_MEMORY("ggml_vk_host_free_device(" << ptr << ")");
+
+    vk_host_allocation entry;
+    {
+        std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+        const size_t index = ggml_vk_host_allocation_find(ptr);
+        if (index == SIZE_MAX) {
+            fprintf(stderr, "WARNING: failed to free pinned memory: memory not in map\n");
+            return;
+        }
+        entry = std::move(vk_instance.host_allocations[index]);
+        vk_instance.host_allocations.erase(vk_instance.host_allocations.begin() + index);
+    }
+
+    // the memory belongs to the buffer of the device
+    for (auto & view : entry.views) {
+        ggml_vk_destroy_buffer(view);
+    }
+}
+
 void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset) {
     buf = nullptr;
     buf_offset = 0;

@@ -1257,6 +1257,15 @@ struct ggml_backend_vk_context {
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
 
+    // background uploads on the transfer queue, see ggml_backend_vk_upload_bg
+    bool bg_initialized = false;
+    vk_command_pool bg_cmd_pool;
+    vk_semaphore bg_semaphore;   // timeline, each submitted batch signals the next value
+    vk_context bg_ctx;           // the batch being recorded
+    std::vector<std::pair<uint64_t, vk_command_buffer *>> bg_inflight;
+    uint64_t bg_ready  = 0;      // the batches up to this value are complete, the compute waits for them
+    uint64_t bg_waited = 0;      // a compute submission already waits for the batches up to this value
+
     std::vector<vk_context_ref> tensor_ctxs;
 
     std::vector<vk::DescriptorPool> descriptor_pools;
