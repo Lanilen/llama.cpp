@@ -600,6 +600,9 @@ struct common_params {
     llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
     std::string moe_cache_device; // hot spare mode: cache device name, empty = the device of each layer
     std::string moe_cache_hot;    // hot spare mode: resident experts file
+    float moe_cache_half_life  = 64.0f; // hot spare mode: half-life of the expert scores in tokens, 0 = static
+    float moe_cache_margin     = 0.5f;  // hot spare mode: score margin to replace a resident expert
+    float moe_cache_budget_mib = 25.0f; // hot spare mode: MiB uploaded per token
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

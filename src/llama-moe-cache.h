@@ -15,6 +15,11 @@ struct llama_moe_cache_params {
     llama_moe_cache_mode mode = LLAMA_MOE_CACHE_MODE_LRU;
     std::string device; // hot spare mode: cache device, empty = the device of each layer
     std::string hot;    // hot spare mode: file with the resident experts
+
+    // hot spare mode: refresh of the resident experts between ubatches
+    float  half_life = 0.0f; // tokens, 0 = the resident experts never change
+    float  margin    = 0.5f; // a new expert replaces a resident one if its decayed score is higher by this much
+    size_t budget    = 0;    // bytes uploaded per token, unlimited for empty slots
 };
 
 // hot spare mode: per layer maps from the selected experts to the ids of the CPU branch and the slots of the cache branch
@@ -44,6 +49,12 @@ public:
 
     // hot spare mode: the maps of layer il, if its experts can run on the hot spare for n_tokens tokens, false otherwise
     bool get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const;
+
+    // hot spare mode: a copy of the selected experts ids of layer il that counts them when it is computed, nullptr if layer il is not cached
+    ggml_tensor * record(ggml_context * ctx, int32_t il, ggml_tensor * ids) const;
+
+    // hot spare mode: after a ubatch of n_tokens tokens, update the scores and refresh the resident experts
+    void update(int64_t n_tokens);
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;

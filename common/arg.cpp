@@ -2831,6 +2831,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_HOT"));
     add_opt(common_arg(
+        {"--moe-cache-half-life"}, "N",
+        string_format("hot spare mode: half-life in tokens of the expert scores that pick the resident experts, 0 = they never change (default: %.0f)", (double) params.moe_cache_half_life),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_half_life = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_HALF_LIFE"));
+    add_opt(common_arg(
+        {"--moe-cache-margin"}, "N",
+        string_format("hot spare mode: a new expert replaces a resident one if its score is higher by this much (default: %.2f)", (double) params.moe_cache_margin),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_margin = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MARGIN"));
+    add_opt(common_arg(
+        {"--moe-cache-budget"}, "MIB",
+        string_format("hot spare mode: MiB of experts uploaded per token to replace resident ones, empty slots are filled for free (default: %.0f)", (double) params.moe_cache_budget_mib),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_budget_mib = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_BUDGET"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

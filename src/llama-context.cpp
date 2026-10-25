@@ -565,6 +565,9 @@ llama_context::llama_context(
             mcp.mode   = cparams.moe_cache_mode;
             mcp.device = params.moe_cache_device ? params.moe_cache_device : "";
             mcp.hot    = params.moe_cache_hot    ? params.moe_cache_hot    : "";
+            mcp.half_life = std::max(0.0f, params.moe_cache_half_life);
+            mcp.margin    = params.moe_cache_margin;
+            mcp.budget    = (size_t) (std::max(0.0f, params.moe_cache_budget_mib)*1024*1024);
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
         }
 
@@ -1595,6 +1598,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // the CPU part of the graph is done, so the selected experts of this ubatch are counted
+    if (moe_cache) {
+        moe_cache->update(ubatch.n_tokens);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -4034,6 +4042,9 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_LRU,
         /*.moe_cache_device            =*/ nullptr,
         /*.moe_cache_hot               =*/ nullptr,
+        /*.moe_cache_half_life         =*/ 64.0f,
+        /*.moe_cache_margin            =*/ 0.5f,
+        /*.moe_cache_budget_mib        =*/ 25.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
