@@ -32,8 +32,8 @@ current text uses.
 A saved set from one kind of work (code, chat, a language) is a good start for the same kind of work: run once with
 `--moe-cache-save code.hot`, then start later runs with `--moe-cache-hot code.hot`.
 
-The refill moves up to the whole cache in one step, and the generation waits for its copies. It pays on long generations;
-on short ones `--moe-cache-refill 0` can be faster.
+The refill moves up to the whole cache in one step, and the generation waits for its copies. It pays on long sessions
+(14.1 against 13.9 tok/s over the 5-turn session below); on a single short answer `--moe-cache-refill 0` can be faster.
 
 ## Sizing the cache
 
@@ -123,6 +123,7 @@ skewed, so the hit rate is much higher than that share:
 | --- | --- | --- |
 | Qwen3.8-Flash-Next UD-IQ4_XS, 2x RX 480 | 8600 / 56762 MiB (15%) | 56% static set, 65% with refresh and refill (code, 1024 tokens) |
 | same | 6800-7900 / 56762 MiB (12-14%) | 40-47% (code, 256 tokens, with MTP) |
+| same | 7400 / 56762 MiB (13%) | 56% (5-turn coding session, 9.6k-token paste and 4.2k generated tokens, with MTP) |
 | Qwen3-Coder-30B-A3B UD-Q4_K_XL, RTX 4070 Ti | 3000 / 15864 MiB (19%) | 46-52% (code, 256 tokens) |
 
 For your own workload, record which experts the router picks with `llama-moe-trace` and replay the trace against cache sizes
@@ -172,7 +173,8 @@ ubatches.
 
 ## Measured
 
-Greedy decoding of one coding prompt, 256 tokens. "Before" is the code without this branch's scheduler changes (overlapping
+Greedy decoding of one coding prompt, 256 tokens, and a 5-turn coding session with `session-bench.py` (a 9.6k-token
+paste of a source file, then four turns of up to 1024 tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes (overlapping
 splits, asynchronous reads), which also speed up a model with its experts on the CPU and no cache.
 
 | Machine | Setup | tok/s |
@@ -181,6 +183,8 @@ splits, asynchronous reads), which also speed up a model with its experts on the
 | | hot spare 8600 MiB | 12.2 |
 | | MTP, 1 drafted token, before | 11.7 |
 | | MTP + hot spare 4600,4300 MiB, `--no-op-offload` | 14.3 |
+| | 5-turn session, MTP, no cache | 11.7 |
+| | 5-turn session, MTP + hot spare 3350,4050 MiB (`-c 16384`) | 14.1 |
 | RTX 4070 Ti 12 GB, i5-14600KF, Qwen3-Coder-30B-A3B UD-Q4_K_XL | experts on the CPU, before | 26.6 |
 | | experts on the CPU | 29.2 |
 | | hot spare 3000 MiB | 43.3 |
