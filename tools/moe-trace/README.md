@@ -38,3 +38,13 @@ The projected time per generated token assumes a hot spare cache: hits run on th
 - overlapped: `base - sum(cpu_layer - max(cpu_layer*(n_used - k)/n_used, rt*[k > 0]))`
 
 `--base`, `--cpu-layer` and `--rt` default to measurements on an RX 480 test machine with Qwen3.8-Flash-Next and must be changed for other setups. The projection does not charge the uploads: compare the budgets' rows, uploads read the same host memory the CPU experts use.
+
+## Sessions
+
+`session-bench.py` runs a multi-turn chat against a running `llama-server` (Python standard library only): the first turn
+pastes a file, the next turns work on it with the whole history, so the server reuses its cached prompt. It prints the
+prompt and generation speed of each turn and the accepted drafts with speculative decoding.
+
+```bash
+python3 session-bench.py --url localhost:8080 --file src/llama-graph.cpp --chars 30000 --max-tokens 1024 --output session.json
+```
