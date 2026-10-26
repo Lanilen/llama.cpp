@@ -575,9 +575,22 @@ llama_context::llama_context(
                 mcp.sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + params.n_moe_cache_sizes);
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
-            if (moe_cache->resizes()) {
-                // the first reserve is for large batches, the cache is restored for the first small one
-                moe_cache->release();
+        }
+
+        if (params.moe_cache_resize) {
+            if (moe_cache) {
+                if (moe_cache->resizes()) {
+                    // the first reserve is for large batches, the cache is restored for the first small one
+                    resize_small_max = llama_moe_cache::max_hot_spare_batch();
+                    moe_cache->release();
+                }
+            } else {
+                // a context without the cache, such as an MTP draft, resizes its compute buffers only: below 32 tokens
+                // (GGML_OP_OFFLOAD_MIN_BATCH) no op copies host weights to a device, so small batches need small buffers;
+                // it starts small, so that its large buffers only exist while a prompt runs and the cache of the main
+                // context is released (the draft reads the prompt after the main context, and drafts before it verifies)
+                resize_small_max = 31;
+                moe_resize_large = false;
             }
         }
 
@@ -765,9 +778,9 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
-    if (moe_cache && moe_cache->resizes() && !moe_resize_large) {
-        // generation: the batches run on the hot spare, the large ones switch to the other reserve first
-        n_tokens = std::min<uint32_t>(n_tokens, (uint32_t) llama_moe_cache::max_hot_spare_batch());
+    if (resize_small_max > 0 && !moe_resize_large) {
+        // generation: the batches are small, the large ones switch to the other reserve first
+        n_tokens = std::min<uint32_t>(n_tokens, (uint32_t) resize_small_max);
     }
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -1961,11 +1974,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     embd_batch_idxs.clear();
 
     // --moe-cache-resize: the compute buffers of large batches and the MoE cache take turns in the device memory
-    if (moe_cache && moe_cache->resizes()) {
-        const bool large = balloc->get_n_tokens() > llama_moe_cache::max_hot_spare_batch();
+    if (resize_small_max > 0) {
+        const bool large = balloc->get_n_tokens() > resize_small_max;
         if (large != moe_resize_large) {
             synchronize();
-            if (large) {
+            if (large && moe_cache) {
                 moe_cache->release();
             }
             moe_resize_large = large;
@@ -1973,7 +1986,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // free the compute buffers of large batches before the cache takes the memory back, then reserve once,
                 // with the cache branch: a buffer allocated while a freed one is not released yet may go to host memory
                 sched.reset();
-                moe_cache->restore();
+                if (moe_cache) {
+                    moe_cache->restore();
+                }
             }
             sched_need_reserve = true;
             sched_reserve();
