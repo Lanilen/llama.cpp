@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -187,17 +188,75 @@ int main(int argc, char ** argv) {
         prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
     }
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, prompt, true, true);
+    // --conversation: the messages are traced as one sequence, each message a segment of prompt or generated tokens
+    const bool conversation = !params.moe_trace_conversation.empty();
+    json segments = json::array();
+    std::vector<llama_token> tokens;
+    if (conversation) {
+        std::ifstream fconv(params.moe_trace_conversation);
+        if (!fconv) {
+            LOG_ERR("%s: failed to read %s\n", __func__, params.moe_trace_conversation.c_str());
+            return 1;
+        }
+        const json conv = json::parse(fconv);
+        const json & msgs = conv.is_object() ? conv.at("messages") : conv;
+        std::vector<common_chat_msg> all;
+        if (!params.system_prompt.empty()) {
+            common_chat_msg msg;
+            msg.role    = "system";
+            msg.content = params.system_prompt;
+            all.push_back(msg);
+        }
+        for (const auto & m : msgs) {
+            common_chat_msg msg;
+            msg.role    = m.at("role").get<std::string>();
+            msg.content = m.at("content").get<std::string>();
+            all.push_back(msg);
+        }
+        auto render = [&](size_t n, bool add_generation_prompt) {
+            common_chat_templates_inputs inputs;
+            inputs.use_jinja = params.use_jinja;
+            inputs.messages.assign(all.begin(), all.begin() + n);
+            inputs.add_generation_prompt = add_generation_prompt;
+            return common_tokenize(ctx, common_chat_templates_apply(chat_templates.get(), inputs).prompt.str(), true, true);
+        };
+        tokens = render(all.size(), false);
+
+        // a message starts where the prompt before it ends, for an assistant message after the generation prompt
+        std::vector<size_t> starts;
+        for (size_t k = 0; k < all.size(); ++k) {
+            const bool assistant = all[k].role == "assistant";
+            if (k == 0 && !assistant) {
+                starts.push_back(0);
+                continue;
+            }
+            const auto prefix = render(k, assistant);
+            if (prefix.size() > tokens.size() || !std::equal(prefix.begin(), prefix.end(), tokens.begin()) ||
+                    (!starts.empty() && prefix.size() < starts.back())) {
+                LOG_WRN("%s: the template renders message %zu differently in the whole conversation, its segment is approximate\n", __func__, k);
+            }
+            starts.push_back(std::min(prefix.size(), tokens.size()));
+        }
+        for (size_t k = 0; k < all.size(); ++k) {
+            const size_t end = k + 1 < all.size() ? starts[k + 1] : tokens.size();
+            segments.push_back({ starts[k], std::max(end, starts[k]), all[k].role == "assistant" ? "generated" : "prompt" });
+        }
+    } else {
+        tokens = common_tokenize(ctx, prompt, true, true);
+    }
     if (tokens.empty()) {
         LOG_ERR("%s: empty prompt, use -p or -f\n", __func__);
         return 1;
     }
     const int n_prompt = (int) tokens.size();
+    if (conversation) {
+        params.n_predict = 0;
+    }
     if (n_prompt + std::max(params.n_predict, 0) > (int) llama_n_ctx(ctx)) {
         LOG_ERR("%s: %d prompt tokens + %d to predict do not fit in the context of %d, use -c\n", __func__, n_prompt, params.n_predict, llama_n_ctx(ctx));
         return 1;
     }
-    LOG_INF("%s: %d prompt tokens, chat template %s\n", __func__, n_prompt, use_chat ? "applied" : "not applied");
+    LOG_INF("%s: %d %s tokens, chat template %s\n", __func__, n_prompt, conversation ? "conversation" : "prompt", use_chat || conversation ? "applied" : "not applied");
 
     common_sampler_ptr smpl(common_sampler_init(model, params.sampling));
     for (llama_token id : tokens) {
@@ -212,6 +271,10 @@ int main(int argc, char ** argv) {
         const int n = std::min(params.n_batch, n_prompt - i);
         output_rows.push_back(i + n - 1);
         common_batch batch = common_batch_get_one(ctx, tokens.data() + i, n);
+        // a conversation has every token as an output, so no layer skips one and each token has all its selections
+        for (int j = 0; conversation && j < n; ++j) {
+            batch.set_output(j, true);
+        }
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: failed to process the prompt\n", __func__);
             return 1;
@@ -268,9 +331,15 @@ int main(int argc, char ** argv) {
     meta["n_layer"] = llama_model_n_layer(model);
     meta["n_expert_used"] = data.n_expert_used;
     meta["n_prompt"] = n_prompt;
+    if (conversation) {
+        meta["conversation"] = params.moe_trace_conversation;
+        meta["segments"] = segments;
+    }
     meta["n_generated"] = n_gen;
     meta["stopped_at_eog"] = eog;
-    meta["rows"] = "row i is the token processed at position i; rows >= n_prompt are generated tokens; -1 where a layer skipped a prompt token (output pruning)";
+    meta["rows"] = conversation ?
+        "row i is the token at position i of the conversation, segments give [start, end, prompt|generated] per message" :
+        "row i is the token processed at position i; rows >= n_prompt are generated tokens; -1 where a layer skipped a prompt token (output pruning)";
     meta["chat_template"] = use_chat;
     meta["n_batch"] = params.n_batch;
     meta["n_ubatch"] = params.n_ubatch;

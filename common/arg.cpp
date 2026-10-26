@@ -1927,6 +1927,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_MOE_TRACE}));
     add_opt(common_arg(
+        {"--trace-conversation"}, "FNAME",
+        "trace the messages of a conversation (a JSON list of {role, content}, or an object with \"messages\", as written by\n"
+        "tools/moe-trace/session-bench.py) as one sequence, with every token an output, instead of a prompt and its generation",
+        [](common_params & params, const std::string & value) {
+            params.moe_trace_conversation = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MOE_TRACE}));
+    add_opt(common_arg(
         {"-st", "--single-turn"},
         "run conversation for a single turn only, then exit when done\n"
         "will not be interactive if first turn is predefined with --prompt\n"
