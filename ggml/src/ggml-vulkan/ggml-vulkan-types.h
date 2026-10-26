@@ -1082,6 +1082,10 @@ struct vk_event {
     vk_semaphore tl_semaphore;
     vk_command_buffer* cmd_buffer = nullptr;
     uint64_t cmd_buffer_use_counter = 0;
+
+    // the deferred memcpys of the asynchronous reads submitted with the event, run by the event synchronization
+    // (or by the synchronization of the backend that recorded it, which holds them too)
+    std::vector<std::shared_ptr<std::vector<struct vk_staging_memcpy>>> out_memcpys;
 };
 
 struct vk_submission {
@@ -1230,6 +1234,11 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // asynchronous reads into memory that is not pinned: each gets its own part of read_staging until the next synchronization,
+    // the memcpys of those submitted with an event are kept until the event or the backend is synchronized
+    vk_buffer read_staging;
+    size_t    read_staging_used = 0;
+    std::vector<std::shared_ptr<std::vector<struct vk_staging_memcpy>>> event_out_memcpys;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
