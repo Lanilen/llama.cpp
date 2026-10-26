@@ -212,6 +212,12 @@ On the 2x RX 480 test machine (MTP + hot spare, the layout above) fused adds gav
 together 13.82 -> 14.60 tok/s: there the GPU time is in the dense matrix-vector products, not in the number of dispatches.
 Other GPUs may differ: compare a run with `GGML_VK_DISABLE_FUSION=1` or `GGML_VK_DISABLE_MULTI_ADD=1` against one without.
 
+On the RX 480 (RADV: `maxPushConstantsSize` 256, no fp16 rounding modes, subgroup arithmetic and shuffle) the fused adds
+were the only fusion its hardware turned off; with them on, a profile shows `MULTI_ADD` about once per layer and token.
+The other unfused patterns with Qwen3.8-Flash-Next do not depend on the GPU: the norm+mul+rope fusion handles normal and
+neox RoPE only (the model uses interleaved multi-section RoPE), the fused QSA top-k is skipped by design for small k (64-128
+here), and the matmul+add patterns do not occur in this model's graph.
+
 At exit, `-v` prints the cache statistics: hit rate, swaps, MiB uploaded per token and the time of the update between
 ubatches.
 
