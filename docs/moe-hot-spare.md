@@ -125,6 +125,13 @@ On the 2x RX 480 test machine (5-turn session below, MTP, `-c 16384`), the cache
 With `-ub 4096` the pinned host compute buffer doubles (233 MiB), which shows in `mem_info_gtt_used` without slowing
 anything.
 
+A context without the cache, such as the MTP draft context, also follows `--moe-cache-resize`: its compute buffers are
+reserved for 31 tokens (below 32, `GGML_OP_OFFLOAD_MIN_BATCH`, nothing copies host weights to a device) and grow only while
+it reads a prompt, when the cache of the main context is released. The draft can then read prompts in large ubatches
+(`--spec-draft-n-ubatch`) without keeping their buffers during generation. This relies on the order of llama-server's
+speculative decoding: the draft reads the prompt after the main context and drafts before the main context verifies, so it
+is small again before the cache comes back.
+
 ### Worked example
 
 2x RX 480 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS, `-dev Vulkan1,Vulkan0 -ngl 99 -ncmoe 48 -c 9216`, MTP draft on Vulkan0 with

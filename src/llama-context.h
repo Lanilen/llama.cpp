@@ -311,7 +311,8 @@ private:
 
     // --moe-cache-resize: the compute buffers are reserved for large batches (prompts) with the MoE cache released,
     // or for the small batches of generation with the cache in device memory
-    bool moe_resize_large = true;
+    int64_t resize_small_max = 0;    // batches of up to this many tokens use the small reserve, 0 = no resize
+    bool    moe_resize_large = true; // the current reserve is for large batches
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
