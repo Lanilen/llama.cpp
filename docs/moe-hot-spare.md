@@ -121,6 +121,7 @@ On the 2x RX 480 test machine (5-turn session below, MTP, `-c 16384`), the cache
 | `-ub 512`, cache `3350,4050` | 36.5 tok/s | 14.11 tok/s | 56.6% | 571 s |
 | `-ub 2048 -b 2048 --moe-cache-resize`, cache `5000,4200` | 68.4 tok/s | 14.59 tok/s | 62.3% | 460 s |
 | `-ub 4096 -b 4096 --moe-cache-resize`, cache `5000,4200` | 80.5 tok/s | 14.63 tok/s | 61.9% | 419 s |
+| same, cache `5000,4150`, `--spec-draft-n-ubatch 2048` | 86.0 tok/s | 14.46 tok/s | 61.2% | 417 s |
 
 With `-ub 4096` the pinned host compute buffer doubles (233 MiB), which shows in `mem_info_gtt_used` without slowing
 anything.
@@ -229,6 +230,7 @@ splits, asynchronous reads), which also speed up a model with its experts on the
 | | 5-turn session, MTP, no cache | 11.7 |
 | | 5-turn session, MTP + hot spare 3350,4050 MiB (`-c 16384`) | 14.1 |
 | | 5-turn session, MTP + hot spare 5000,4200 MiB, `-ub 4096 --moe-cache-resize` | 14.6, prompt 80.5 tok/s |
+| | same, cache 5000,4150, `--spec-draft-n-ubatch 2048` | 14.5, prompt 86.0 tok/s |
 | RTX 4070 Ti 12 GB, i5-14600KF, Qwen3-Coder-30B-A3B UD-Q4_K_XL | experts on the CPU, before | 26.6 |
 | | experts on the CPU | 29.2 |
 | | hot spare 3000 MiB | 43.3 |
