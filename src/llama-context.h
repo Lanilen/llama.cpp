@@ -314,6 +314,9 @@ private:
     int64_t resize_small_max = 0;    // batches of up to this many tokens use the small reserve, 0 = no resize
     bool    moe_resize_large = true; // the current reserve is for large batches
 
+    // reserve the compute buffers for small batches again
+    void resize_to_small();
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 

@@ -763,6 +763,14 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+void llama_context::resize_to_small() {
+    synchronize();
+    moe_resize_large = false;
+    sched.reset();
+    sched_need_reserve = true;
+    sched_reserve();
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -1973,6 +1981,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    // a context without the cache keeps the buffers of a large batch only while it runs: it may read the end of a prompt
+    // in its next call, after the main context has restored its cache
+    struct resize_guard {
+        llama_context * ctx = nullptr;
+        ~resize_guard() {
+            if (ctx) {
+                ctx->resize_to_small();
+            }
+        }
+    } shrink_after;
+
     // --moe-cache-resize: the compute buffers of large batches and the MoE cache take turns in the device memory
     if (resize_small_max > 0) {
         const bool large = balloc->get_n_tokens() > resize_small_max;
@@ -1992,6 +2011,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             sched_need_reserve = true;
             sched_reserve();
+        }
+        if (large && !moe_cache) {
+            shrink_after.ctx = this;
         }
     }
 

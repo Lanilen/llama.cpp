@@ -128,9 +128,8 @@ anything.
 A context without the cache, such as the MTP draft context, also follows `--moe-cache-resize`: its compute buffers are
 reserved for 31 tokens (below 32, `GGML_OP_OFFLOAD_MIN_BATCH`, nothing copies host weights to a device) and grow only while
 it reads a prompt, when the cache of the main context is released. The draft can then read prompts in large ubatches
-(`--spec-draft-n-ubatch`) without keeping their buffers during generation. This relies on the order of llama-server's
-speculative decoding: the draft reads the prompt after the main context and drafts before the main context verifies, so it
-is small again before the cache comes back.
+(`--spec-draft-n-ubatch`) without keeping their buffers during generation. It keeps them only while each of its large
+batches runs, so it is small again before the cache of the main context comes back, whatever the order of the calls.
 
 ### Worked example
 
