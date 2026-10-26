@@ -41,8 +41,11 @@ In hot spare mode each MoE layer of a small batch (up to 32 tokens) has two bran
   multiplication by slot id, where the selected experts that are not resident get id -1 and are skipped;
 - the **CPU branch** runs the other selected experts from host memory, with the resident ones skipped the same way.
 
-Each selected expert runs in exactly one branch and is zero in the other, so adding the two outputs gives the same sum as
-running them all on the CPU; then the outputs are weighted as usual. Small per-layer maps (one in host memory for the CPU
+Each selected expert runs in exactly one branch and is zero in the other, so adding the two outputs gives the same result as
+running them all on the CPU, up to floating-point rounding: the GPU computes the resident experts with its own kernels, which
+round differently from the CPU's, and the weighting and sum of the experts can run on another device, in another order. The
+results can differ in the last bits, and greedy generations can drift apart over long outputs. Then the outputs are weighted
+as usual. Small per-layer maps (one in host memory for the CPU
 branch, two on the GPU) say which branch owns each expert. Batches of more than 32 tokens, prompts, use most experts of a
 layer and run as before.
 
