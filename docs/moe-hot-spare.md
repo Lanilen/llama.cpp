@@ -1,5 +1,12 @@
 # MoE hot spare cache (experimental)
 
+> **Part of the Polaris Anniversary Fork, tuned for one home lab:** two AMD RX 480 8 GB (Polaris, no fp16), a 12-core
+> Threadripper 1920X and 128 GB of RAM, running Qwen3.8-Flash-Next with its experts in system memory. Some of these
+> changes work around the RX 480's Vulkan driver and could make other GPUs slower where they collide with features that
+> modern GPUs use. We try to avoid that, but besides the RX 480s they are tested on only one other architecture, an NVIDIA
+> RTX 4070 Ti, also with the Vulkan backend. [Changes that apply without any option](#changes-that-apply-without-any-option)
+> lists what runs for everyone and how to switch it off.
+
 When the experts of a MoE model stay in host memory (`--cpu-moe`, `--n-cpu-moe`), the CPU computes every selected expert of
 every token while the GPUs wait. The hot spare cache keeps a copy of the most used experts in the free VRAM of the GPUs: each
 layer runs its resident experts on its GPU while the CPU computes the others, and the two results are added. A missing expert
@@ -10,24 +17,141 @@ llama-server -m model.gguf -ngl 99 --n-cpu-moe 48 \
     --moe-cache-mode hot-spare --moe-cache-mib 8600
 ```
 
-It differs from the default `--moe-cache-mode lru`, which uploads every missing expert before running it on the GPU: on a slow
-PCIe link the uploads cost more than the CPU would. The hot spare uploads only a few MiB per token to follow the experts the
-current text uses.
+On the test machine generation went from 11.7 to 14.5 tok/s with MTP, and a 9.6k-token prompt from 36.5 to 86 tok/s with
+`--moe-cache-resize` ([Measured](#measured)).
 
-## Options
+## How it works
 
-| Option | Default | Meaning |
+### The problem
+
+With the experts in host memory, every MoE layer of a generated token goes: attention and router on the GPU, the layer's
+input copied to the CPU, about ten selected experts computed on the CPU from system memory, the result copied back, and the
+next layer on the GPU. The GPUs wait while the CPU works; on the test machine the CPU's experts were about 45 of the 100 ms
+of a token.
+
+Upstream's MoE cache (`--moe-cache-mode lru`, the default mode) keeps experts in VRAM and uploads every selected expert that
+is missing before the layer runs on the GPU. The RX 480s sit on PCIe 3.0 x8 and x16, at 5.7-11 GB/s: uploading a 2.3 MiB
+expert takes longer than computing it on the CPU, so on this machine the LRU cache made generation slower.
+
+### The hot spare
+
+In hot spare mode each MoE layer of a small batch (up to 32 tokens) has two branches in the graph:
+
+- the **cache branch** runs on the layer's own GPU, over banks of slots that hold the resident experts: a matrix
+  multiplication by slot id, where the selected experts that are not resident get id -1 and are skipped;
+- the **CPU branch** runs the other selected experts from host memory, with the resident ones skipped the same way.
+
+Each selected expert runs in exactly one branch and is zero in the other, so adding the two outputs gives the same sum as
+running them all on the CPU; then the outputs are weighted as usual. Small per-layer maps (one in host memory for the CPU
+branch, two on the GPU) say which branch owns each expert. Batches of more than 32 tokens, prompts, use most experts of a
+layer and run as before.
+
+By default each layer's experts are cached on the GPU of that layer, so that its activations never travel between GPUs;
+`--moe-cache-mib N1,N2` gives each GPU its own size.
+
+### Choosing the resident experts
+
+A small CPU operation counts each layer's selections. Between ubatches the cache updates a decayed score per expert
+(`--moe-cache-half-life`) and replaces the weakest resident experts by stronger ones when the difference is larger than
+`--moe-cache-margin`, up to `--moe-cache-budget` MiB of uploads per token; empty slots are filled without counting. After a
+prompt it rebalances once without a budget, unless it started from a hot file, and after the first `--moe-cache-refill`
+generated tokens once more from those tokens alone.
+
+Uploads do not stop generation: the generation thread records them into a background batch on the GPU's transfer queue,
+from pinned staging memory of that GPU, and a worker thread copies the experts into the staging memory. The batch is
+submitted at the next update, and its experts count as resident once it is done, a ubatch or two later. An evicted expert
+leaves at once.
+
+### The two branches at the same time
+
+On its own, the scheduler would run the cache branch together with the layer's attention, and the CPU's input copy would
+wait for both. The cache branch is marked as an overlapping split: the scheduler records an event after the attention,
+launches the cache branch at once, and the CPU's input copy waits for that event only. The CPU computes its experts while
+the GPU computes the resident ones (`GGML_SCHED_OVERLAP=0` turns this off).
+
+### Faster copies to the CPU
+
+Every split that runs on the CPU first reads its inputs from the GPUs. These reads were synchronous, a submission and a
+fence wait each, about 140 us on the RX 480's driver, 49 times per token. The scheduler now queues them as asynchronous
+reads and waits once per GPU; with the overlap, the reads are queued before the event, so the event wait delivers them.
+On Vulkan, an asynchronous read into memory that is not pinned for that GPU now gets its own part of a staging ring, and its
+copy runs when the GPU or the event is synchronized (`GGML_SCHED_ASYNC_READS=0` restores the synchronous reads).
+
+### Prompts: `--moe-cache-resize`
+
+A prompt batch copies the experts of every layer to the GPU once, so larger ubatches make prompts faster (on the test
+machine a 9.7k-token prompt read at 40 tok/s with `-ub 512` and 84 tok/s with `-ub 2048`), but their compute buffers grow
+too. Since the hot spare does not run for batches of more than 32 tokens, the cache and those buffers can take turns:
+
+- a batch of more than 32 tokens waits for the cache's uploads, frees its GPU memory (keeping the scores and the resident
+  set), waits until the driver reports that memory free, and reserves the compute buffers for `-ub` tokens;
+- the next batch of 32 tokens or less frees those buffers, allocates the cache again, uploads its experts in the
+  background and reserves compute buffers for 32 tokens, a few MiB.
+
+The CPU branch is pinned to the CPU, so that a 32-token batch never copies a layer's experts to the GPU. A context without
+the cache, such as an MTP draft, follows the same option with its compute buffers only: it reserves for 31 tokens (below the
+32 at which ggml offloads an operation on host weights to a GPU) and holds its large buffers only while each of its large
+batches runs.
+
+### Changes that apply without any option
+
+These change behaviour for every model and GPU, with or without the cache:
+
+| Change | Applies to | Switch |
 | --- | --- | --- |
-| `--moe-cache-mode hot-spare` | `lru` | enables the hot spare |
-| `--moe-cache-mib N` | 0 | cache size in MiB, split among the GPUs by their free memory (or `--tensor-split`) |
-| `--moe-cache-mib N1,N2,...` | | the size on each GPU, in the order of the devices of the model (`--device`) |
-| `--moe-cache-device DEV` | | one GPU caches the experts of all layers (by default each layer's experts stay on the GPU of the layer, which avoids a round trip between GPUs) |
-| `--moe-cache-hot FILE` | | starts with the experts listed in FILE resident, see `--moe-cache-save` |
-| `--moe-cache-save FILE` | | writes the resident experts at exit, most used first |
-| `--moe-cache-half-life N` | 64 | half-life in tokens of the expert usage scores, 0 keeps the resident set fixed |
-| `--moe-cache-margin X` | 0.5 | an expert replaces a resident one only if its score is higher by X |
-| `--moe-cache-budget N` | 10 | MiB uploaded per token to replace resident experts (empty slots are filled for free) |
-| `--moe-cache-refill N` | 128 | after N generated tokens, one rebalance from the scores of those tokens alone, 0 = none |
+| The scheduler queues the reads of split inputs into host memory and waits once per backend | every backend with asynchronous reads (Vulkan, CUDA, ...) | `GGML_SCHED_ASYNC_READS=0` |
+| Vulkan: asynchronous reads into memory not pinned for the device use a staging ring and copy at synchronization | all Vulkan GPUs, including the logits reads | none |
+| Vulkan: the matrix-vector MUL_MAT_ID shaders skip slots with id -1 | all Vulkan GPUs, one check per workgroup | none |
+| Vulkan: fused f32 adds no longer need `shaderRoundingModeRTEFloat16` | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
+
+On the RTX 4070 Ti, a model with its experts on the CPU and no cache generated 29.2 instead of 26.6 tok/s with these.
+
+## Reference
+
+### Options
+
+The help text of the options (`llama-server --help`, `llama-cli --help`):
+
+```
+--moe-cache-mib N[,N1,...]    GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, one size is
+                              split among them like the layers (--tensor-split), a list gives each GPU its size, in the
+                              order of the devices of the model (--device) (default: 0, disabled)
+                              (env: LLAMA_ARG_MOE_CACHE_MIB)
+--moe-cache-mode {lru,hot-spare}
+                              MoE cache mode (default: lru)
+                              - lru: the selected experts are uploaded to the cache before they run on the GPU
+                              - hot-spare: the resident experts run on the cache device while the CPU runs the others
+                              (env: LLAMA_ARG_MOE_CACHE_MODE)
+--moe-cache-device NAME       hot spare mode: device of the MoE cache for all layers, one of the devices of -dev
+                              (default: each GPU caches the layers assigned to it, the size is split among them like
+                              the layers)
+                              (env: LLAMA_ARG_MOE_CACHE_DEVICE)
+--moe-cache-hot FNAME         hot spare mode: file with the resident experts, one "layer expert" pair per line, most used
+                              first; they change after the prompt only within the budget
+                              (env: LLAMA_ARG_MOE_CACHE_HOT)
+--moe-cache-half-life N       hot spare mode: half-life in tokens of the expert scores that pick the resident experts,
+                              0 = they never change (default: 64)
+                              (env: LLAMA_ARG_MOE_CACHE_HALF_LIFE)
+--moe-cache-margin N          hot spare mode: a new expert replaces a resident one if its score is higher by this much
+                              (default: 0.50)
+                              (env: LLAMA_ARG_MOE_CACHE_MARGIN)
+--moe-cache-budget MIB        hot spare mode: MiB of experts uploaded per token to replace resident ones, not counting
+                              empty slots and the rebalance after a prompt (default: 10)
+                              (env: LLAMA_ARG_MOE_CACHE_BUDGET)
+--moe-cache-save FNAME        hot spare mode: write the resident experts to this file at exit, to start the next run from
+                              them with --moe-cache-hot
+                              (env: LLAMA_ARG_MOE_CACHE_SAVE)
+--moe-cache-refill N          hot spare mode: after a prompt, rebalance the resident experts once from the selections of
+                              the first N generated tokens, 0 = never (default: 128)
+                              (env: LLAMA_ARG_MOE_CACHE_REFILL)
+--moe-cache-resize            hot spare mode: release the cache's GPU memory while batches of more than 32 tokens
+                              (prompts) run, so that their compute buffers can use it (e.g. a large --ubatch-size), and
+                              restore the cache for generation (default: off)
+                              (env: LLAMA_ARG_MOE_CACHE_RESIZE)
+```
+
+`--moe-cache-mib` and the LRU mode come from upstream; this fork adds the list form, the hot spare mode and the other
+options. `llama-moe-trace` also takes `--trace-conversation FNAME`, see [tools/moe-trace](../tools/moe-trace/README.md).
 
 A saved set from one kind of work (code, chat, a language) is a good start for the same kind of work: run once with
 `--moe-cache-save code.hot`, then start later runs with `--moe-cache-hot code.hot`.
@@ -43,6 +167,25 @@ The refill moves up to the whole cache in one step, and the generation waits for
 - the upload budget raises the hit rate (5 MiB/token: 56.6%, 20: 59.0%, 40: 62.8% measured) but not the speed: 14.11,
   13.95 and 13.76 tok/s. The copies and uploads cost about what the extra hits save. Keep the budget at 5-10.
 - the margin hardly matters.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `GGML_SCHED_OVERLAP=0` | the cache branch no longer runs while the CPU computes the misses |
+| `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU are synchronous reads again |
+| `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
+| `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
+| `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
+| `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
+| `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
+| `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops |
+| `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
+| `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan (upstream): no fused adds |
+| `GGML_VK_DISABLE_FUSION=1` | Vulkan (upstream): no fused operations at all, to measure what fusion is worth on a GPU |
+
+With `-v`, the cache prints its statistics at exit: hit rate, swaps, MiB uploaded per token, the time of the update between
+ubatches and, with `--moe-cache-resize`, how often it was released.
 
 ## Sizing the cache
 
@@ -97,7 +240,7 @@ while kill -0 $pid 2>/dev/null; do
 done | awk '{ if ($2 > v[$1]) v[$1] = $2; if ($3 > g[$1]) g[$1] = $3 } END { for (k in v) print k ": peak vram " v[k] " MiB, peak gtt " g[k] " MiB" }'
 ```
 
-### Large prompt batches: `--moe-cache-resize`
+### Sizing with `--moe-cache-resize`
 
 A prompt with the experts in host memory is faster with large ubatches, because each ubatch copies the experts of every
 layer to the GPU once (`-ub 2048` read a 9.7k-token prompt at 84 tok/s on the test machine, `-ub 512` at 40), but the
@@ -181,27 +324,19 @@ that borrows the main model's embedding and output head). The draft context has 
 
 - Put the draft on the GPU with the most room (`-ngld 99 -devd Vulkan0`) and its experts on the CPU (`-cmoed`). A draft on
   the CPU (`-ngld 0`) reads its output head for every drafted token and is slower than no draft.
-- `--spec-draft-n-ubatch 16`: the draft's compute buffer is sized for its batch, 980 MiB at the default `-ub 512`, 8 MiB at
-  16. A draft step has one or a few tokens.
+- The draft's compute buffers are sized for its batch, 980 MiB at the default `-ub 512`, 8 MiB at 16. With
+  `--moe-cache-resize` the draft keeps its large buffers only while it reads a prompt, so `--spec-draft-n-ubatch 2048` reads
+  prompts faster at no cost during generation; without it, use `--spec-draft-n-ubatch 16` (or 31, the largest that stays
+  small).
 - Size the cache per GPU around the draft, with the headroom above for the compute buffer that is reserved again.
 - One drafted token (`--spec-draft-n-max 1`) was best on the test machine: each extra drafted token makes the CPU compute
   the experts of one more token per pass.
 
-## Diagnostics
+## Fusion
 
-| Variable | Effect |
-| --- | --- |
-| `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
-| `GGML_SCHED_OVERLAP=0` | the cache branch no longer runs while the CPU computes the misses |
-| `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU are synchronous reads |
-| `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
-| `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
-| `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase |
-| `GGML_VK_PERF_LOGGER=1` | Vulkan: GPU time of each operation (adds a barrier per operation, so short operations look longer than they are) |
-| `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan: no fused adds (see below) |
-| `GGML_VK_DISABLE_FUSION=1` | Vulkan: no fused operations at all, to measure what fusion is worth on a GPU |
+The switches and timing tools are in [Environment variables](#environment-variables).
 
-### Fusion on GPUs without fp16
+### On GPUs without fp16
 
 Vulkan fuses chains of f32 adds (the sum of the experts' outputs, adds before an RMS norm) into one dispatch. It used to
 require `shaderRoundingModeRTEFloat16`, which GPUs without fp16 arithmetic (GCN cards such as the RX 480) lack; the f32
@@ -217,9 +352,6 @@ were the only fusion its hardware turned off; with them on, a profile shows `MUL
 The other unfused patterns with Qwen3.8-Flash-Next do not depend on the GPU: the norm+mul+rope fusion handles normal and
 neox RoPE only (the model uses interleaved multi-section RoPE), the fused QSA top-k is skipped by design for small k (64-128
 here), and the matmul+add patterns do not occur in this model's graph.
-
-At exit, `-v` prints the cache statistics: hit rate, swaps, MiB uploaded per token and the time of the update between
-ubatches.
 
 ## Measured
 
