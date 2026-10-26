@@ -108,8 +108,9 @@ not run for ubatches of more than 32 tokens anyway, so with `--moe-cache-resize`
 - the next batch of 32 tokens or less reserves compute buffers for 32 tokens, allocates the cache again and uploads its
   experts: the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
 
-Size the cache for generation (small compute buffers) and check that the prompt phase fits without it: weights, KV, the
-compute buffers of `-ub` tokens and a draft model. Each switch back costs one upload of the cache, about a second for 7 GB.
+Size the cache for generation and check that the prompt phase fits without it: weights, KV, the compute buffers of `-ub`
+tokens and a draft model. During generation the compute buffers are tiny (a few MiB on the test machines), so the
+cache gets nearly all the memory that the prompt's compute buffers take; note that `-ub` is capped by `-b`. Each switch back costs one upload of the cache, about a second for 7 GB.
 It is meant for one sequence at a time (`-np 1`): with several, prompt chunks and generation mix and every mixed batch
 switches.
 
