@@ -35,6 +35,15 @@ A saved set from one kind of work (code, chat, a language) is a good start for t
 The refill moves up to the whole cache in one step, and the generation waits for its copies. It pays on long sessions
 (14.1 against 13.9 tok/s over the 5-turn session below); on a single short answer `--moe-cache-refill 0` can be faster.
 
+**Tuning the refresh.** `tools/moe-trace/hot_spare_sim.py` replays a recorded session through the refresh logic. On the
+5-turn session below (simulated hit rates within 1 point of the measured ones):
+
+- half-life 16 to 512 and refill 32 to 256 all give 54.4-56.4% hits; the defaults (64, 128) are 0.6 points from the best.
+  Very short or very long memories (8, 1024), no refill, and a fixed set (30%, a set saved from another prompt) are worse.
+- the upload budget raises the hit rate (5 MiB/token: 56.6%, 20: 59.0%, 40: 62.8% measured) but not the speed: 14.11,
+  13.95 and 13.76 tok/s. The copies and uploads cost about what the extra hits save. Keep the budget at 5-10.
+- the margin hardly matters.
+
 ## Sizing the cache
 
 The cache gets whatever VRAM is left on each GPU. Everything else on the card comes first:
@@ -49,7 +58,7 @@ All of these are printed at load with `-v`, one line per device:
 | --- | --- | --- |
 | weights | `load_tensors: Vulkan0 model buffer size` | the dense layers on that card and, on the last card, the output head |
 | KV and recurrent state | `llama_kv_cache: ... KV buffer size`, `llama_memory_recurrent: ... RS buffer size` | grow with the context (`-c`) |
-| compute buffer | `sched_reserve: Vulkan0 compute buffer size` | the first GPU holds the experts of one layer while a prompt batch runs on the GPU (batches of 32 tokens or more, `GGML_OP_OFFLOAD_MIN_BATCH`), about 1 GB below; `--no-op-offload` removes that part, longer prompts then compute their experts on the CPU |
+| compute buffer | `sched_reserve: Vulkan0 compute buffer size` | the first GPU holds the experts of one layer while a prompt batch runs on the GPU (batches of 32 tokens or more, `GGML_OP_OFFLOAD_MIN_BATCH`), about 1 GB below; `--no-op-offload` removes that part, prompts then compute their experts on the CPU, which on the test machine was as fast (42.8 against 40.3 tok/s for a 9.7k-token prompt) |
 | draft model (speculative decoding) | the same lines after `creating MTP draft context` | see below |
 | the cache itself | `impl: Vulkan0 MoE cache size = ... for ... MiB of host experts` | |
 | headroom | | see below |
