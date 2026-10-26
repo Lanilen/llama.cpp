@@ -1,10 +1,17 @@
 # About this fork
 
-This is a personal fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) with a few Vulkan backend patches for older GPUs. It is not affiliated with ggml-org, and the patches have not been submitted upstream. Upstream changes are merged in regularly.
+This is a personal fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that makes large MoE models run
+better on older GPUs with the Vulkan backend, tested on two AMD RX 480s (8 GB, no fp16) with the experts in system memory.
+It is not affiliated with ggml-org, and the patches have not been submitted upstream.
 
-The patches live on the `vk-sparse-attn` branch. `master` tracks upstream unchanged.
+| Branch | What it has |
+|---|---|
+| `master` | upstream, unchanged |
+| `vk-sparse-attn` | Vulkan support for the sparse-attention ops on GPUs without fp16 (below) |
+| [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | a GPU cache of the most used experts that runs beside the CPU, and scheduler and Vulkan changes for models with experts on the CPU (below) |
+| [`combined`](https://github.com/Lanilen/llama.cpp/tree/combined) | both, the one to use on an RX 480 |
 
-## What it changes
+## Sparse attention on GPUs without fp16 (`vk-sparse-attn`)
 
 Models with a lightning-indexer sparse attention (Qwen3.8-Flash-Next / `qwen4exp`, DeepSeek V3.2/V4-style indexers) use two ops that upstream Vulkan did not fully cover. On GPUs without fp16 support, such as AMD Polaris (RX 470/480/570/580), both ops fell back to the CPU in every full-attention layer.
 
@@ -13,7 +20,7 @@ Models with a lightning-indexer sparse attention (Qwen3.8-Flash-Next / `qwen4exp
 
 Nothing else changes, and GPUs that have fp16 run the same indexer shader as upstream.
 
-## Results
+### Results
 
 Correctness (`test-backend-ops -b Vulkan0`, all cases supported, all passed):
 
@@ -42,18 +49,51 @@ The gain grows with context, because upstream runs the indexer on the CPU over e
 
 From 0 to 16384 tokens of context, upstream loses 13% of its generation speed; the patched build loses 4.5%.
 
+## MoE hot spare cache (`moe-hot-spare`)
+
+When the experts of a MoE model stay in system memory (`--cpu-moe`, `--n-cpu-moe`), the CPU computes every selected expert while the GPUs wait. `--moe-cache-mode hot-spare` keeps the most used experts in the free VRAM of each GPU: each layer runs its resident experts on its own GPU at the same time as the CPU computes the others, and the results are added. The resident set follows the text with a few MiB of background uploads per token. Everything new is behind new options and environment variables.
+
+- **The cache:** decayed usage scores, a rebalance after each prompt and one after the first generated tokens, per-GPU sizes (`--moe-cache-mib N1,N2`), saved and reloaded sets (`--moe-cache-save`, `--moe-cache-hot`), uploads in the background on the transfer queue with the copies on a worker thread.
+- **`--moe-cache-resize`:** the cache gives its VRAM to the compute buffers of prompt batches and takes it back for generation, so prompts can run with a large `-ub` (also for an MTP draft context).
+- **Scheduler:** the GPU part of a layer runs while the CPU computes its experts (overlapping splits), and the copies of a split's inputs to the CPU are asynchronous, which also helps a model with its experts on the CPU and no cache.
+- **Vulkan:** MUL_MAT_ID skips the work of unused slots, background uploads and per-device pinned memory, asynchronous reads without pinned memory, fused adds on GPUs without fp16 rounding modes, perf logger fixes, timing tools.
+- **Tools** (`tools/moe-trace`): a router trace recorder, cache simulators that replay traces against cache sizes and refresh settings, a multi-turn session benchmark and an upload benchmark.
+
+The full guide, with the options, how to size the cache for each GPU and the measurements: [docs/moe-hot-spare.md](https://github.com/Lanilen/llama.cpp/blob/moe-hot-spare/docs/moe-hot-spare.md).
+
+### Results
+
+2x RX 480 8 GB, Threadripper 1920X, Qwen3.8-Flash-Next UD-IQ4_XS with the experts in system memory, speculative decoding with the model's MTP head, a 5-turn coding session with `tools/moe-trace/session-bench.py` (a 9.6k-token paste, then four turns of up to 1024 tokens, greedy):
+
+| | prompt (9.6k tokens) | generation | whole session |
+|---|---|---|---|
+| no cache, `-ub 512` | 36.5 tok/s | 11.7 tok/s | 640 s |
+| hot spare `5000,4150` MiB, `--moe-cache-resize`, `-ub 4096`, draft `-ub 2048` | 86.0 tok/s | 14.5 tok/s | 417 s |
+
+On a single 256-token answer without MTP, generation went from 9.8 tok/s (experts on the CPU, before these changes) to 12.2 tok/s (hot spare, 8600 MiB). On an RTX 4070 Ti with Qwen3-Coder-30B-A3B UD-Q4_K_XL (experts on the CPU, one 256-token answer) it went from 26.6 to 43.3 tok/s with a 3000 MiB cache.
+
 ## Build
 
 ```bash
-git clone -b vk-sparse-attn https://github.com/Lanilen/llama.cpp
+git clone -b combined https://github.com/Lanilen/llama.cpp
 cd llama.cpp
 cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vk -j
 ```
 
+The setup used on the 2x RX 480 machine (see the guide for how to size it for other GPUs):
+
+```bash
+llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+    -dev Vulkan1,Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -c 16384 -ub 4096 -b 4096 \
+    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 5000,4150 --moe-cache-budget 5 \
+    -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -cmoed -devd Vulkan0 \
+    --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 2048
+```
+
 ## How it was made
 
-The code was written by [Claude Code](https://claude.com/claude-code) (Claude Opus 5.5) from a written brief. The brief came from an earlier hands-on experiment on the RX 480 and set the approach, the scope and the tests. Claude implemented both patches, built them and ran `test-backend-ops` on the RTX 4070 Ti, including with fp16 disabled to exercise the RX 480 code path. I ran the tests and benchmarks on the RX 480 and checked the results. Both commits carry a `Co-Authored-By` trailer.
+The code was written by [Claude Code](https://claude.com/claude-code) (Claude Opus 5.5) from written briefs. The briefs came from earlier hands-on experiments on the RX 480 and set the approach, the scope and the tests; the hot spare work then went step by step, and I chose each next step from the measurements. Claude implemented the patches, built them and ran the correctness tests on the RTX 4070 Ti, including with fp16 disabled to exercise the RX 480 code paths. I ran the tests and benchmarks on the RX 480s and checked the results. The commits carry a `Co-Authored-By` trailer.
 
 ## License
 
