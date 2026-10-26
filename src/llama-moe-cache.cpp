@@ -16,6 +16,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <chrono>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -402,6 +403,13 @@ struct llama_moe_cache::impl {
     int64_t refill_tokens = 0; // generated tokens after which the cache is rebalanced from their scores, 0 = never
     int64_t refill_left   = 0; // generated tokens until that rebalance, 0 = none pending
     std::string save_path;   // the resident experts are written there at exit
+
+    // hot spare mode with resize: the device memory of the cache is released while large batches run
+    bool resize   = false;
+    bool released = false;
+    std::string hot_pending; // the hot file, loaded at the first restore
+    size_t n_restores    = 0;
+    size_t restore_bytes = 0;
     std::vector<pending_upload> pending_uploads;
     std::vector<ggml_backend_t> layer_backends; // [n_layer] backend of the device of each layer
 
@@ -431,6 +439,9 @@ struct llama_moe_cache::impl {
             half_life(params.half_life), margin(params.margin), budget(params.budget), layers(model.layers.size()) {
         if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && !model.hparams.no_alloc) {
             save_path = params.save;
+            resize    = params.resize;
+        } else if (params.resize && mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+            LLAMA_LOG_WARN("%s: --moe-cache-resize needs --moe-cache-mode hot-spare, ignored\n", __func__);
         }
         refill_tokens = std::max<int64_t>(0, params.refill);
         refill_left   = refill_tokens; // also for a first prompt too short to count as one
@@ -810,36 +821,11 @@ struct llama_moe_cache::impl {
             }
         }
 
-        if (!path.empty()) {
-            std::ifstream f(path);
-            if (!f) {
-                throw std::runtime_error("failed to open the MoE cache hot file " + path);
-            }
-            std::string line;
-            while (std::getline(f, line)) {
-                if (line.empty() || line[0] == '#') {
-                    continue;
-                }
-                std::istringstream ss(line);
-                int32_t il;
-                int32_t e;
-                if (!(ss >> il >> e)) {
-                    throw std::runtime_error("invalid line in the MoE cache hot file " + path + ": " + line);
-                }
-                if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
-                    continue;
-                }
-                layer & l = layers[il];
-                group & g = groups[l.ig];
-                if (e < 0 || e >= (int32_t) l.slot_of.size() || l.slot_of[e] >= 0 || g.n_resident >= g.n_slots) {
-                    continue;
-                }
-                const int32_t s = g.n_resident++;
-                g.key_of_slot[s] = il*(int32_t) l.slot_of.size() + e;
-                set_resident(l, e, s);
-                upload_expert(g, l, e, s, false);
-                warm = true;
-            }
+        // with resize, the device memory is released before the first batch, the hot file is loaded when it is restored
+        if (resize) {
+            hot_pending = path;
+        } else if (!path.empty()) {
+            load_hot(path);
         }
 
         flush_maps();
@@ -849,6 +835,39 @@ struct llama_moe_cache::impl {
                 d.pending = false;
             }
             d.staging_used = 0;
+        }
+    }
+
+    // hot spare mode: upload the resident experts listed in the hot file, most used first, into the free slots
+    void load_hot(const std::string & path) {
+        std::ifstream f(path);
+        if (!f) {
+            throw std::runtime_error("failed to open the MoE cache hot file " + path);
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::istringstream ss(line);
+            int32_t il;
+            int32_t e;
+            if (!(ss >> il >> e)) {
+                throw std::runtime_error("invalid line in the MoE cache hot file " + path + ": " + line);
+            }
+            if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+                continue;
+            }
+            layer & l = layers[il];
+            group & g = groups[l.ig];
+            if (e < 0 || e >= (int32_t) l.slot_of.size() || l.slot_of[e] >= 0 || g.n_resident >= g.n_slots) {
+                continue;
+            }
+            const int32_t s = g.n_resident++;
+            g.key_of_slot[s] = il*(int32_t) l.slot_of.size() + e;
+            set_resident(l, e, s);
+            upload_expert(g, l, e, s, false);
+            warm = true;
         }
     }
 
@@ -1064,6 +1083,17 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (released) {
+            // no device memory: the scores are kept, the cache is refreshed when it is restored
+            if (half_life > 0.0f && !small) {
+                rebalance = true;
+                start_refill();
+            }
+            st.t_us += ggml_time_us() - t_start_us;
+            spare_cur = nullptr;
+            return;
+        }
+
         activate_uploads();
 
         if (half_life > 0.0f) {
@@ -1198,6 +1228,159 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // the driver may make freed device memory available some time after the buffer is released (amdgpu releases
+    // buffers that the GPU used in a deferred way): a buffer allocated before that may be placed in host memory
+    static void wait_for_free_memory(ggml_backend_t backend, size_t target, const char * what) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        const int64_t t_start_us = ggml_time_us();
+        for (;;) {
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (free >= target || total == 0) {
+                return;
+            }
+            if (ggml_time_us() - t_start_us > 2000000) {
+                LLAMA_LOG_WARN("%s: %s: %.2f MiB free on %s after 2 s, waited for %.2f MiB\n", __func__, what,
+                    free/1024.0/1024.0, ggml_backend_name(backend), target/1024.0/1024.0);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    // hot spare mode with resize: free the device memory of the cache, the scores and the resident set are kept
+    void release() {
+        if (!resize || released) {
+            return;
+        }
+        // the uploads in flight write to the banks
+        finish_submits();
+        for (device & d : devices) {
+            if (!d.buf) {
+                continue;
+            }
+            if (d.upload_bg != nullptr) {
+                d.upload_bg_done(d.backend, std::max(d.half_ticket[0], d.half_ticket[1]), true);
+            }
+            ggml_backend_synchronize(d.backend);
+        }
+        // an upload that did not finish keeps its expert in the resident set (key_of_slot), it is uploaded again
+        for (const pending_upload & pu : pending_uploads) {
+            group & g = groups[pu.ig];
+            const int32_t n_expert = g.ref[0]->ne[2];
+            layers[pu.key / n_expert].uploading[pu.key % n_expert] = 0;
+            g.slot_pending[pu.slot] = 0;
+        }
+        pending_uploads.clear();
+        for (layer & l : layers) {
+            if (l.ig < 0) {
+                continue;
+            }
+            for (size_t e = 0; e < l.slot_of.size(); ++e) {
+                if (l.slot_of[e] >= 0) {
+                    set_resident(l, (int32_t) e, -1);
+                }
+            }
+        }
+        for (device & d : devices) {
+            if (!d.buf) {
+                continue;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
+            d.buf.reset();
+            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+            d.staging_used = 0;
+            d.half         = 0;
+            d.pending      = false;
+            wait_for_free_memory(d.backend, free + d.buf_size/10*9, "releasing the MoE cache");
+        }
+        released = true;
+    }
+
+    // hot spare mode with resize: allocate the device memory again and upload the resident experts:
+    // the hot file the first time, the resident set if it came from a hot file, otherwise the next refresh fills
+    // the empty slots from the scores, like the rebalance after a prompt
+    void restore() {
+        if (!resize || !released) {
+            return;
+        }
+        for (device & d : devices) {
+            if (!d.ctx) {
+                continue;
+            }
+            wait_for_free_memory(d.backend, d.buf_size + 64*1024*1024, "restoring the MoE cache");
+            d.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft));
+            if (!d.buf) {
+                throw std::runtime_error("failed to allocate the MoE cache buffers");
+            }
+            ggml_backend_buffer_clear(d.buf.get(), 0);
+            ggml_backend_buffer_set_usage(d.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        released = false;
+        n_restores++;
+        for (layer & l : layers) {
+            if (l.ig >= 0) {
+                l.dirty = true; // the device maps are new
+            }
+        }
+
+        if (!hot_pending.empty()) {
+            const std::string path = hot_pending;
+            hot_pending.clear();
+            load_hot(path);
+        } else if (warm) {
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                const int32_t n_expert = g.n_slots > 0 ? (int32_t) g.ref[0]->ne[2] : 0;
+                for (int32_t s = 0; s < g.n_slots; ++s) {
+                    const int32_t key = g.key_of_slot[s];
+                    if (key < 0) {
+                        continue;
+                    }
+                    layer & l = layers[key / n_expert];
+                    const int32_t e = key % n_expert;
+                    if (upload_expert(g, l, e, s, true)) {
+                        l.uploading[e] = 1;
+                        g.slot_pending[s] = 1;
+                        pending_uploads.push_back({ (int32_t) ig, key, s, 0 });
+                    } else {
+                        set_resident(l, e, s);
+                    }
+                    for (const ggml_tensor * t : g.ref) {
+                        restore_bytes += t->nb[2];
+                    }
+                }
+            }
+            for (device & d : devices) {
+                if (d.upload_bg != nullptr) {
+                    submit_bg(d, true);
+                }
+            }
+        } else {
+            for (group & g : groups) {
+                std::fill(g.key_of_slot.begin(), g.key_of_slot.end(), -1);
+                g.n_resident = 0;
+            }
+        }
+
+        flush_maps();
+        for (device & d : devices) {
+            if (d.pending) {
+                ggml_backend_synchronize(d.backend);
+                d.pending = false;
+                if (d.upload_bg == nullptr) {
+                    d.staging_used = 0;
+                }
+            }
+        }
+    }
+
     // hot spare mode: count the next generated tokens apart, for one rebalance from their scores
     void start_refill() {
         refill_left = refill_tokens;
@@ -1213,7 +1396,8 @@ struct llama_moe_cache::impl {
             return false;
         }
         // large batches use most experts of a layer, they keep running all host experts with the scheduler's offload
-        if (n_tokens == 0 || n_tokens > max_batch) {
+        // with resize, the cache has no device memory while large batches run
+        if (n_tokens == 0 || n_tokens > max_batch || released) {
             return false;
         }
         const layer & l = layers[il];
@@ -1412,6 +1596,10 @@ struct llama_moe_cache::impl {
         };
         log_spare("ubatch <= 32", spare_small, true);
         log_spare("ubatch  > 32", spare_large, false);
+        if (resize) {
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again\n",
+                n_restores, restore_bytes/1024.0/1024.0);
+        }
         if (worker) {
             const size_t bytes = spare_small.bytes + spare_large.bytes;
             const int64_t t_us = worker->t_us;
@@ -1444,6 +1632,22 @@ bool llama_moe_cache::get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe
 
 ggml_tensor * llama_moe_cache::record(ggml_context * ctx, int32_t il, ggml_tensor * ids) const {
     return pimpl->record(ctx, il, ids);
+}
+
+int64_t llama_moe_cache::max_hot_spare_batch() {
+    return impl::max_batch;
+}
+
+bool llama_moe_cache::resizes() const {
+    return pimpl->resize;
+}
+
+void llama_moe_cache::release() {
+    pimpl->release();
+}
+
+void llama_moe_cache::restore() {
+    pimpl->restore();
 }
 
 void llama_moe_cache::update(int64_t n_tokens) {

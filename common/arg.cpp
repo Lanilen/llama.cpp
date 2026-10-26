@@ -2885,6 +2885,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_REFILL"));
     add_opt(common_arg(
+        {"--moe-cache-resize"},
+        "hot spare mode: release the cache's GPU memory while batches of more than 32 tokens (prompts) run, so that their\n"
+        "compute buffers can use it (e.g. a large --ubatch-size), and restore the cache for generation (default: off)",
+        [](common_params & params) {
+            params.moe_cache_resize = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_RESIZE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

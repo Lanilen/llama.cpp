@@ -97,6 +97,22 @@ while kill -0 $pid 2>/dev/null; do
 done | awk '{ if ($2 > v[$1]) v[$1] = $2; if ($3 > g[$1]) g[$1] = $3 } END { for (k in v) print k ": peak vram " v[k] " MiB, peak gtt " g[k] " MiB" }'
 ```
 
+### Large prompt batches: `--moe-cache-resize`
+
+A prompt with the experts in host memory is faster with large ubatches, because each ubatch copies the experts of every
+layer to the GPU once (`-ub 2048` read a 9.7k-token prompt at 84 tok/s on the test machine, `-ub 512` at 40), but the
+compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 against 1.0 and 0.5 at 512). The hot spare does
+not run for ubatches of more than 32 tokens anyway, so with `--moe-cache-resize` the two take turns:
+
+- a batch of more than 32 tokens frees the cache's GPU memory, and the compute buffers are reserved for `-ub` tokens;
+- the next batch of 32 tokens or less reserves compute buffers for 32 tokens, allocates the cache again and uploads its
+  experts: the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
+
+Size the cache for generation (small compute buffers) and check that the prompt phase fits without it: weights, KV, the
+compute buffers of `-ub` tokens and a draft model. Each switch back costs one upload of the cache, about a second for 7 GB.
+It is meant for one sequence at a time (`-np 1`): with several, prompt chunks and generation mix and every mixed batch
+switches.
+
 ### Worked example
 
 2x RX 480 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS, `-dev Vulkan1,Vulkan0 -ngl 99 -ncmoe 48 -c 9216`, MTP draft on Vulkan0 with

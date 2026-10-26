@@ -607,6 +607,7 @@ struct common_params {
     float moe_cache_budget_mib = 10.0f; // hot spare mode: MiB uploaded per token
     std::string moe_cache_save;         // hot spare mode: resident experts file written at exit
     int32_t moe_cache_refill = 128;     // hot spare mode: generated tokens after a prompt for one rebalance from them
+    bool    moe_cache_resize = false;   // hot spare mode: the cache gives its VRAM to the compute buffers of large batches
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

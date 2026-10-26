@@ -570,10 +570,15 @@ llama_context::llama_context(
             mcp.budget    = (size_t) (std::max(0.0f, params.moe_cache_budget_mib)*1024*1024);
             mcp.save      = params.moe_cache_save ? params.moe_cache_save : "";
             mcp.refill    = params.moe_cache_refill;
+            mcp.resize    = params.moe_cache_resize;
             if (params.moe_cache_sizes != nullptr) {
                 mcp.sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + params.n_moe_cache_sizes);
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
+            if (moe_cache->resizes()) {
+                // the first reserve is for large batches, the cache is restored for the first small one
+                moe_cache->release();
+            }
         }
 
         sched_reserve();
@@ -759,7 +764,11 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    if (moe_cache && moe_cache->resizes() && !moe_resize_large) {
+        // generation: the batches run on the hot spare, the large ones switch to the other reserve first
+        n_tokens = std::min<uint32_t>(n_tokens, (uint32_t) llama_moe_cache::max_hot_spare_batch());
+    }
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -1950,6 +1959,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    // --moe-cache-resize: the compute buffers of large batches and the MoE cache take turns in the device memory
+    if (moe_cache && moe_cache->resizes()) {
+        const bool large = balloc->get_n_tokens() > llama_moe_cache::max_hot_spare_batch();
+        if (large != moe_resize_large) {
+            synchronize();
+            if (large) {
+                moe_cache->release();
+            }
+            moe_resize_large = large;
+            sched_need_reserve = true;
+            sched_reserve();
+            if (!large) {
+                // the small reserve above had no cache branch, reserve again with it
+                moe_cache->restore();
+                sched_need_reserve = true;
+            }
+        }
+    }
 
     sched_reserve();
 
@@ -4065,6 +4093,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_cache_resize            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
