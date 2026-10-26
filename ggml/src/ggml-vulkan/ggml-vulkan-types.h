@@ -1182,7 +1182,7 @@ inline std::mutex vk_memory_logger::log_mutex;
 
 class vk_perf_logger {
   public:
-    void print_timings(bool force = false);
+    void print_timings(bool force = false, const char * name = nullptr);
 
 
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops);

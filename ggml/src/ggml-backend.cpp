@@ -939,6 +939,7 @@ struct ggml_backend_sched_timing {
     int64_t t_copy_us[GGML_SCHED_MAX_BACKENDS];
     int64_t t_compute_us[GGML_SCHED_MAX_BACKENDS];
     int64_t n_splits_backend[GGML_SCHED_MAX_BACKENDS];
+    int64_t t_wait_us[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS]; // [split backend][input backend], part of the copies
 };
 
 struct ggml_backend_sched {
@@ -966,6 +967,7 @@ struct ggml_backend_sched {
     ggml_backend_event_t  overlap_events[GGML_SCHED_MAX_BACKENDS];
     bool                  overlap_events_init[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_t        overlap_wait_backend;  // while copying, wait for overlap_wait_event instead of this backend
+    struct ggml_backend_sched_timing * cur_timing; // GGML_SCHED_TIMING of the graph being computed
     ggml_backend_event_t  overlap_wait_event;
 
     int * node_backend_ids; // [graph_size]
@@ -1923,10 +1925,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        const int64_t t_wait_us = sched->cur_timing ? ggml_time_us() : 0;
         if (input_backend == sched->overlap_wait_backend) {
             ggml_backend_event_synchronize(sched->overlap_wait_event);
         } else {
             ggml_backend_synchronize(input_backend);
+        }
+        if (sched->cur_timing) {
+            sched->cur_timing->t_wait_us[split_backend_id][ggml_backend_sched_backend_id(sched, input_backend)] += ggml_time_us() - t_wait_us;
         }
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1958,6 +1964,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
     const int64_t t_graph_us = tm ? ggml_time_us() : 0;
+    sched->cur_timing = tm;
 
     // copy the input tensors to the split backend
     // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
@@ -2090,6 +2097,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         tm->n_graphs++;
         tm->t_total_us += ggml_time_us() - t_graph_us;
     }
+    sched->cur_timing = NULL;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2191,6 +2199,16 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             GGML_LOG_INFO("%s: timing:   %-10s %6.1f splits, copy inputs %8.3f ms, compute %8.3f ms per graph\n",
                 __func__, sched->timing_names[b], (double) tm->n_splits_backend[b]/tm->n_graphs,
                 tm->t_copy_us[b]/1000.0/tm->n_graphs, tm->t_compute_us[b]/1000.0/tm->n_graphs);
+            char waits[512] = "";
+            for (int ib = 0; ib < sched->n_backends; ib++) {
+                if (tm->t_wait_us[b][ib] > 0) {
+                    const size_t len = strlen(waits);
+                    snprintf(waits + len, sizeof(waits) - len, "%s %s %.3f ms", len ? "," : "", sched->timing_names[ib], tm->t_wait_us[b][ib]/1000.0/tm->n_graphs);
+                }
+            }
+            if (waits[0] != '\0') {
+                GGML_LOG_INFO("%s: timing:   %-10s        of the copies, waiting for%s\n", __func__, sched->timing_names[b], waits);
+            }
         }
     }
     for (int b = 0; b < sched->n_backends; b++) {
