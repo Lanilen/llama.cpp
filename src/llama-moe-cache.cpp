@@ -519,7 +519,8 @@ struct llama_moe_cache::impl {
             return res;
         };
 
-        // the budget is split among the devices with host experts like the layers, by the tensor split or by default by free memory
+        // the budget is split among the devices with host experts like the layers, by the tensor split or by default by free memory,
+        // or each device has the size given for it
         const float * tensor_split = model.tensor_split();
         const bool split_by_free = tensor_split == nullptr ||
             std::all_of(tensor_split, tensor_split + model.n_devices(), [](float x) { return x == 0.0f; });
@@ -529,7 +530,11 @@ struct llama_moe_cache::impl {
                 continue;
             }
             ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
-            if (split_by_free) {
+            if (!params.sizes.empty()) {
+                const auto it = std::find_if(model.devices.begin(), model.devices.end(), [&](const llama_device & ld) { return ld.dev == dev; });
+                const size_t i = it - model.devices.begin();
+                d.split = i < params.sizes.size() ? (double) params.sizes[i] : 0.0;
+            } else if (split_by_free) {
                 size_t free;
                 size_t total;
                 ggml_backend_dev_memory(dev, &free, &total);
@@ -541,7 +546,12 @@ struct llama_moe_cache::impl {
             }
             split_sum += d.split;
         }
-        if (split_sum == 0.0) {
+        if (!params.sizes.empty()) {
+            if (params.sizes.size() > model.devices.size()) {
+                LLAMA_LOG_WARN("%s: %zu MoE cache sizes for %zu devices, the extra sizes are ignored\n", __func__, params.sizes.size(), model.devices.size());
+            }
+            split_sum = (double) size; // the sum of the sizes, so each device gets its own
+        } else if (split_sum == 0.0) {
             // the devices do not report their free memory
             for (device & d : devices) {
                 d.split    = d.host_bytes > 0 ? 1.0 : 0.0;

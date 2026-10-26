@@ -2,6 +2,8 @@
 
 Records which experts the router of every MoE layer selects for every token, then replays the trace against expert cache policies to estimate what a GPU cache of hot experts would gain.
 
+The hot spare cache itself, its options and how to size it: [docs/moe-hot-spare.md](../../docs/moe-hot-spare.md).
+
 ## Trace
 
 ```bash

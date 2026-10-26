@@ -402,6 +402,8 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        const size_t * moe_cache_sizes; // bytes of the cache on each device of the model, in its device order, instead of the split of moe_cache_size [EXPERIMENTAL]
+        size_t n_moe_cache_sizes;
         enum llama_moe_cache_mode moe_cache_mode; // [EXPERIMENTAL]
         const char * moe_cache_device; // hot spare mode: name of the cache device for all layers, nullptr = the device of each layer [EXPERIMENTAL]
         const char * moe_cache_hot;    // hot spare mode: file with the resident experts, "layer expert" per line, most used first, nullptr = none [EXPERIMENTAL]

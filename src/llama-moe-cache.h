@@ -12,6 +12,7 @@ struct llama_model;
 
 struct llama_moe_cache_params {
     size_t size = 0;
+    std::vector<size_t> sizes; // bytes on each device of the model, in its device order, instead of the split of size
     llama_moe_cache_mode mode = LLAMA_MOE_CACHE_MODE_LRU;
     std::string device; // hot spare mode: cache device, empty = the device of each layer
     std::string hot;    // hot spare mode: file with the resident experts
