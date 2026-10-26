@@ -2639,12 +2639,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_build_forward_expand(gf, experts_c);
 
             ggml_tensor * ids_h = ggml_get_rows(ctx0, maps.miss, ggml_reshape_1d(ctx0, ids_rec, ggml_nelements(ids_rec)));
-            ggml_backend_sched_set_tensor_backend(sched, ids_h, backend_cpu);
+            ggml_tensor * first_h = ids_h;
             cb(ids_h, "ffn_moe_misses", il);
             ids_h = ggml_reshape_2d(ctx0, ids_h, selected_experts->ne[0], selected_experts->ne[1]);
 
             ggml_tensor * experts_h = build_experts(cur, ids_h, nullptr, selected_experts);
             cb(experts_h, "ffn_moe_down_host", il);
+
+            // every op of the CPU branch runs on the CPU: from 32 tokens the scheduler would otherwise offload its matrix
+            // multiplications to a GPU by copying all the experts of the layer, and reserve a compute buffer for that
+            for (ggml_tensor * t = first_h; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+                if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                    ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+                }
+                if (t == experts_h) {
+                    break;
+                }
+            }
 
             // each expert output comes from one branch and is zero in the other, so the sum is exact
             ggml_tensor * experts = ggml_add(ctx0, experts_c, experts_h);

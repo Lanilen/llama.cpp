@@ -1969,13 +1969,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 moe_cache->release();
             }
             moe_resize_large = large;
+            if (!large) {
+                // free the compute buffers of large batches before the cache takes the memory back, then reserve once,
+                // with the cache branch: a buffer allocated while a freed one is not released yet may go to host memory
+                sched.reset();
+                moe_cache->restore();
+            }
             sched_need_reserve = true;
             sched_reserve();
-            if (!large) {
-                // the small reserve above had no cache branch, reserve again with it
-                moe_cache->restore();
-                sched_need_reserve = true;
-            }
         }
     }
 
