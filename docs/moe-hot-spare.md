@@ -152,7 +152,20 @@ that borrows the main model's embedding and output head). The draft context has 
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase |
-| `GGML_VK_PERF_LOGGER=1` | Vulkan: GPU time of each operation (adds a barrier per operation) |
+| `GGML_VK_PERF_LOGGER=1` | Vulkan: GPU time of each operation (adds a barrier per operation, so short operations look longer than they are) |
+| `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan: no fused adds (see below) |
+| `GGML_VK_DISABLE_FUSION=1` | Vulkan: no fused operations at all, to measure what fusion is worth on a GPU |
+
+### Fusion on GPUs without fp16
+
+Vulkan fuses chains of f32 adds (the sum of the experts' outputs, adds before an RMS norm) into one dispatch. It used to
+require `shaderRoundingModeRTEFloat16`, which GPUs without fp16 arithmetic (GCN cards such as the RX 480) lack; the f32
+variants use no rounding mode, so this branch enables them there. `test-backend-ops -o ADD`, `-o ADD_ID` and
+`-p multi_add=1` pass on the RX 480 and on an RTX 4070 Ti with `GGML_VK_DISABLE_F16=1`.
+
+On the 2x RX 480 test machine (MTP + hot spare, the layout above) fused adds gave 14.44 -> 14.57 tok/s, and all fusions
+together 13.82 -> 14.60 tok/s: there the GPU time is in the dense matrix-vector products, not in the number of dispatches.
+Other GPUs may differ: compare a run with `GGML_VK_DISABLE_FUSION=1` or `GGML_VK_DISABLE_MULTI_ADD=1` against one without.
 
 At exit, `-v` prints the cache statistics: hit rate, swaps, MiB uploaded per token and the time of the update between
 ubatches.
