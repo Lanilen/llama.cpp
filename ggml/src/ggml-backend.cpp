@@ -962,6 +962,11 @@ struct ggml_backend_sched {
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
     uint8_t             * hv_tensor_overlap;     // [hash_set.size], nodes that start an overlapping split
     bool                  overlap_enabled;       // GGML_SCHED_OVERLAP=0 disables the overlap
+    // the end of the split before an overlapping split, so that the copies of the next split wait for it alone
+    ggml_backend_event_t  overlap_events[GGML_SCHED_MAX_BACKENDS];
+    bool                  overlap_events_init[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_t        overlap_wait_backend;  // while copying, wait for overlap_wait_event instead of this backend
+    ggml_backend_event_t  overlap_wait_event;
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1918,7 +1923,11 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-        ggml_backend_synchronize(input_backend);
+        if (input_backend == sched->overlap_wait_backend) {
+            ggml_backend_event_synchronize(sched->overlap_wait_event);
+        } else {
+            ggml_backend_synchronize(input_backend);
+        }
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
@@ -1990,10 +1999,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             copy_inputs(split);
         }
 
-        // an overlapping split is launched after the inputs of the next split are copied,
-        // so that the copies do not wait for it and the next split computes while it runs
+        // an overlapping split runs while the next split computes, the copies of the next split must not wait for it:
+        // with events they wait for the end of the previous split, otherwise they are made before it is launched
+        ggml_backend_event_t overlap_event = NULL;
         if (split->overlap && !sched->callback_eval) {
-            copy_inputs(&splits[split_id + 1]);
+            if (!sched->overlap_events_init[split_backend_id]) {
+                sched->overlap_events[split_backend_id] = ggml_backend_event_new(split_backend->device);
+                sched->overlap_events_init[split_backend_id] = true;
+            }
+            overlap_event = split->n_inputs == 0 ? sched->overlap_events[split_backend_id] : NULL;
+            if (overlap_event != NULL) {
+                ggml_backend_event_record(overlap_event, split_backend);
+            } else {
+                copy_inputs(&splits[split_id + 1]);
+            }
             copied_split_id = split_id + 1;
             if (tm) {
                 tm->n_overlap++;
@@ -2054,6 +2073,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        if (overlap_event != NULL) {
+            sched->overlap_wait_backend = split_backend;
+            sched->overlap_wait_event   = overlap_event;
+            copy_inputs(&splits[split_id + 1]);
+            sched->overlap_wait_backend = NULL;
+            sched->overlap_wait_event   = NULL;
         }
 
         prev_backend_id = split_backend_id;
@@ -2170,6 +2197,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        ggml_backend_event_free(sched->overlap_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
