@@ -13015,6 +13015,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ggml_vk_destroy_buffer(ctx->read_staging);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -13424,6 +13425,42 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
 
     if (!ret) {
         const size_t staging_size = size * n_copies;
+
+        // a part of read_staging of its own, so that the read stays asynchronous: the memcpy runs when it is synchronized
+        const size_t part_size = GGML_PAD(staging_size, 256);
+        if (ctx->read_staging_used == 0 && (ctx->read_staging == nullptr || ctx->read_staging->size < part_size)) {
+            ggml_vk_destroy_buffer(ctx->read_staging);
+            ctx->read_staging = ggml_vk_create_buffer_check(ctx->device, std::max<size_t>(part_size, 16*1024*1024),
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        }
+        if (ctx->read_staging_used + part_size <= ctx->read_staging->size) {
+            const size_t part_offset = ctx->read_staging_used;
+            ctx->read_staging_used += part_size;
+            ggml_vk_sync_buffers(nullptr, compute_ctx);
+
+            std::vector<vk::BufferCopy> slices(1);
+            if (size == stride_tensor) {
+                slices[0] = vk::BufferCopy{ src_offset, part_offset, staging_size };
+            } else {
+                slices.resize(n_copies);
+                for (size_t i = 0; i < n_copies; i++) {
+                    slices[i] = vk::BufferCopy{ src_offset + i * stride_tensor, part_offset + i * size, size };
+                }
+            }
+            compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->read_staging->buffer, slices);
+
+            const uint8_t * part = (const uint8_t *) ctx->read_staging->ptr + part_offset;
+            if (size == stride_data) {
+                deferred_memcpy(data, part, staging_size, &compute_ctx->out_memcpys);
+            } else {
+                for (size_t i = 0; i < n_copies; i++) {
+                    deferred_memcpy((uint8_t *)data + i * stride_data, part + i * size, size, &compute_ctx->out_memcpys);
+                }
+            }
+            return;
+        }
+
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
         ggml_vk_sync_buffers(nullptr, compute_ctx);
 
@@ -13593,12 +13630,22 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
     }
 
+    // the reads submitted with events come first
+    for (auto & cpys : ctx->event_out_memcpys) {
+        for (auto & cpy : *cpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        cpys->clear();
+    }
+    ctx->event_out_memcpys.clear();
+
     if (do_transfer) {
         for (auto& cpy : compute_ctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
     }
+    ctx->read_staging_used = 0;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -15304,6 +15351,18 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
 
     vkev->has_event = true;
 
+    // the memcpys of the asynchronous reads in this submission run when the event (or this backend) is synchronized
+    for (auto & cpy : compute_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    compute_ctx->in_memcpys.clear();
+    if (!compute_ctx->out_memcpys.empty()) {
+        auto cpys = std::make_shared<std::vector<vk_staging_memcpy>>(std::move(compute_ctx->out_memcpys));
+        compute_ctx->out_memcpys.clear();
+        vkev->out_memcpys.push_back(cpys);
+        ctx->event_out_memcpys.push_back(cpys);
+    }
+
     ggml_vk_set_event(compute_ctx, vkev->event);
 
     vkev->tl_semaphore.value++;
@@ -16425,6 +16484,14 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         uint64_t val = vkev->tl_semaphore.value;
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
         VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+
+        for (auto & cpys : vkev->out_memcpys) {
+            for (auto & cpy : *cpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+            cpys->clear();
+        }
+        vkev->out_memcpys.clear();
 
         // Reset and move submitted events
         for (auto& event : vkev->events_submitted) {
