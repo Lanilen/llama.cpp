@@ -12333,6 +12333,15 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
     }
+
+    // these buffers are not part of the scheduler's compute buffer, so the memory breakdown does not count them
+    const size_t total = ctx->prealloc_x->size + ctx->prealloc_y->size + ctx->prealloc_split_k->size + ctx->prealloc_add_rms_partials->size;
+    if (total > ctx->prealloc_logged_size) {
+        ctx->prealloc_logged_size = total;
+        GGML_LOG_DEBUG("%s: %s: preallocated buffers %.2f MiB (x %.2f, y %.2f, split_k %.2f, add_rms %.2f)\n", __func__, ctx->name.c_str(),
+            total/1048576.0, ctx->prealloc_x->size/1048576.0, ctx->prealloc_y->size/1048576.0,
+            ctx->prealloc_split_k->size/1048576.0, ctx->prealloc_add_rms_partials->size/1048576.0);
+    }
 }
 
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
