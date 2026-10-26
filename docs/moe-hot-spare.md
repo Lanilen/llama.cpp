@@ -10,6 +10,10 @@ llama-server -m model.gguf -ngl 99 --n-cpu-moe 48 \
     --moe-cache-mode hot-spare --moe-cache-mib 8600
 ```
 
+Add `--load-mode none` when the experts stay in host memory: without mmap they are loaded into the GPU backend's pinned
+host memory, and a prompt batch, which copies the experts of each layer to the GPU, reads them with DMA instead of through
+a staging copy. On the test machine below a 9.6k-token prompt read at 56.7 instead of 36.5 tok/s.
+
 It differs from the default `--moe-cache-mode lru`, which uploads every missing expert before running it on the GPU: on a slow
 PCIe link the uploads cost more than the CPU would. The hot spare uploads only a few MiB per token to follow the experts the
 current text uses.
