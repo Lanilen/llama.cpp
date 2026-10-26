@@ -4535,8 +4535,8 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->pipeline_robustness = pl_robustness_features.pipelineRobustness;
 
-        device->multi_add = vk12_props.shaderRoundingModeRTEFloat16 &&
-                            device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
+        // the f32 shaders use no rounding mode, the shaderRoundingModeRTEFloat16 requirement dated from an RTE16 build of them
+        device->multi_add = device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
