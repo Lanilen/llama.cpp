@@ -2053,8 +2053,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             overlap_event = split->n_inputs == 0 ? sched->overlap_events[split_backend_id] : NULL;
             if (overlap_event != NULL) {
-                // the reads of the next split are queued before the event, after the previous split and before this one
-                copy_inputs_issue(&splits[split_id + 1]);
+                // asynchronous reads of the next split are queued before the event, after the previous split and before this one
+                if (sched->async_reads) {
+                    copy_inputs_issue(&splits[split_id + 1]);
+                }
                 ggml_backend_event_record(overlap_event, split_backend);
             } else {
                 copy_inputs(&splits[split_id + 1]);
@@ -2124,6 +2126,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (overlap_event != NULL) {
             sched->overlap_wait_backend = split_backend;
             sched->overlap_wait_event   = overlap_event;
+            // synchronous reads are made now, they wait for the event instead of this split
+            if (!sched->async_reads) {
+                copy_inputs_issue(&splits[split_id + 1]);
+            }
             copy_inputs_finish(&splits[split_id + 1]);
             sched->overlap_wait_backend = NULL;
             sched->overlap_wait_event   = NULL;
