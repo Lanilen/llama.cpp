@@ -2791,13 +2791,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-cache-mib"}, "N[,N1,...]",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, one size is split among them like the layers (--tensor-split),\n"
+        "a list gives each GPU its size, in the order of the devices of the model (--device) (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            const auto values = string_split<std::string>(value, ',');
+            params.moe_cache_size = 0;
+            params.moe_cache_sizes.clear();
+            for (const auto & v : values) {
+                const long mib = std::stol(v);
+                if (mib < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_cache_size += (size_t) mib*1024*1024;
+                params.moe_cache_sizes.push_back((size_t) mib*1024*1024);
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            if (values.size() < 2) {
+                params.moe_cache_sizes.clear();
+            }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(

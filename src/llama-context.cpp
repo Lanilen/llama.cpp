@@ -570,6 +570,9 @@ llama_context::llama_context(
             mcp.budget    = (size_t) (std::max(0.0f, params.moe_cache_budget_mib)*1024*1024);
             mcp.save      = params.moe_cache_save ? params.moe_cache_save : "";
             mcp.refill    = params.moe_cache_refill;
+            if (params.moe_cache_sizes != nullptr) {
+                mcp.sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + params.n_moe_cache_sizes);
+            }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
         }
 
@@ -4044,6 +4047,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_sizes             =*/ nullptr,
+        /*.n_moe_cache_sizes           =*/ 0,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_LRU,
         /*.moe_cache_device            =*/ nullptr,
         /*.moe_cache_hot               =*/ nullptr,
