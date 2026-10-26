@@ -4535,7 +4535,8 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->pipeline_robustness = pl_robustness_features.pipelineRobustness;
 
-        // the f32 shaders use no rounding mode, the shaderRoundingModeRTEFloat16 requirement dated from an RTE16 build of them
+        // the multi_add variants read and write f32 (ggml_vk_fuse_multi_add fuses f32 adds only) and use no rounding mode;
+        // a variant writing f16 would also need shaderRoundingModeRTEFloat16, for round to nearest even like the reference
         device->multi_add = device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
@@ -14434,6 +14435,7 @@ uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml
 
     // The shader currently requires same shapes (but different strides are allowed),
     // everything f32, and no misalignment
+    // (f32 only also keeps the variants free of rounding modes, see device->multi_add)
     for (int32_t i = 0; i < num_adds; ++i) {
         const ggml_tensor *next_node = cgraph->nodes[node_idx + i];
         if (!ggml_are_same_shape(first_node, next_node->src[0]) ||
