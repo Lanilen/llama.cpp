@@ -598,6 +598,7 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     std::vector<size_t> moe_cache_sizes; // bytes on each GPU of the model, in its device order, instead of the split (empty = split)
+    std::string moe_trace_conversation; // llama-moe-trace: messages to trace as one sequence instead of a prompt and its generation
     llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_LRU;
     std::string moe_cache_device; // hot spare mode: cache device name, empty = the device of each layer
     std::string moe_cache_hot;    // hot spare mode: resident experts file
