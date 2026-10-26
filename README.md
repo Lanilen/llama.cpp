@@ -1,5 +1,7 @@
 # llama.cpp
 
+> **Fork note:** this fork makes large MoE models run better on older GPUs with Vulkan (tested on two AMD RX 480s): sparse-attention ops on GPUs without fp16, and a GPU cache of the most used experts that runs beside the CPU. See [FORK.md](https://github.com/Lanilen/llama.cpp/blob/vk-sparse-attn/FORK.md) for the branches, results and how it was made.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
