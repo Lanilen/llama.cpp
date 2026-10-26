@@ -18,6 +18,7 @@ struct llama_moe_cache_params {
     std::string hot;    // hot spare mode: file with the resident experts
     std::string save;   // hot spare mode: file the resident experts are written to at exit
     int64_t refill = 0; // hot spare mode: generated tokens after a prompt for one rebalance from their scores alone, 0 = none
+    bool resize = false; // hot spare mode: release the device memory for large batches (see llama_moe_cache::release)
 
     // hot spare mode: refresh of the resident experts between ubatches
     float  half_life = 0.0f; // tokens, 0 = the resident experts never change
@@ -58,6 +59,15 @@ public:
 
     // hot spare mode: after a ubatch of n_tokens tokens, update the scores and refresh the resident experts
     void update(int64_t n_tokens);
+
+    // hot spare mode: ubatches of more tokens do not run on the hot spare
+    static int64_t max_hot_spare_batch();
+
+    // hot spare mode with resize (--moe-cache-resize): the device memory of the cache can be released while large batches
+    // run, so that their compute buffers can use it, and restored for the small batches of generation
+    bool resizes() const;
+    void release();
+    void restore();
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;

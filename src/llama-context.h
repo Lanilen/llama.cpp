@@ -309,6 +309,10 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
+    // --moe-cache-resize: the compute buffers are reserved for large batches (prompts) with the MoE cache released,
+    // or for the small batches of generation with the cache in device memory
+    bool moe_resize_large = true;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
