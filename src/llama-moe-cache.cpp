@@ -6,12 +6,17 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -211,6 +216,74 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
 }
 
 struct llama_moe_cache::impl {
+    // hot spare mode: copies the experts to the staging memory on a thread of its own,
+    // their background uploads are submitted once the copies are done
+    struct copy_worker {
+        struct job {
+            uint8_t       * dst;
+            const uint8_t * src;
+            size_t          n;
+        };
+
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<job> queue;
+        bool busy = false;
+        bool stop = false;
+        std::atomic<int64_t> t_us { 0 };
+
+        copy_worker() : thread([this] { run(); }) {}
+
+        ~copy_worker() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+            }
+            cv.notify_all();
+            thread.join();
+        }
+
+        void run() {
+            std::unique_lock<std::mutex> lock(mutex);
+            for (;;) {
+                cv.wait(lock, [this] { return stop || !queue.empty(); });
+                if (queue.empty()) {
+                    return;
+                }
+                std::vector<job> jobs;
+                jobs.swap(queue);
+                busy = true;
+                lock.unlock();
+                const int64_t t_start_us = ggml_time_us();
+                for (const job & j : jobs) {
+                    memcpy(j.dst, j.src, j.n);
+                }
+                t_us += ggml_time_us() - t_start_us;
+                lock.lock();
+                busy = false;
+                cv.notify_all();
+            }
+        }
+
+        void post(std::vector<job> & jobs) {
+            if (jobs.empty()) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                queue.insert(queue.end(), jobs.begin(), jobs.end());
+            }
+            jobs.clear();
+            cv.notify_all();
+        }
+
+        void wait() {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [this] { return queue.empty() && !busy; });
+        }
+    };
+
     // a GPU with its own budget and banks, it caches the layers assigned to it
     struct device {
         ggml_backend_t backend;
@@ -240,6 +313,8 @@ struct llama_moe_cache::impl {
         int      half        = 0;
         uint64_t half_ticket[2] = { 0, 0 };
         bool     bg_recorded = false;    // background uploads were recorded since the last submission
+        std::vector<copy_worker::job> jobs; // the copies of the recorded uploads, for the copy worker
+        bool     submit_waiting = false; // the recorded uploads are submitted at the next update, after their copies
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -295,6 +370,8 @@ struct llama_moe_cache::impl {
         size_t bytes  = 0;
         int64_t t_us  = 0;
         int64_t t_copy_us = 0; // of t_us, copying the experts to the staging memory
+        int64_t t_sync_us = 0; // of t_us, waiting for the devices to finish the ubatch
+        int64_t t_wait_us = 0; // of t_us, waiting for the copy worker
     };
 
     struct binding {
@@ -319,6 +396,7 @@ struct llama_moe_cache::impl {
     spare_stats spare_small; // ubatches that run on the hot spare
     spare_stats spare_large;
     spare_stats * spare_cur = nullptr; // the stats of the running update
+    std::unique_ptr<copy_worker> worker; // LLAMA_MOE_CACHE_ASYNC=0 copies on the generation thread
     bool rebalance = false;  // large ubatches were processed since the last refresh
     bool warm      = false;  // the resident experts were loaded from a file
     int64_t refill_tokens = 0; // generated tokens after which the cache is rebalanced from their scores, 0 = never
@@ -792,8 +870,14 @@ struct llama_moe_cache::impl {
                     d.staging_used = 0;
                 }
                 uint8_t * src = d.staging + d.half*half_size + d.staging_used;
-                copy_to_staging(src, (const uint8_t *) l.experts[ip]->data + e*expert_size, expert_size);
+                const uint8_t * expert = (const uint8_t *) l.experts[ip]->data + e*expert_size;
+                // the upload is recorded now and reads the staging memory when it runs, after its submission
                 if (d.upload_bg(d.backend, g.banks[ip], src, s*expert_size, expert_size)) {
+                    if (get_worker() != nullptr) {
+                        d.jobs.push_back({ src, expert, expert_size });
+                    } else {
+                        copy_to_staging(src, expert, expert_size);
+                    }
                     d.staging_used += GGML_PAD(expert_size, 64);
                     d.bg_recorded = true;
                     continue;
@@ -802,6 +886,10 @@ struct llama_moe_cache::impl {
                 d.upload_bg = nullptr;
                 bg = false;
                 GGML_ASSERT(ip == 0 && "background upload failed after the first tensor of an expert");
+                if (worker) {
+                    worker->post(d.jobs);
+                    worker->wait();
+                }
                 ggml_backend_synchronize(d.backend);
                 d.staging_used = 0;
             }
@@ -826,17 +914,51 @@ struct llama_moe_cache::impl {
         }
     }
 
+    copy_worker * get_worker() {
+        static const bool async = [] {
+            const char * env = getenv("LLAMA_MOE_CACHE_ASYNC");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (async && !worker) {
+            worker = std::make_unique<copy_worker>();
+        }
+        return worker.get();
+    }
+
     // hot spare mode: submit the recorded background uploads of device d and give their ticket to the uploads that wait for one
-    void submit_bg(device & d) {
+    // with the copy worker and defer, the copies run in the background and the uploads are submitted by finish_submits
+    void submit_bg(device & d, bool defer = false) {
         if (!d.bg_recorded) {
             return;
         }
+        if (worker) {
+            worker->post(d.jobs);
+            if (defer) {
+                d.submit_waiting = true;
+                return;
+            }
+            const int64_t t_start_us = ggml_time_us();
+            worker->wait();
+            if (spare_cur != nullptr) {
+                spare_cur->t_wait_us += ggml_time_us() - t_start_us;
+            }
+        }
+        d.submit_waiting = false;
         const uint64_t ticket = d.upload_bg_submit(d.backend);
         d.half_ticket[d.half] = ticket;
         d.bg_recorded = false;
         for (pending_upload & pu : pending_uploads) {
             if (pu.ticket == 0 && &devices[groups[pu.ig].id] == &d) {
                 pu.ticket = ticket;
+            }
+        }
+    }
+
+    // hot spare mode: submit the uploads whose copies were left to the copy worker
+    void finish_submits() {
+        for (device & d : devices) {
+            if (d.submit_waiting) {
+                submit_bg(d);
             }
         }
     }
@@ -902,12 +1024,17 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        const int64_t t_sync_us = ggml_time_us() - t_start_us;
 
         // the selections of this ubatch ran on the hot spare if they were resident, for small ubatches
         const bool small = n_tokens <= max_batch;
         spare_stats & st = small ? spare_small : spare_large;
         st.tokens += n_tokens;
+        st.t_sync_us += t_sync_us;
         spare_cur = &st;
+
+        // the copies of the uploads of the previous update are done in the background by now
+        finish_submits();
 
         const float decay = half_life > 0.0f ? powf(0.5f, (float) n_tokens/half_life) : 1.0f;
         for (layer & l : layers) {
@@ -1056,7 +1183,7 @@ struct llama_moe_cache::impl {
 
         for (device & d : devices) {
             if (d.upload_bg != nullptr) {
-                submit_bg(d);
+                submit_bg(d, true);
             }
         }
     }
@@ -1086,6 +1213,7 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         // the background uploads read the staging memory until they are done
+        finish_submits();
         for (device & d : devices) {
             if (d.upload_bg != nullptr) {
                 d.upload_bg_done(d.backend, std::max(d.half_ticket[0], d.half_ticket[1]), true);
@@ -1267,13 +1395,19 @@ struct llama_moe_cache::impl {
                 return;
             }
             const size_t n = st.hits + st.misses;
-            LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: %zu tokens,%s %zu swaps, uploaded = %.2f MiB (%.2f MiB/token), update = %.3f ms/token (copy %.3f, %.2f GB/s)\n",
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: %zu tokens,%s %zu swaps, uploaded = %.2f MiB (%.2f MiB/token), update = %.3f ms/token (sync %.3f, copy %.3f, waiting for the copy worker %.3f)\n",
                 name, st.tokens, hits ? format(" hit rate = %.2f%%,", n > 0 ? 100.0*st.hits/n : 0.0).c_str() : "",
                 st.swaps, st.bytes/1024.0/1024.0, st.bytes/1024.0/1024.0/st.tokens, st.t_us/1000.0/st.tokens,
-                st.t_copy_us/1000.0/st.tokens, st.t_copy_us > 0 ? st.bytes/1e3/st.t_copy_us : 0.0);
+                st.t_sync_us/1000.0/st.tokens, st.t_copy_us/1000.0/st.tokens, st.t_wait_us/1000.0/st.tokens);
         };
         log_spare("ubatch <= 32", spare_small, true);
         log_spare("ubatch  > 32", spare_large, false);
+        if (worker) {
+            const size_t bytes = spare_small.bytes + spare_large.bytes;
+            const int64_t t_us = worker->t_us;
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, copy worker: %.3f ms/token in the background, %.2f GB/s\n",
+                t_us/1000.0/std::max<size_t>(spare_small.tokens + spare_large.tokens, 1), t_us > 0 ? bytes/1e3/t_us : 0.0);
+        }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
