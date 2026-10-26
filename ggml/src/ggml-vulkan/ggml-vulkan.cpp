@@ -901,6 +901,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 
 static bool vk_host_timing_enabled = getenv("GGML_VK_HOST_TIMING") != nullptr;
 static thread_local int64_t vk_host_timing_submit_us = 0;
+static thread_local int64_t vk_host_timing_submits = 0;
 
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (ctx->seqs.empty()) {
@@ -978,6 +979,7 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     ctx->p->q->handle->submit(submit_infos, fence);
     if (vk_host_timing_enabled) {
         vk_host_timing_submit_us += ggml_time_us() - t_submit_us;
+        vk_host_timing_submits++;
     }
 
     ctx->seqs.clear();
@@ -4284,6 +4286,12 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        }
+        // GGML_VK_FLOPS_PER_SUBMIT: fixed flops between submits instead of the estimate from the previous graph, 0 disables flop based submits
+        device->flops_per_submit_override = -1;
+        const char* GGML_VK_FLOPS_PER_SUBMIT = getenv("GGML_VK_FLOPS_PER_SUBMIT");
+        if (GGML_VK_FLOPS_PER_SUBMIT != nullptr) {
+            device->flops_per_submit_override = std::stoll(GGML_VK_FLOPS_PER_SUBMIT);
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -13385,9 +13393,10 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     if (vk_host_timing_enabled && ctx->host_timing.calls > 0) {
         const auto & ht = ctx->host_timing;
         const double c = (double) ht.calls;
-        GGML_LOG_INFO("%s: host timing: %lld graph_compute calls, %.1f nodes per call, per call: total %.3f ms = setup %.3f + fusion checks %.3f + recording %.3f (of which queue submits %.3f) + tail %.3f; %.2f us per node\n",
-            ctx->name.c_str(), (long long) ht.calls, ht.nodes/c, ht.total_us/1000.0/c, ht.setup_us/1000.0/c, ht.fusion_us/1000.0/c, ht.build_us/1000.0/c,
-            ht.submit_us/1000.0/c, (ht.total_us - ht.setup_us - ht.fusion_us - ht.build_us)/1000.0/c, (double) ht.total_us/std::max<int64_t>(ht.nodes, 1));
+        GGML_LOG_INFO("%s: host timing: %lld graph_compute calls, %.1f nodes and %.2f queue submits per call, per call: total %.3f ms = setup %.3f + fusion checks %.3f + recording %.3f + queue submits %.3f + tail %.3f; %.2f us per node, %.1f us per submit\n",
+            ctx->name.c_str(), (long long) ht.calls, ht.nodes/c, ht.submits/c, ht.total_us/1000.0/c, ht.setup_us/1000.0/c, ht.fusion_us/1000.0/c, ht.build_us/1000.0/c,
+            ht.submit_us/1000.0/c, (ht.total_us - ht.setup_us - ht.fusion_us - ht.build_us - ht.submit_us)/1000.0/c, (double) ht.total_us/std::max<int64_t>(ht.nodes, 1),
+            (double) ht.submit_us/std::max<int64_t>(ht.submits, 1));
     }
 
     ggml_vk_cleanup(ctx);
@@ -14419,7 +14428,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     const int64_t t_start_us = vk_host_timing_enabled ? ggml_time_us() : 0;
     const int64_t submit_start_us = vk_host_timing_submit_us;
+    const int64_t submits_start = vk_host_timing_submits;
     int64_t t_node_us = 0;
+    int64_t s_node_us = submit_start_us; // submit time so far, to keep submits out of the other phases
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -14514,6 +14525,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    if (ctx->device->flops_per_submit_override >= 0) {
+        flops_per_submit = (uint64_t) ctx->device->flops_per_submit_override;
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -14547,7 +14561,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (vk_host_timing_enabled) {
         t_node_us = ggml_time_us();
-        ctx->host_timing.setup_us += t_node_us - t_start_us;
+        ctx->host_timing.setup_us += t_node_us - t_start_us - (vk_host_timing_submit_us - s_node_us);
+        s_node_us = vk_host_timing_submit_us;
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -14840,14 +14855,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         int64_t t_build_us = 0;
         if (vk_host_timing_enabled) {
             t_build_us = ggml_time_us();
-            ctx->host_timing.fusion_us += t_build_us - t_node_us;
+            ctx->host_timing.fusion_us += t_build_us - t_node_us - (vk_host_timing_submit_us - s_node_us);
+            s_node_us = vk_host_timing_submit_us;
         }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_host_timing_enabled) {
             t_node_us = ggml_time_us();
-            ctx->host_timing.build_us += t_node_us - t_build_us;
+            ctx->host_timing.build_us += t_node_us - t_build_us - (vk_host_timing_submit_us - s_node_us);
+            s_node_us = vk_host_timing_submit_us;
         }
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -14937,6 +14954,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->host_timing.nodes += cgraph->n_nodes;
         ctx->host_timing.total_us  += ggml_time_us() - t_start_us;
         ctx->host_timing.submit_us += vk_host_timing_submit_us - submit_start_us;
+        ctx->host_timing.submits   += vk_host_timing_submits - submits_start;
     }
 
     return GGML_STATUS_SUCCESS;

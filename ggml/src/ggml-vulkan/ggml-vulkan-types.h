@@ -712,6 +712,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    int64_t flops_per_submit_override;
 
     bool shader_64b_indexing;
 
@@ -1261,7 +1262,7 @@ struct ggml_backend_vk_context {
 
     // GGML_VK_HOST_TIMING: host time of graph_compute by phase
     struct {
-        int64_t calls = 0, nodes = 0, total_us = 0, setup_us = 0, fusion_us = 0, build_us = 0, submit_us = 0;
+        int64_t calls = 0, nodes = 0, total_us = 0, setup_us = 0, fusion_us = 0, build_us = 0, submit_us = 0, submits = 0;
     } host_timing;
 
     // background uploads on the transfer queue, see ggml_backend_vk_upload_bg
