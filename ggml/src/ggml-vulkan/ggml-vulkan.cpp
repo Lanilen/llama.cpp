@@ -13055,7 +13055,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->bg_cmd_pool.destroy(ctx->device->device);
     }
     if (vk_perf_logger_enabled) {
-        ctx->perf_logger->print_timings(true);
+        ctx->perf_logger->print_timings(true, ctx->name.c_str());
     }
 }
 
@@ -14416,7 +14416,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        // the asynchronous copies of the split inputs may have opened the compute context already,
+        // they are recorded before the first timestamp
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
@@ -14871,7 +14872,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
             }
         }
-        ctx->perf_logger->print_timings();
+        ctx->perf_logger->print_timings(false, ctx->name.c_str());
     }
 
     if (!ctx->device->support_async) {
@@ -16794,7 +16795,7 @@ vk_device_struct::~vk_device_struct() {
     device.destroy();
 }
 
-void vk_perf_logger::print_timings(bool force) {
+void vk_perf_logger::print_timings(bool force, const char * name) {
     if (timings.empty()) {
         return;
     }
@@ -16804,7 +16805,7 @@ void vk_perf_logger::print_timings(bool force) {
     }
     print_count = 0;
     uint64_t total_all_op_times = 0;
-    std::cerr << "----------------\nVulkan Timings:" << std::endl;
+    std::cerr << "----------------\nVulkan Timings" << (name ? std::string(" ") + name : std::string()) << ":" << std::endl;
     for (const auto & t : timings) {
         uint64_t total_op_times = 0;
         for (const auto & time : t.second) {
