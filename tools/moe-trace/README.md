@@ -39,6 +39,18 @@ The projected time per generated token assumes a hot spare cache: hits run on th
 
 `--base`, `--cpu-layer` and `--rt` default to measurements on an RX 480 test machine with Qwen3.8-Flash-Next and must be changed for other setups. The projection does not charge the uploads: compare the budgets' rows, uploads read the same host memory the CPU experts use.
 
+## Hot spare refresh settings
+
+`hot_spare_sim.py` replays a trace through a port of the hot spare cache's refresh (`src/llama-moe-cache.cpp`) to sweep
+its settings: half-life, refill, budget and margin, with the cache size of each device and a start from a hot file. A
+conversation traced with `llama-moe-trace --trace-conversation session.json` (the `--output` of `session-bench.py`) is
+replayed turn by turn. Validated against a live 5-turn session: 53.3% hits simulated, 53.1% measured.
+
+```bash
+python3 hot_spare_sim.py session --sizes 3350 4050 --layer-split 25 --hot other.hot --warmup \
+    --half-life 16 32 64 128 256 --refill 0 64 128 256 512
+```
+
 ## Sessions
 
 `session-bench.py` runs a multi-turn chat against a running `llama-server` (Python standard library only): the first turn
