@@ -1236,6 +1236,7 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     // asynchronous reads into memory that is not pinned: each gets its own part of read_staging until the next synchronization,
     // the memcpys of those submitted with an event are kept until the event or the backend is synchronized
+    size_t prealloc_logged_size = 0;
     vk_buffer read_staging;
     size_t    read_staging_used = 0;
     std::vector<std::shared_ptr<std::vector<struct vk_staging_memcpy>>> event_out_memcpys;
