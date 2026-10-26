@@ -2634,6 +2634,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     ggml_backend_sched_set_tensor_backend(sched, t, backend_cache);
                 }
             }
+            // the cache branch is a split of its own that runs while the CPU computes the misses
+            ggml_backend_sched_set_tensor_overlap(sched, first_c);
             ggml_build_forward_expand(gf, experts_c);
 
             ggml_tensor * ids_h = ggml_get_rows(ctx0, maps.miss, ggml_reshape_1d(ctx0, ids_rec, ggml_nelements(ids_rec)));
