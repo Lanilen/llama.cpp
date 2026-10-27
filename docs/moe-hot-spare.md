@@ -102,6 +102,14 @@ size in what is left (its buffers for a batch can be larger than the main contex
 spilled into system memory and generation fell from 26 to 8.5 tok/s), and if it fits only a smaller one, the main context
 follows it.
 
+Backends also keep memory of their own between graphs, sized by the largest graph so far and outside the scheduler's buffers:
+the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch grows them a lot (the sparse attention
+top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at 59k cells and `-ub 8192` on perseus), and
+the cache coming back on top of them overcommitted the GPU: the driver moved memory to the host and generation stayed at 7
+tok/s instead of 20 for the rest of the session. So when large batches end, and at the next small batch after a medium one,
+the context gives them back (`ggml_backend_release_scratch`, Vulkan only) before the cache comes back; the next graph
+allocates what it needs, a few MB for generation.
+
 The CPU branch is pinned to the CPU and the small reserve does not offload host weights, so a small batch never copies a
 layer's experts to the GPU. A context without the cache, such as an MTP draft, follows the same option with its compute
 buffers only: it reserves for 31 tokens (below the 32 at which ggml offloads an operation on host weights to a GPU), or for

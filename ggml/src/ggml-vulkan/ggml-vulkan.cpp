@@ -15535,6 +15535,33 @@ static bool ggml_backend_vk_upload_bg_done(ggml_backend_t backend, uint64_t tick
     return true;
 }
 
+// frees the scratch buffers (prealloc x, y, split_k) and the staging buffer of synchronous copies, which grow with
+// the largest graph computed so far and are not part of the scheduler's buffers: after a large batch they can hold
+// a GB that the caller wants back for something else (the MoE cache); the next graph allocates what it needs again
+static void ggml_backend_vk_release_scratch(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ggml_backend_vk_synchronize(backend);
+
+    const size_t dev_size = (ctx->prealloc_x ? ctx->prealloc_x->size : 0) + (ctx->prealloc_y ? ctx->prealloc_y->size : 0) +
+                            (ctx->prealloc_split_k ? ctx->prealloc_split_k->size : 0);
+    const size_t host_size = ctx->sync_staging ? ctx->sync_staging->size : 0;
+    ggml_vk_destroy_buffer(ctx->prealloc_x);
+    ggml_vk_destroy_buffer(ctx->prealloc_y);
+    ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->sync_staging);
+    ctx->prealloc_size_x = 0;
+    ctx->prealloc_size_y = 0;
+    ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    ctx->prealloc_y_last_k_padded = false;
+    ctx->prealloc_logged_size = 0;
+    if (dev_size + host_size >= 64*1024*1024) {
+        GGML_LOG_DEBUG("%s: %s: released preallocated buffers %.2f MiB and staging %.2f MiB\n", __func__, ctx->name.c_str(),
+            dev_size/1048576.0, host_size/1048576.0);
+    }
+}
+
 // pinned host memory of one device, the host buffer type is pinned for device 0 only when the devices cannot import host memory
 struct ggml_backend_vk_pinned_buffer_type_context {
     size_t device;
@@ -16617,6 +16644,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_upload_bg_done") == 0) {
         return (void *) ggml_backend_vk_upload_bg_done;
+    }
+    if (strcmp(name, "ggml_backend_release_scratch") == 0) {
+        return (void *) ggml_backend_vk_release_scratch;
     }
     return nullptr;
 

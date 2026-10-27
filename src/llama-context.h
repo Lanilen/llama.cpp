@@ -316,9 +316,15 @@ private:
     int64_t moe_resize_batch = 0;    // --moe-cache-batch: the largest batch tried for the small reserve, 0 = n_ubatch
     bool    moe_resize_fitted = false;
     int64_t moe_resize_gen   = 0;    // tokens of small batches since the cache came back, before moe_resize_fit
+    bool    moe_scratch_grown = false; // a batch larger than the hot spare's ran with the small reserve
 
     // reserve the compute buffers for small batches again
     void resize_to_small();
+
+    // free the scratch the backends keep between graphs, which the largest batch so far sized (the Vulkan backend's
+    // preallocated buffers: a GB after a deep prompt at -ub 8192); the scheduler's buffers do not count it, so with it
+    // the cache does not fit any more and the driver moves memory to the host
+    void release_scratch();
 
     // the small reserve for the largest batch, from n_max down by halves to n_min, whose compute buffers fit in the free
     // memory of the GPUs; returns that batch size

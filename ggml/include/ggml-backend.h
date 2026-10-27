@@ -233,6 +233,9 @@ extern "C" {
     typedef bool                         (*ggml_backend_upload_bg_t)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
     typedef uint64_t                     (*ggml_backend_upload_bg_submit_t)(ggml_backend_t backend);
     typedef bool                         (*ggml_backend_upload_bg_done_t)(ggml_backend_t backend, uint64_t ticket, bool wait);
+    // Free the memory the backend keeps for itself between graphs (scratch, staging), sized by the largest graph so far;
+    // waits for the backend, the next graph allocates what it needs again
+    typedef void                         (*ggml_backend_release_scratch_t)(ggml_backend_t backend);
 
     //
     // Backend registry

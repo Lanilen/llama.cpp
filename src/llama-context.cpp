@@ -772,8 +772,21 @@ void llama_context::resize_to_small() {
     synchronize();
     moe_resize_large = false;
     sched.reset();
+    release_scratch();
     sched_need_reserve = true;
     sched_reserve();
+}
+
+void llama_context::release_scratch() {
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * fn = reg ? (ggml_backend_release_scratch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_release_scratch") : nullptr;
+        if (fn) {
+            fn(backend.get());
+        }
+    }
+    moe_scratch_grown = false;
 }
 
 int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
@@ -2151,15 +2164,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             moe_resize_large = large;
             if (!large) {
-                // free the compute buffers of large batches before the cache takes the memory back, then reserve once,
-                // with the cache branch: a buffer allocated while a freed one is not released yet may go to host memory
+                // free the compute buffers and the backends' scratch of large batches before the cache takes the memory
+                // back, then reserve once, with the cache branch: a buffer allocated while a freed one is not released
+                // yet may go to host memory
                 sched.reset();
+                release_scratch();
                 if (moe_cache) {
                     moe_cache->restore();
                 }
             }
             sched_need_reserve = true;
             sched_reserve();
+        } else if (!large && moe_scratch_grown && balloc->get_n_tokens() <= n_min) {
+            // a medium batch ran next to the cache: its scratch (hundreds of MB deep in a long context) goes before
+            // generation goes on
+            synchronize();
+            release_scratch();
+        }
+        if (!large && balloc->get_n_tokens() > n_min) {
+            moe_scratch_grown = true;
         }
         if (moe_cache && !moe_resize_fitted) {
             moe_resize_gen = large ? 0 : moe_resize_gen + balloc->get_n_tokens();
