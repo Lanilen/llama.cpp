@@ -208,6 +208,43 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
     return true;
 }
 
+// the largest number of experts (dim 2) a bank of each tensor in ref can hold on dev, at most limit: a bank is one tensor,
+// and a backend may refuse large ones (Vulkan without 64-bit indexing: maxStorageBufferRange, 4 GiB on RADV)
+static int64_t llama_moe_cache_max_bank_experts(ggml_backend_dev_t dev, const std::vector<ggml_tensor *> & ref, int64_t limit) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ ref.size()*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    std::vector<ggml_tensor *> probes;
+    for (const ggml_tensor * t : ref) {
+        probes.push_back(ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], 1));
+    }
+    auto fits = [&](int64_t n) {
+        for (ggml_tensor * x : probes) {
+            x->ne[2] = n;
+            if (!ggml_backend_dev_supports_op(dev, x)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (fits(limit)) {
+        return limit;
+    }
+    if (!fits(1)) {
+        return 0;
+    }
+    int64_t lo = 1;
+    int64_t hi = limit;
+    while (hi - lo > 1) {
+        const int64_t mid = lo + (hi - lo)/2;
+        (fits(mid) ? lo : hi) = mid;
+    }
+    return lo;
+}
+
 static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
     return t->buffer != nullptr &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -326,6 +363,7 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        int32_t max_slots = INT32_MAX;    // the largest bank the device takes, less the extra slot
         moe_cache_slru slru;
 
         // hot spare mode
@@ -570,6 +608,49 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // a group whose budget needs banks larger than its device takes is split by layers, each part keeping the share of
+        // the budget of its experts; the experts of a layer can then only use the slots of its part
+        {
+            std::vector<group> fitted;
+            for (group & g : groups) {
+                const device & d = devices[g.id];
+                const int32_t n_expert = g.ref[0]->ne[2];
+                const size_t  budget   = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+                size_t slot_bytes = 0;
+                for (const ggml_tensor * t : g.ref) {
+                    slot_bytes += t->nb[2];
+                }
+                const int64_t wanted = std::min<int64_t>(budget/std::max<size_t>(slot_bytes, 1), (int64_t) g.layers.size()*n_expert);
+                const int64_t max_slots = llama_moe_cache_max_bank_experts(ggml_backend_get_device(d.backend), g.ref, wanted + 1) - 1;
+                if (max_slots >= wanted || max_slots < 1) {
+                    g.max_slots = (int32_t) std::max<int64_t>(max_slots, 0);
+                    fitted.push_back(std::move(g));
+                    continue;
+                }
+                const size_t n_parts = std::min(g.layers.size(), (size_t) ((wanted + max_slots - 1)/max_slots));
+                LLAMA_LOG_INFO("%s: %s: banks of %lld experts are larger than the device takes (%lld), the %zu layers are split into %zu groups\n",
+                    __func__, ggml_backend_dev_name(ggml_backend_get_device(d.backend)), (long long) wanted, (long long) max_slots, g.layers.size(), n_parts);
+                for (size_t ip = 0; ip < n_parts; ++ip) {
+                    group part;
+                    part.id        = g.id;
+                    part.max_slots = (int32_t) max_slots;
+                    for (size_t i = ip*g.layers.size()/n_parts; i < (ip + 1)*g.layers.size()/n_parts; ++i) {
+                        const int32_t il = g.layers[i];
+                        auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+                        if (part.layers.empty()) {
+                            part.ref = experts;
+                        }
+                        part.layers.push_back(il);
+                        for (const ggml_tensor * t : experts) {
+                            part.host_bytes += ggml_nbytes(t);
+                        }
+                    }
+                    fitted.push_back(std::move(part));
+                }
+            }
+            groups = std::move(fitted);
+        }
+
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
@@ -577,7 +658,7 @@ struct llama_moe_cache::impl {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            const int32_t max_slots = g.layers.size()*n_expert;
+            const int32_t max_slots = std::min<int32_t>(g.layers.size()*n_expert, g.max_slots);
             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
                 g.n_slots++;
             }
