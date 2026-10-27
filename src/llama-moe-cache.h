@@ -71,6 +71,10 @@ public:
     // its device memory (an MTP draft) keep their small reserve for the same batches
     static int64_t resize_batch();
 
+    // a context without the cache whose small reserve fits only up to n tokens lowers resize_batch() to n, and the
+    // context with the cache follows
+    static void limit_resize_batch(int64_t n);
+
     // hot spare mode with resize (--moe-cache-resize): the device memory of the cache can be released while large batches
     // run, so that their compute buffers can use it, and restored for the small batches of generation
     bool resizes() const;

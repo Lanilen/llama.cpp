@@ -91,12 +91,16 @@ too. With `--moe-cache-resize` the cache and those buffers take turns:
 - the next small batch frees those buffers, allocates the cache again, uploads its experts in the background and reserves
   compute buffers for the small batches.
 
-The first time the cache comes back, the context measures, without allocating them, the compute buffers of a reserve for
-`--moe-cache-batch` tokens (default 512, 0 = `-ub`), halving down to 32 until twice that size plus 256 MiB fits in the free
-GPU memory (twice, because an MTP draft on the same GPU reserves about as much). Batches up to the size that fits are small:
+After the cache comes back the first time and 64 tokens have been generated (until then the free memory that RADV reports
+can still drop by about a GB), the context measures, without allocating them, the compute buffers of a reserve for
+`--moe-cache-batch` tokens (default 512, 0 = `-ub`), reserves them if they fit in the free GPU memory with 256 MiB to spare,
+checks what the reserve allocated, and otherwise tries half the size, down to 32. Batches up to the size that fits are small:
 they keep the cache and run on the hot spare, the cached experts on the GPU and the misses on the CPU, so a medium prompt such
 as a tool output neither copies every expert to the GPU nor uploads the cache again. Larger batches are large. The log says
-`MoE cache resize: batches of up to N tokens keep the cache`.
+`MoE cache resize: batches of up to N tokens keep the cache`. An MTP draft context then fits its own small reserve for the same
+size in what is left (its buffers for a batch can be larger than the main context's: on perseus 2048-token reserves for both
+spilled into system memory and generation fell from 26 to 8.5 tok/s), and if it fits only a smaller one, the main context
+follows it.
 
 The CPU branch is pinned to the CPU and the small reserve does not offload host weights, so a small batch never copies a
 layer's experts to the GPU. A context without the cache, such as an MTP draft, follows the same option with its compute
