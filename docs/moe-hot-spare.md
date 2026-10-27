@@ -84,17 +84,25 @@ copy runs when the GPU or the event is synchronized (`GGML_SCHED_ASYNC_READS=0` 
 
 A prompt batch copies the experts of every layer to the GPU once, so larger ubatches make prompts faster (on the test
 machine a 9.7k-token prompt read at 40 tok/s with `-ub 512` and 84 tok/s with `-ub 2048`), but their compute buffers grow
-too. Since the hot spare does not run for batches of more than 32 tokens, the cache and those buffers can take turns:
+too. With `--moe-cache-resize` the cache and those buffers take turns:
 
-- a batch of more than 32 tokens waits for the cache's uploads, frees its GPU memory (keeping the scores and the resident
-  set), waits until the driver reports that memory free, and reserves the compute buffers for `-ub` tokens;
-- the next batch of 32 tokens or less frees those buffers, allocates the cache again, uploads its experts in the
-  background and reserves compute buffers for 32 tokens, a few MiB.
+- a large batch waits for the cache's uploads, frees its GPU memory (keeping the scores and the resident set), waits until
+  the driver reports that memory free, and reserves the compute buffers for `-ub` tokens;
+- the next small batch frees those buffers, allocates the cache again, uploads its experts in the background and reserves
+  compute buffers for the small batches.
 
-The CPU branch is pinned to the CPU, so that a 32-token batch never copies a layer's experts to the GPU. A context without
-the cache, such as an MTP draft, follows the same option with its compute buffers only: it reserves for 31 tokens (below the
-32 at which ggml offloads an operation on host weights to a GPU) and holds its large buffers only while each of its large
-batches runs.
+The first time the cache comes back, the context measures, without allocating them, the compute buffers of a reserve for
+`--moe-cache-batch` tokens (default 512, 0 = `-ub`), halving down to 32 until twice that size plus 256 MiB fits in the free
+GPU memory (twice, because an MTP draft on the same GPU reserves about as much). Batches up to the size that fits are small:
+they keep the cache and run on the hot spare, the cached experts on the GPU and the misses on the CPU, so a medium prompt such
+as a tool output neither copies every expert to the GPU nor uploads the cache again. Larger batches are large. The log says
+`MoE cache resize: batches of up to N tokens keep the cache`.
+
+The CPU branch is pinned to the CPU and the small reserve does not offload host weights, so a small batch never copies a
+layer's experts to the GPU. A context without the cache, such as an MTP draft, follows the same option with its compute
+buffers only: it reserves for 31 tokens (below the 32 at which ggml offloads an operation on host weights to a GPU), or for
+the main context's small batches once it has measured them, and holds its large buffers only while each of its large batches
+runs.
 
 ### Changes that apply without any option
 
@@ -147,10 +155,15 @@ The help text of the options (`llama-server --help`, `llama-cli --help`):
 --moe-cache-refill N          hot spare mode: after a prompt, rebalance the resident experts once from the selections of
                               the first N generated tokens, 0 = never (default: 128)
                               (env: LLAMA_ARG_MOE_CACHE_REFILL)
---moe-cache-resize            hot spare mode: release the cache's GPU memory while batches of more than 32 tokens
-                              (prompts) run, so that their compute buffers can use it (e.g. a large --ubatch-size), and
-                              restore the cache for generation (default: off)
+--moe-cache-resize            hot spare mode: release the cache's GPU memory while large batches (prompts) run, so that
+                              their compute buffers can use it (e.g. a large --ubatch-size), and restore the cache for
+                              generation; see --moe-cache-batch (default: off)
                               (env: LLAMA_ARG_MOE_CACHE_RESIZE)
+--moe-cache-batch N           with --moe-cache-resize: batches of up to N tokens keep the cache and run on the hot spare,
+                              if their compute buffers fit next to it in the free GPU memory (else the largest of N/2,
+                              N/4, ... down to 32 that fits); larger batches release it; 0 = up to --ubatch-size
+                              (default: 512)
+                              (env: LLAMA_ARG_MOE_CACHE_BATCH)
 ```
 
 `--moe-cache-mib` and the LRU mode come from upstream; this fork adds the list form, the hot spare mode and the other
@@ -247,16 +260,23 @@ done | awk '{ if ($2 > v[$1]) v[$1] = $2; if ($3 > g[$1]) g[$1] = $3 } END { for
 
 A prompt with the experts in host memory is faster with large ubatches, because each ubatch copies the experts of every
 layer to the GPU once (`-ub 2048` read a 9.7k-token prompt at 84 tok/s on the test machine, `-ub 512` at 40), but the
-compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 against 1.0 and 0.5 at 512). The hot spare does
-not run for ubatches of more than 32 tokens anyway, so with `--moe-cache-resize` the two take turns:
+compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 against 1.0 and 0.5 at 512). With
+`--moe-cache-resize` the two take turns:
 
-- a batch of more than 32 tokens frees the cache's GPU memory, and the compute buffers are reserved for `-ub` tokens;
-- the next batch of 32 tokens or less reserves compute buffers for 32 tokens, allocates the cache again and uploads its
-  experts: the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
+- a large batch frees the cache's GPU memory, and the compute buffers are reserved for `-ub` tokens;
+- the next small batch reserves compute buffers for the small batches, allocates the cache again and uploads its experts:
+  the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
+
+Small batches are those of up to the `--moe-cache-batch` size whose compute buffers fit next to the cache (see
+[Prompts](#prompts---moe-cache-resize)). On Kallista (RTX 4070 Ti, Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
+of 193, 349 and 749 tokens read at 458, 413 and 556 tok/s when they kept the cache, against 111, 186 and 356 when they
+released it, and the generation after them ran at 51-59 tok/s against 30-34, while the cache filled again; `--moe-cache-batch 0`
+kept the cache up to 1024 tokens there.
 
 Size the cache for generation and check that the prompt phase fits without it: weights, KV, the compute buffers of `-ub`
 tokens and a draft model. During generation the compute buffers are tiny (a few MiB on the test machines), so the
-cache gets nearly all the memory that the prompt's compute buffers take; note that `-ub` is capped by `-b`. Each switch back costs one upload of the cache, about a second for 7 GB.
+cache gets nearly all the memory that the prompt's compute buffers take, minus what the small batches keep; note that
+`-ub` is capped by `-b`. Each switch back costs one upload of the cache, about a second for 7 GB.
 It is meant for one sequence at a time (`-np 1`): with several, prompt chunks and generation mix and every mixed batch
 switches.
 
@@ -273,8 +293,9 @@ With `-ub 4096` the pinned host compute buffer doubles (233 MiB), which shows in
 anything.
 
 A context without the cache, such as the MTP draft context, also follows `--moe-cache-resize`: its compute buffers are
-reserved for 31 tokens (below 32, `GGML_OP_OFFLOAD_MIN_BATCH`, nothing copies host weights to a device) and grow only while
-it reads a prompt, when the cache of the main context is released. The draft can then read prompts in large ubatches
+reserved for 31 tokens (below 32, `GGML_OP_OFFLOAD_MIN_BATCH`, nothing copies host weights to a device), or for the main
+context's small batches without offloading host weights, and grow only while it reads a large batch, when the cache of the
+main context is released. The draft can then read prompts in large ubatches
 (`--spec-draft-n-ubatch`) without keeping their buffers during generation. It keeps them only while each of its large
 batches runs, so it is small again before the cache of the main context comes back, whatever the order of the calls.
 
