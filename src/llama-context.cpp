@@ -580,8 +580,10 @@ llama_context::llama_context(
         if (params.moe_cache_resize) {
             if (moe_cache) {
                 if (moe_cache->resizes()) {
-                    // the first reserve is for large batches, the cache is restored for the first small one
+                    // the first reserve is for large batches, the cache is restored for the first small one, which
+                    // also sets how large the small batches can be (moe_resize_fit)
                     resize_small_max = llama_moe_cache::max_hot_spare_batch();
+                    moe_resize_batch = params.moe_cache_batch;
                     moe_cache->release();
                 }
             } else {
@@ -756,8 +758,11 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
+    // --moe-cache-resize: the small reserve never copies host weights to a device; from 32 tokens the offload would
+    // copy all the experts of a layer, in a compute buffer that doesn't fit next to the cache
+    const bool op_offload = cparams.op_offload && !(resize_small_max > 0 && !moe_resize_large);
     sched.reset(ggml_backend_sched_new(
-            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
@@ -769,6 +774,68 @@ void llama_context::resize_to_small() {
     sched.reset();
     sched_need_reserve = true;
     sched_reserve();
+}
+
+void llama_context::moe_resize_fit() {
+    moe_resize_fitted = true;
+
+    // a draft context on the same device reserves about as much again for the same batches, plus some headroom
+    const size_t headroom = 256u*1024*1024;
+
+    const int64_t n_min = llama_moe_cache::max_hot_spare_batch();
+    const int64_t n_max = moe_resize_batch > 0 ? std::min<int64_t>(moe_resize_batch, cparams.n_ubatch) : cparams.n_ubatch;
+    const uint32_t n_seqs = cparams.n_seq_max;
+
+    std::vector<size_t> sizes(backend_ptrs.size());
+    int64_t n_fit = n_min;
+    for (int64_t n = n_max; n > n_min; n /= 2) {
+        resize_small_max = n;
+        moe_cache->set_hot_spare_batch(n);
+
+        const size_t max_nodes = graph_max_nodes(n);
+        for (auto & res : gf_res_prev) {
+            res.reset();
+        }
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+        gf_res_prev_active = nullptr;
+        sched_new(max_nodes, cparams.pipeline_parallel);
+
+        llama_memory_context_ptr mctx;
+        if (memory) {
+            mctx = memory->init_full();
+        }
+        std::fill(sizes.begin(), sizes.end(), 0);
+        if (!graph_reserve(n, n_seqs, std::min<uint32_t>(n, cparams.n_outputs_max), mctx.get(), true, sizes.data())) {
+            continue;
+        }
+
+        bool fits = true;
+        for (size_t i = 0; i < backend_ptrs.size() && fits; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (dev == nullptr || sizes[i] == 0) {
+                continue;
+            }
+            const auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            fits = 2*sizes[i] + headroom <= free;
+            LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %s compute buffer %.2f MiB, %.2f MiB free\n", __func__, n,
+                    ggml_backend_dev_name(dev), sizes[i]/1024.0/1024.0, free/1024.0/1024.0);
+        }
+        if (fits) {
+            n_fit = n;
+            break;
+        }
+    }
+
+    resize_small_max = n_fit;
+    moe_cache->set_hot_spare_batch(n_fit);
+    LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens keep the cache%s\n", __func__, n_fit,
+            n_fit < n_max ? " (larger ones don't fit next to it)" : "");
 }
 
 void llama_context::sched_reserve() {
@@ -1994,6 +2061,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // --moe-cache-resize: the compute buffers of large batches and the MoE cache take turns in the device memory
     if (resize_small_max > 0) {
+        if (!moe_cache) {
+            // a context without the cache follows the main context, which keeps its cache for batches of up to
+            // llama_moe_cache::resize_batch() tokens: a large reserve then would not fit next to the cache
+            const int64_t n_main  = llama_moe_cache::resize_batch();
+            const int64_t n_small = n_main > llama_moe_cache::max_hot_spare_batch() ? n_main : 31;
+            if (n_small != resize_small_max) {
+                resize_small_max = n_small;
+                if (!moe_resize_large) {
+                    synchronize();
+                    sched.reset();
+                    sched_need_reserve = true;
+                    sched_reserve();
+                }
+            }
+        }
         const bool large = balloc->get_n_tokens() > resize_small_max;
         if (large != moe_resize_large) {
             synchronize();
@@ -2007,6 +2089,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 sched.reset();
                 if (moe_cache) {
                     moe_cache->restore();
+                    if (!moe_resize_fitted) {
+                        moe_resize_fit();
+                    }
                 }
             }
             sched_need_reserve = true;
@@ -4123,6 +4208,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_budget_mib        =*/ 10.0f,
         /*.moe_cache_save              =*/ nullptr,
         /*.moe_cache_refill            =*/ 128,
+        /*.moe_cache_batch             =*/ 512,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

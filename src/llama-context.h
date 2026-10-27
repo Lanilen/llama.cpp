@@ -313,9 +313,14 @@ private:
     // or for the small batches of generation with the cache in device memory
     int64_t resize_small_max = 0;    // batches of up to this many tokens use the small reserve, 0 = no resize
     bool    moe_resize_large = true; // the current reserve is for large batches
+    int64_t moe_resize_batch = 0;    // --moe-cache-batch: the largest batch tried for the small reserve, 0 = n_ubatch
+    bool    moe_resize_fitted = false;
 
     // reserve the compute buffers for small batches again
     void resize_to_small();
+
+    // with the cache restored: the largest batch up to moe_resize_batch whose compute buffers fit next to the cache
+    void moe_resize_fit();
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

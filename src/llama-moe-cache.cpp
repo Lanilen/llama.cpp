@@ -426,6 +426,7 @@ struct llama_moe_cache::impl {
     };
 
     static constexpr int64_t max_batch = 32;
+    int64_t hot_batch = max_batch; // ubatches of up to this many tokens run on the hot spare, more with resize (set_hot_spare_batch)
 
     int32_t n_expert_used;
     llama_moe_cache_mode mode;
@@ -1478,7 +1479,7 @@ struct llama_moe_cache::impl {
         }
         // large batches use most experts of a layer, they keep running all host experts with the scheduler's offload
         // with resize, the cache has no device memory while large batches run
-        if (n_tokens == 0 || n_tokens > max_batch || released) {
+        if (n_tokens == 0 || n_tokens > hot_batch || released) {
             return false;
         }
         const layer & l = layers[il];
@@ -1717,6 +1718,20 @@ ggml_tensor * llama_moe_cache::record(ggml_context * ctx, int32_t il, ggml_tenso
 
 int64_t llama_moe_cache::max_hot_spare_batch() {
     return impl::max_batch;
+}
+
+// the largest hot spare ubatch of a context with resize, for the contexts without the cache that share its device memory
+static std::atomic<int64_t> g_resize_batch{0};
+
+void llama_moe_cache::set_hot_spare_batch(int64_t n) {
+    pimpl->hot_batch = std::max(n, impl::max_batch);
+    if (pimpl->resize) {
+        g_resize_batch = pimpl->hot_batch;
+    }
+}
+
+int64_t llama_moe_cache::resize_batch() {
+    return g_resize_batch;
 }
 
 bool llama_moe_cache::resizes() const {

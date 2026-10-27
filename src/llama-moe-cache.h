@@ -60,8 +60,16 @@ public:
     // hot spare mode: after a ubatch of n_tokens tokens, update the scores and refresh the resident experts
     void update(int64_t n_tokens);
 
-    // hot spare mode: ubatches of more tokens do not run on the hot spare
+    // hot spare mode: ubatches of more tokens do not run on the hot spare, unless set_hot_spare_batch raised the limit
     static int64_t max_hot_spare_batch();
+
+    // hot spare mode: ubatches of up to n tokens (at least max_hot_spare_batch()) run on the hot spare; with resize, the
+    // batches the cache stays in device memory for, whose compute buffers fit next to it
+    void set_hot_spare_batch(int64_t n);
+
+    // the hot spare batch of the last context with resize that set one, 0 = none: contexts without the cache that share
+    // its device memory (an MTP draft) keep their small reserve for the same batches
+    static int64_t resize_batch();
 
     // hot spare mode with resize (--moe-cache-resize): the device memory of the cache can be released while large batches
     // run, so that their compute buffers can use it, and restored for the small batches of generation
