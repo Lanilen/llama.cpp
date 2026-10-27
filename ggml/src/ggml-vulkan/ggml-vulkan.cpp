@@ -2860,6 +2860,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         };
         device->matmul_id_tile_selector = device->matmul_tile_selector;
     }
+    // GGML_VK_FORCE_MMID_TILE=0|1|2: always the small, medium or large tile for MUL_MAT_ID, to measure them
+    const char * forced_env = getenv("GGML_VK_FORCE_MMID_TILE");
+    if (forced_env && *forced_env) {
+        const uint32_t forced = (uint32_t) atoi(forced_env);
+        device->matmul_id_tile_selector = [forced](uint32_t /*m*/, uint32_t /*n*/, uint32_t /*k*/, uint32_t /*shader_core_count*/,
+                                                   const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
+            return configs.empty() ? 0 : std::min(forced, (uint32_t) configs.size() - 1);
+        };
+    }
 
     // mul mat vec
 
