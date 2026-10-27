@@ -2886,12 +2886,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE_REFILL"));
     add_opt(common_arg(
         {"--moe-cache-resize"},
-        "hot spare mode: release the cache's GPU memory while batches of more than 32 tokens (prompts) run, so that their\n"
-        "compute buffers can use it (e.g. a large --ubatch-size), and restore the cache for generation (default: off)",
+        "hot spare mode: release the cache's GPU memory while large batches (prompts) run, so that their compute buffers\n"
+        "can use it (e.g. a large --ubatch-size), and restore the cache for generation; see --moe-cache-batch (default: off)",
         [](common_params & params) {
             params.moe_cache_resize = true;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_RESIZE"));
+    add_opt(common_arg(
+        {"--moe-cache-batch"}, "N",
+        string_format("with --moe-cache-resize: batches of up to N tokens keep\n"
+        "the cache and run on the hot spare, if their compute buffers\n"
+        "fit next to it in the free GPU memory (else the largest of\n"
+        "N/2, N/4, ... down to 32 that fits); larger batches release\n"
+        "it; 0 = up to --ubatch-size (default: %d)", params.moe_cache_batch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--moe-cache-batch must be 0 or more");
+            }
+            params.moe_cache_batch = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_BATCH"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
