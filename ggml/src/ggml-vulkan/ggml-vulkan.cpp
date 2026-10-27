@@ -2418,8 +2418,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Some quants are not performant on RDNA4, those fall back to FP16 matmul
         const bool rdna3 = device->architecture == AMD_RDNA3;
         const bool rdna4 = device->architecture == AMD_RDNA4;
-        // GGML_VK_RDNA4_INT_K=1 creates the Q4_K and Q5_K ones on RDNA4 too, to measure them
-        const bool rdna4_int_k = getenv("GGML_VK_RDNA4_INT_K") != nullptr;
+        // upstream leaves the Q4_K and Q5_K ones out on RDNA4; on an R9700 they read Qwen3-Coder-30B Q4_K_XL prompts at
+        // 3379 against 3318 tok/s and passed test-backend-ops, so they're on (GGML_VK_RDNA4_NO_INT_K=1 turns them off)
+        const bool rdna4_int_k = getenv("GGML_VK_RDNA4_NO_INT_K") == nullptr;
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
