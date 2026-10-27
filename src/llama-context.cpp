@@ -776,22 +776,62 @@ void llama_context::resize_to_small() {
     sched_reserve();
 }
 
-void llama_context::moe_resize_fit() {
-    moe_resize_fitted = true;
-
-    // a draft context on the same device reserves about as much again for the same batches, plus some headroom
+int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
     const size_t headroom = 256u*1024*1024;
-
-    const int64_t n_min = llama_moe_cache::max_hot_spare_batch();
-    const int64_t n_max = moe_resize_batch > 0 ? std::min<int64_t>(moe_resize_batch, cparams.n_ubatch) : cparams.n_ubatch;
     const uint32_t n_seqs = cparams.n_seq_max;
 
-    std::vector<size_t> sizes(backend_ptrs.size());
-    int64_t n_fit = n_min;
-    for (int64_t n = n_max; n > n_min; n /= 2) {
+    // the free memory of each GPU, with the current compute buffers given back; SIZE_MAX = not a GPU
+    std::vector<size_t> free_dev(backend_ptrs.size(), SIZE_MAX);
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+        if (dev == nullptr) {
+            continue;
+        }
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        free_dev[i] = free + (sched ? ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0);
+    }
+    const auto fits = [&](const std::vector<size_t> & sizes) {
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (free_dev[i] != SIZE_MAX && sizes[i] + headroom > free_dev[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // the largest compute buffer on a GPU, and the least free memory of one
+    const auto gpu_mib = [&](const std::vector<size_t> & v, bool largest) {
+        size_t r = largest ? 0 : SIZE_MAX;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (free_dev[i] != SIZE_MAX) {
+                r = largest ? std::max(r, v[i]) : std::min(r, v[i]);
+            }
+        }
+        return r == SIZE_MAX ? 0.0 : r/1024.0/1024.0;
+    };
+    const auto set_batch = [&](int64_t n) {
         resize_small_max = n;
-        moe_cache->set_hot_spare_batch(n);
+        if (moe_cache) {
+            moe_cache->set_hot_spare_batch(n);
+        }
+    };
+    const auto reserve = [&]() {
+        sched.reset();
+        sched_need_reserve = true;
+        sched_reserve();
+    };
 
+    std::vector<size_t> sizes(backend_ptrs.size());
+    int64_t n_fit = 0;
+    for (int64_t n = n_max; n > n_min && n_fit == 0; n /= 2) {
+        set_batch(n);
+
+        // measure first, without allocating
         const size_t max_nodes = graph_max_nodes(n);
         for (auto & res : gf_res_prev) {
             res.reset();
@@ -805,37 +845,43 @@ void llama_context::moe_resize_fit() {
             mctx = memory->init_full();
         }
         std::fill(sizes.begin(), sizes.end(), 0);
-        if (!graph_reserve(n, n_seqs, std::min<uint32_t>(n, cparams.n_outputs_max), mctx.get(), true, sizes.data())) {
+        const bool measured = graph_reserve(n, n_seqs, std::min<uint32_t>(n, cparams.n_outputs_max), mctx.get(), true, sizes.data()) != nullptr;
+        LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB measured, %.2f MiB free\n", __func__, n, gpu_mib(sizes, true), gpu_mib(free_dev, false));
+        mctx.reset();
+        if (!measured || !fits(sizes)) {
             continue;
         }
 
-        bool fits = true;
-        for (size_t i = 0; i < backend_ptrs.size() && fits; ++i) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
-            if (dev == nullptr || sizes[i] == 0) {
-                continue;
-            }
-            const auto type = ggml_backend_dev_type(dev);
-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                continue;
-            }
-            size_t free = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
-            fits = 2*sizes[i] + headroom <= free;
-            LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %s compute buffer %.2f MiB, %.2f MiB free\n", __func__, n,
-                    ggml_backend_dev_name(dev), sizes[i]/1024.0/1024.0, free/1024.0/1024.0);
+        // then reserve, and check what the reserve allocated
+        try {
+            reserve();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %s\n", __func__, n, e.what());
+            continue;
         }
-        if (fits) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            sizes[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+        LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB allocated\n", __func__, n, gpu_mib(sizes, true));
+        if (fits(sizes)) {
             n_fit = n;
-            break;
         }
     }
 
-    resize_small_max = n_fit;
-    moe_cache->set_hot_spare_batch(n_fit);
-    LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens keep the cache%s\n", __func__, n_fit,
-            n_fit < n_max ? " (larger ones don't fit next to it)" : "");
+    if (n_fit == 0) {
+        n_fit = n_min;
+        set_batch(n_fit);
+        reserve();
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            sizes[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens %s%s (compute buffer %.2f MiB, %.2f MiB free for it)\n",
+            __func__, n_fit, moe_cache ? "keep the cache" : "use the small reserve", n_fit < n_max ? ", larger ones don't fit" : "",
+            gpu_mib(sizes, true), gpu_mib(free_dev, false));
+
+    return n_fit;
 }
 
 void llama_context::sched_reserve() {
@@ -2061,18 +2107,39 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // --moe-cache-resize: the compute buffers of large batches and the MoE cache take turns in the device memory
     if (resize_small_max > 0) {
-        if (!moe_cache) {
+        const int64_t n_min = llama_moe_cache::max_hot_spare_batch();
+        if (moe_cache) {
+            if (!moe_resize_large && !moe_resize_fitted && moe_resize_gen >= 64 && balloc->get_n_tokens() <= n_min) {
+                // the small batches grow to what fits next to the cache, once generation has run for a while since the
+                // cache came back: until then the free memory the driver reports can still drop by a GB (RADV)
+                synchronize();
+                moe_resize_fitted = true;
+                moe_resize_fit(moe_resize_batch > 0 ? std::min<int64_t>(moe_resize_batch, cparams.n_ubatch) : cparams.n_ubatch, n_min);
+            } else if (moe_resize_fitted) {
+                // a context without the cache (the MTP draft) found less room for its own buffers
+                const int64_t n_shared = llama_moe_cache::resize_batch();
+                if (n_shared >= n_min && n_shared < resize_small_max) {
+                    resize_small_max = n_shared;
+                    moe_cache->set_hot_spare_batch(n_shared);
+                    LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens keep the cache, as the draft's buffers fit\n", __func__, n_shared);
+                    if (!moe_resize_large) {
+                        synchronize();
+                        sched.reset();
+                        sched_need_reserve = true;
+                        sched_reserve();
+                    }
+                }
+            }
+        } else {
             // a context without the cache follows the main context, which keeps its cache for batches of up to
-            // llama_moe_cache::resize_batch() tokens: a large reserve then would not fit next to the cache
-            const int64_t n_main  = llama_moe_cache::resize_batch();
-            const int64_t n_small = n_main > llama_moe_cache::max_hot_spare_batch() ? n_main : 31;
-            if (n_small != resize_small_max) {
-                resize_small_max = n_small;
-                if (!moe_resize_large) {
-                    synchronize();
-                    sched.reset();
-                    sched_need_reserve = true;
-                    sched_reserve();
+            // llama_moe_cache::resize_batch() tokens: a large reserve then would not fit next to the cache, so its small
+            // reserve takes those batches, as far as its buffers fit in what is left
+            const int64_t n_main = llama_moe_cache::resize_batch();
+            if (n_main > n_min && n_main != resize_small_max && !moe_resize_large) {
+                synchronize();
+                const int64_t n = moe_resize_fit(n_main, n_min);
+                if (n < n_main) {
+                    llama_moe_cache::limit_resize_batch(n);
                 }
             }
         }
@@ -2089,13 +2156,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 sched.reset();
                 if (moe_cache) {
                     moe_cache->restore();
-                    if (!moe_resize_fitted) {
-                        moe_resize_fit();
-                    }
                 }
             }
             sched_need_reserve = true;
             sched_reserve();
+        }
+        if (moe_cache && !moe_resize_fitted) {
+            moe_resize_gen = large ? 0 : moe_resize_gen + balloc->get_n_tokens();
         }
         if (large && !moe_cache) {
             shrink_after.ctx = this;

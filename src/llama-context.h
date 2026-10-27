@@ -315,12 +315,14 @@ private:
     bool    moe_resize_large = true; // the current reserve is for large batches
     int64_t moe_resize_batch = 0;    // --moe-cache-batch: the largest batch tried for the small reserve, 0 = n_ubatch
     bool    moe_resize_fitted = false;
+    int64_t moe_resize_gen   = 0;    // tokens of small batches since the cache came back, before moe_resize_fit
 
     // reserve the compute buffers for small batches again
     void resize_to_small();
 
-    // with the cache restored: the largest batch up to moe_resize_batch whose compute buffers fit next to the cache
-    void moe_resize_fit();
+    // the small reserve for the largest batch, from n_max down by halves to n_min, whose compute buffers fit in the free
+    // memory of the GPUs; returns that batch size
+    int64_t moe_resize_fit(int64_t n_max, int64_t n_min);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
