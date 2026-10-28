@@ -1,5 +1,8 @@
 // records the experts selected by the router of every MoE layer for every token of a prompt and a generation
-// output: <out>.npy (int16 [n_tokens, n_moe_layers, n_expert_used]) and <out>.json (model and run info)
+// output: <out>.npy (int16 [n_tokens, n_moe_layers, n_expert_used]) and <out>.json (model and run info, the tokens)
+// LLAMA_MOE_TRACE_HIDDEN=16,32 also saves the inputs of those layers (float16) for every
+// LLAMA_MOE_TRACE_HIDDEN_STRIDE-th prompt token (default 16) and around each generated segment's start:
+// <out>.hid.npy [n_rows, n_layers, n_embd], the rows' positions in the json's "hidden"
 
 #include "arg.h"
 #include "chat.h"
@@ -7,6 +10,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_embeddings_layer_inp / llama_get_embeddings_layer_inp
 
 #include <nlohmann/json.hpp>
 
@@ -17,6 +21,8 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -106,13 +112,17 @@ static bool moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
     return true;
 }
 
-static bool write_npy(const std::string & path, const std::vector<int16_t> & data, const std::vector<size_t> & shape) {
+static bool write_npy(const std::string & path, const char * descr, const void * data, size_t elem_size, const std::vector<size_t> & shape) {
+    size_t n = 1;
     std::string shape_str = "(";
     for (size_t s : shape) {
         shape_str += std::to_string(s) + ", ";
     }
     shape_str += ")";
-    std::string header = "{'descr': '<i2', 'fortran_order': False, 'shape': " + shape_str + ", }";
+    for (size_t s : shape) {
+        n *= s;
+    }
+    std::string header = std::string("{'descr': '") + descr + "', 'fortran_order': False, 'shape': " + shape_str + ", }";
     // magic (6) + version (2) + header length (2) + header, padded with spaces to a multiple of 64 and ended by a newline
     const size_t total = 10 + header.size() + 1;
     header += std::string((64 - total % 64) % 64, ' ') + "\n";
@@ -126,7 +136,7 @@ static bool write_npy(const std::string & path, const std::vector<int16_t> & dat
     fwrite(prefix, 1, sizeof(prefix), f);
     fwrite(&hlen, 1, sizeof(hlen), f);
     fwrite(header.data(), 1, header.size(), f);
-    fwrite(data.data(), sizeof(int16_t), data.size(), f);
+    fwrite(data, elem_size, n, f);
     return fclose(f) == 0;
 }
 
@@ -166,6 +176,28 @@ int main(int argc, char ** argv) {
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    std::vector<int> hid_layers;
+    int hid_stride = 16;
+    if (const char * env = getenv("LLAMA_MOE_TRACE_HIDDEN")) {
+        std::stringstream ss(env);
+        for (std::string item; std::getline(ss, item, ',');) {
+            const int il = atoi(item.c_str());
+            if (il < 0 || il >= llama_model_n_layer(model)) {
+                LOG_ERR("%s: LLAMA_MOE_TRACE_HIDDEN: no layer %d\n", __func__, il);
+                return 1;
+            }
+            hid_layers.push_back(il);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) il, true);
+        }
+        if (const char * st = getenv("LLAMA_MOE_TRACE_HIDDEN_STRIDE")) {
+            hid_stride = std::max(1, atoi(st));
+        }
+    }
+    const int64_t n_embd = llama_model_n_embd(model);
+    std::vector<ggml_fp16_t> hid;
+    std::vector<int> hid_pos;
+    std::set<int> hid_extra;   // the last prompt token before and the first token of each generated segment
 
     std::string prompt = params.prompt;
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
@@ -240,6 +272,10 @@ int main(int argc, char ** argv) {
         for (size_t k = 0; k < all.size(); ++k) {
             const size_t end = k + 1 < all.size() ? starts[k + 1] : tokens.size();
             segments.push_back({ starts[k], std::max(end, starts[k]), all[k].role == "assistant" ? "generated" : "prompt" });
+            if (all[k].role == "assistant" && starts[k] > 0) {
+                hid_extra.insert((int) starts[k] - 1);
+                hid_extra.insert((int) starts[k]);
+            }
         }
     } else {
         tokens = common_tokenize(ctx, prompt, true, true);
@@ -278,6 +314,19 @@ int main(int argc, char ** argv) {
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: failed to process the prompt\n", __func__);
             return 1;
+        }
+        // the layer inputs cover every token of the batch, outputs or not
+        for (int j = 0; !hid_layers.empty() && j < n; ++j) {
+            if ((i + j) % hid_stride != 0 && hid_extra.count(i + j) == 0) {
+                continue;
+            }
+            hid_pos.push_back(i + j);
+            for (int il : hid_layers) {
+                const float * src = llama_get_embeddings_layer_inp(ctx, (uint32_t) il);
+                GGML_ASSERT(src != nullptr);
+                hid.resize(hid.size() + n_embd);
+                ggml_fp32_to_fp16_row(src + (size_t) j*n_embd, hid.data() + hid.size() - n_embd, n_embd);
+            }
         }
     }
 
@@ -365,6 +414,15 @@ int main(int argc, char ** argv) {
     }
     meta["layers"] = layers;
     meta["generated_tokens"] = generated;
+    meta["tokens"] = tokens;
+    if (!hid_layers.empty()) {
+        meta["hidden"] = { { "layers", hid_layers }, { "stride", hid_stride }, { "n_embd", n_embd }, { "positions", hid_pos },
+                           { "rows", "layer inputs (the mean of the hyper-connection streams where the model has them), float16" } };
+        if (!write_npy(params.out_file + ".hid.npy", "<f2", hid.data(), sizeof(ggml_fp16_t), { hid_pos.size(), hid_layers.size(), (size_t) n_embd })) {
+            LOG_ERR("%s: failed to write %s.hid.npy\n", __func__, params.out_file.c_str());
+            return 1;
+        }
+    }
     meta["generated_text"] = text;
 
     if (data.enabled) {
@@ -389,7 +447,7 @@ int main(int argc, char ** argv) {
             }
         }
         meta["pruned_layers"] = pruned;
-        if (!write_npy(params.out_file + ".npy", out, { (size_t) n_tokens, moe_layers.size(), n_used })) {
+        if (!write_npy(params.out_file + ".npy", "<i2", out.data(), sizeof(int16_t), { (size_t) n_tokens, moe_layers.size(), n_used })) {
             LOG_ERR("%s: failed to write %s.npy\n", __func__, params.out_file.c_str());
             return 1;
         }
