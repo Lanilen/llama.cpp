@@ -1731,10 +1731,11 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
-                // locking a lazy tensor would fault all of it in, which is what lazy avoids
+                // lock only this tensor's pages: locking the file from its start would also fault in and lock the
+                // lazy tensors before it (which lazy avoids) and the pages of tensors copied to other buffers
                 if (lmlocks && !lazy.has(cur)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    lmlock->lock_range(weight->offs, n_size);
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
