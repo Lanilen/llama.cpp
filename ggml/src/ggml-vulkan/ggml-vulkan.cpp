@@ -14601,6 +14601,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // a graph within one submit's node limit is submitted once: a model split between the CPU and the GPU computes
+    // a hundred such graphs per generated token, and splitting them by their flops cost ~8 queue submits each (~18 us
+    // on RADV) for a GPU that waited for the host anyway
+    if (cgraph->n_nodes <= (int) ctx->device->max_nodes_per_submit) {
+        flops_per_submit = 0;
+    }
     if (ctx->device->flops_per_submit_override >= 0) {
         flops_per_submit = (uint64_t) ctx->device->flops_per_submit_override;
     }
