@@ -71,6 +71,8 @@ struct llama_mlock {
 
     void init(void * ptr);
     void grow_to(size_t target_size);
+    // lock [offset, offset + size) of the region given to init(), rounded out to whole pages
+    void lock_range(size_t offset, size_t size);
 
     static const bool SUPPORTED;
 
