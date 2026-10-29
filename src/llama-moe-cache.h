@@ -42,7 +42,8 @@ public:
     // backends are all the backends of the context
     // lru mode: each GPU gets its own cache of the given size for the layers assigned to it
     // hot spare mode: the cache device gets the whole size for all host-resident layers, without a cache device it is like lru mode
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_params & params);
+    // no_alloc: only the memory use is measured (dummy buffers, see llama_context::memory_breakdown)
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_params & params);
     ~llama_moe_cache();
 
     // the device that caches layer il
