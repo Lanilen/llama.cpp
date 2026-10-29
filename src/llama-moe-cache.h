@@ -19,6 +19,8 @@ struct llama_moe_cache_params {
     std::string save;   // hot spare mode: file the resident experts are written to at exit
     int64_t refill = 0; // hot spare mode: generated tokens after a prompt for one rebalance from their scores alone, 0 = none
     bool resize = false; // hot spare mode: release the device memory for large batches (see llama_moe_cache::release)
+    std::string predictor;        // hot spare mode: predictor file (see llama-moe-predictor.h), empty = none
+    std::string predictor_device; // the device it runs on, empty = CPU
 
     // hot spare mode: refresh of the resident experts between ubatches
     float  half_life = 0.0f; // tokens, 0 = the resident experts never change
@@ -58,7 +60,15 @@ public:
     ggml_tensor * record(ggml_context * ctx, int32_t il, ggml_tensor * ids) const;
 
     // hot spare mode: after a ubatch of n_tokens tokens, update the scores and refresh the resident experts
-    void update(int64_t n_tokens);
+    // pos0: position of its first token (0 starts a new conversation), -1 = unknown; gen: 1 if it is generation (it
+    // outputs all its tokens), 0 if it is a prompt, -1 = unknown (up to 4 tokens is generation)
+    void update(int64_t n_tokens, int64_t pos0 = -1, int gen = -1);
+
+    // hot spare mode with a predictor: the layers whose input it reads at the newest token of each ubatch, empty = none
+    const std::vector<int32_t> & predictor_layers() const;
+
+    // hot spare mode with a predictor: the input of layer il at the newest token of the ubatch about to be passed to update
+    void set_hidden(int32_t il, const float * data, size_t n);
 
     // hot spare mode: ubatches of more tokens do not run on the hot spare, unless set_hot_spare_batch raised the limit
     static int64_t max_hot_spare_batch();

@@ -61,6 +61,7 @@ struct llama_cparams {
     enum llama_moe_cache_mode moe_cache_mode;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    std::vector<bool> moe_hidden_inp;       // [n_layer()] the MoE predictor reads the layer's input at the newest token
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

@@ -1404,6 +1404,7 @@ void llm_graph_result::reset() {
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+    t_moe_hidden.assign(LLAMA_MAX_LAYERS + 1, nullptr);
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1454,6 +1455,20 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
+            }
+        }
+    }
+    {
+        // only the newest token's row of the layer input, so a large prompt ubatch keeps none of the rest
+        const auto & moe_hidden_inp = params.cparams.moe_hidden_inp;
+        for (size_t il = 0; il < moe_hidden_inp.size(); ++il) {
+            ggml_tensor * t = t_layer_inp[il];
+            if (moe_hidden_inp[il] && t != nullptr && ggml_nelements(t) == t->ne[0]*t->ne[1]) {
+                ggml_tensor * row = ggml_cont(ctx_compute.get(), ggml_view_1d(ctx_compute.get(), t, t->ne[0], (t->ne[1] - 1)*t->nb[1]));
+                ggml_set_name(row, "moe_hidden");
+                ggml_set_output(row);
+                ggml_build_forward_expand(gf, row);
+                t_moe_hidden[il] = row;
             }
         }
     }
