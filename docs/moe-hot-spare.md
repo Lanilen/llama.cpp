@@ -89,6 +89,18 @@ Flash-Next was trained offline on expert traces (`llama-moe-trace` with `LLAMA_M
 conversations its top 164 experts per layer served 86% of the next 128 tokens' selections from an answer's start,
 against 77% for the decayed scores.
 
+**A start from the turn's text: `--moe-cache-predictor-start`.** A second predictor file (role `start`) predicts before a
+turn's prompt runs. It reads the counts up to the turn and the mean of the model's token embeddings over the turn's
+tokens (a table lookup, no model pass). On a turn whose prompt runs with the cache in device memory (short prompts), its
+experts upload while the prompt computes:
+- the copies are submitted first, behind gates (`ggml_backend_upload_bg_gate`);
+- a thread fills the staging memory chunk by chunk and opens each gate;
+- the answer's start then tops up from the main predictor, at most 1000 swaps (`LLAMA_MOE_PREDICTOR_TOPUP`).
+
+The text start uploads at most 1600 experts (`LLAMA_MOE_PREDICTOR_START_SWAPS`). After a release the restore uploads
+the main predictor's set as before. Offline, on Flash-Next's held-out conversations, after short turns: 85.7% of the
+selections hit with 4.9 uploads per generated token, against 86.1% with 13.7 for the main predictor alone.
+
 ### The two branches at the same time
 
 On its own, the scheduler would run the cache branch together with the layer's attention, and the CPU's input copy would
@@ -232,6 +244,8 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
 | `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on perseus 29.5 GB/s instead of 20) |
 | `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
+| `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
+| `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
 | `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |

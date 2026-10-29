@@ -574,6 +574,7 @@ llama_context::llama_context(
             mcp.resize    = params.moe_cache_resize;
             mcp.predictor        = params.moe_cache_predictor        ? params.moe_cache_predictor        : "";
             mcp.predictor_device = params.moe_cache_predictor_device ? params.moe_cache_predictor_device : "";
+            mcp.predictor_start  = params.moe_cache_predictor_start  ? params.moe_cache_predictor_start  : "";
             if (params.moe_cache_sizes != nullptr) {
                 mcp.sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + params.n_moe_cache_sizes);
             }
@@ -1763,6 +1764,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // a ubatch that outputs all its tokens is generation (with drafts, their verification); a prompt outputs its last
+    uint32_t n_out = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        n_out += ubatch.output[i] != 0;
+    }
+    const int64_t moe_pos0 = ubatch.pos ? ubatch.pos[0] : -1;
+    if (moe_cache) {
+        moe_cache->before_ubatch(ubatch.token, ubatch.n_tokens, moe_pos0, n_out == ubatch.n_tokens ? 1 : 0);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1781,12 +1792,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 moe_cache->set_hidden(il, moe_hidden_buf.data(), moe_hidden_buf.size());
             }
         }
-        // a ubatch that outputs all its tokens is generation (with drafts, their verification); a prompt outputs its last
-        uint32_t n_out = 0;
-        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-            n_out += ubatch.output[i] != 0;
-        }
-        moe_cache->update(ubatch.n_tokens, ubatch.pos ? ubatch.pos[0] : -1, n_out == ubatch.n_tokens ? 1 : 0);
+        moe_cache->update(ubatch.n_tokens, moe_pos0, n_out == ubatch.n_tokens ? 1 : 0);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -4321,6 +4327,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_batch             =*/ 512,
         /*.moe_cache_predictor         =*/ nullptr,
         /*.moe_cache_predictor_device  =*/ nullptr,
+        /*.moe_cache_predictor_start   =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

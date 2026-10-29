@@ -15,9 +15,13 @@
 // the predictor file, version 1 (see the exporter, moe-pred/export_predictor.py):
 //   moe_predictor.{version, n_layer, n_expert, n_expert_used, n_embd, every}: u32; .norm_eps, .map_eps: f32
 //   moe_predictor.{hidden_layers, buckets, horizons}: i32 arrays; .hidden_slots, .maps: string arrays
+//   .hidden_slots: "last" (the newest token's input of each hidden layer) and/or "turn_embd_mean" (the mean of the
+//   model's token embeddings over the turn's tokens, times .turn_embd_scale, f32, default 1), in the input's order
+//   .role: "main" (default) or "start" (it predicts before the turn's prompt is processed)
 //   tensors (f32, ggml order): prior [n_expert, n_layer]; norm.weight, norm.bias [D]; mlp.0.weight [D + n_buckets, F],
 //   mlp.0.bias [F]; mlp.2.weight [F, R], mlp.2.bias [R]; per horizon H: head.H.w [n_buckets, n_maps, n_layer],
-//   head.H.bias [n_expert, n_layer], head.H.v [R, n_expert*n_layer]; D = hidden layers * n_embd
+//   head.H.bias [n_expert, n_layer], head.H.v [R, n_expert*n_layer]; D = n_embd per hidden layer for "last", plus n_embd
+//   for "turn_embd_mean"
 // per head: logits[l, e] = bias[l, e] + sum_f w[b, f, l] * logp_f[l, e] + v[l*n_expert + e] . z with
 // z = mlp.2(gelu_erf(mlp.0([layernorm(hidden), onehot(b)]))), b the bucket nearest to t, logp_f = log(p_f + map_eps)
 // where p_f is map f made a distribution per layer (uniform if the layer has no counts); prediction = softmax over e
@@ -37,6 +41,11 @@ struct llama_moe_predictor::impl {
     int32_t every    = 16;
     float   norm_eps = 1e-5f;
     float   map_eps  = 1e-4f;
+    float   turn_scale = 1.0f;
+    bool    use_last = false;
+    bool    use_turn = false;
+    bool    turn_first = false; // the turn embedding comes before the hidden rows in the input
+    bool    start    = false;
     std::vector<int32_t>  hidden_layers;
     std::vector<map_kind> maps;
     std::vector<int32_t>  buckets;
@@ -69,6 +78,8 @@ const std::vector<int32_t> & llama_moe_predictor::hidden_layers() const { return
 const std::vector<llama_moe_predictor::map_kind> & llama_moe_predictor::maps() const { return pimpl->maps; }
 const std::vector<int32_t> & llama_moe_predictor::horizons() const { return pimpl->horizons; }
 int32_t llama_moe_predictor::every() const { return pimpl->every; }
+bool llama_moe_predictor::reads_turn_embd() const { return pimpl->use_turn; }
+bool llama_moe_predictor::is_start() const { return pimpl->start; }
 
 std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string & path, const std::string & device,
                                                                int32_t n_layer, int32_t n_expert, int32_t n_embd) {
@@ -139,14 +150,32 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
     m.n_layer = n_layer; m.n_expert = n_expert; m.n_embd = n_embd; m.every = std::max<int32_t>(1, (int32_t) every);
     if (const int64_t k = key("norm_eps"); k >= 0) { m.norm_eps = gguf_get_val_f32(g, k); }
     if (const int64_t k = key("map_eps");  k >= 0) { m.map_eps  = gguf_get_val_f32(g, k); }
+    if (const int64_t k = key("turn_embd_scale"); k >= 0) { m.turn_scale = gguf_get_val_f32(g, k); }
+    if (const int64_t k = key("role"); k >= 0) {
+        const std::string role = gguf_get_val_str(g, k);
+        if (role != "main" && role != "start") {
+            return fail("unknown role " + role);
+        }
+        m.start = role == "start";
+    }
 
     std::vector<std::string> slots, maps;
-    if (!i32s("hidden_layers", m.hidden_layers) || !i32s("buckets", m.buckets) || !i32s("horizons", m.horizons) ||
-            !strs("hidden_slots", slots) || !strs("maps", maps)) {
-        return fail("missing hidden_layers, buckets, horizons, hidden_slots or maps");
+    if (!i32s("buckets", m.buckets) || !i32s("horizons", m.horizons) || !strs("hidden_slots", slots) || !strs("maps", maps)) {
+        return fail("missing buckets, horizons, hidden_slots or maps");
     }
-    if (slots != std::vector<std::string>{ "last" }) {
-        return fail("reads hidden slots this build doesn't provide (version 1 provides \"last\")");
+    i32s("hidden_layers", m.hidden_layers);   // an empty array is written as none
+    for (const std::string & sl : slots) {
+        if (sl == "last" && !m.use_last) {
+            m.use_last = true;
+        } else if (sl == "turn_embd_mean" && !m.use_turn) {
+            m.use_turn = true;
+            m.turn_first = !m.use_last;
+        } else {
+            return fail("reads a hidden slot this build doesn't provide: " + sl + " (it provides last and turn_embd_mean)");
+        }
+    }
+    if (m.use_last == m.hidden_layers.empty()) {
+        return fail("the slot \"last\" and the hidden layers go together");
     }
     for (int32_t il : m.hidden_layers) {
         if (il < 0 || il >= n_layer) {
@@ -165,7 +194,7 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
     }
 
     // the tensors, with the shapes the version 1 contract gives them
-    const int64_t D  = (int64_t) m.hidden_layers.size()*n_embd;
+    const int64_t D  = (int64_t) m.hidden_layers.size()*n_embd + (m.use_turn ? n_embd : 0);
     const int64_t NB = m.buckets.size();
     const int64_t NF = m.maps.size();
     const int64_t NE = n_expert, NL = n_layer;
@@ -301,16 +330,18 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
     for (map_kind k : m.maps) {
         names += std::string(names.empty() ? "" : " ") + map_name(k);
     }
-    LLAMA_LOG_INFO("%s: %s: predicts %zu horizons every %d tokens from the inputs of %zu layers and %zu count maps (%s), on %s\n",
-        __func__, fn, m.horizons.size(), m.every, m.hidden_layers.size(), m.maps.size(), names.c_str(), ggml_backend_dev_name(dev));
+    LLAMA_LOG_INFO("%s: %s: %s predictor, %zu horizons every %d tokens from the inputs of %zu layers%s and %zu count maps (%s), on %s\n",
+        __func__, fn, m.start ? "start" : "main", m.horizons.size(), m.every, m.hidden_layers.size(),
+        m.use_turn ? ", the turn's mean token embedding" : "", m.maps.size(), names.c_str(), ggml_backend_dev_name(dev));
     return p;
 }
 
 bool llama_moe_predictor::predict(const std::vector<const float *> & maps, const std::vector<const float *> & hidden, int64_t t,
-                                  std::vector<std::vector<float>> & out) {
+                                  std::vector<std::vector<float>> & out, const float * turn_embd) {
     impl & m = *pimpl;
     const int64_t NF = m.maps.size(), NE = m.n_expert, NL = m.n_layer;
     GGML_ASSERT(maps.size() == m.maps.size() && hidden.size() == m.hidden_layers.size());
+    GGML_ASSERT(!m.use_turn || turn_embd != nullptr);
 
     // each map as a distribution per layer, its log in [n_maps, n_expert, n_layer] order
     for (int64_t f = 0; f < NF; ++f) {
@@ -328,8 +359,17 @@ bool llama_moe_predictor::predict(const std::vector<const float *> & maps, const
         }
     }
     ggml_backend_tensor_set(m.in_logp, m.logp.data(), 0, m.logp.size()*sizeof(float));
+    const size_t off_hid = m.turn_first ? 1 : 0;
     for (size_t i = 0; i < hidden.size(); ++i) {
-        ggml_backend_tensor_set(m.in_hid, hidden[i], i*m.n_embd*sizeof(float), m.n_embd*sizeof(float));
+        ggml_backend_tensor_set(m.in_hid, hidden[i], (i + off_hid)*m.n_embd*sizeof(float), m.n_embd*sizeof(float));
+    }
+    if (m.use_turn) {
+        std::vector<float> te(turn_embd, turn_embd + m.n_embd);
+        for (float & x : te) {
+            x *= m.turn_scale;
+        }
+        const size_t at = m.turn_first ? 0 : hidden.size();
+        ggml_backend_tensor_set(m.in_hid, te.data(), at*m.n_embd*sizeof(float), m.n_embd*sizeof(float));
     }
     // the nearest bucket, the lower one on a tie
     size_t b = 0;

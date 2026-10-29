@@ -21,6 +21,7 @@ struct llama_moe_cache_params {
     bool resize = false; // hot spare mode: release the device memory for large batches (see llama_moe_cache::release)
     std::string predictor;        // hot spare mode: predictor file (see llama-moe-predictor.h), empty = none
     std::string predictor_device; // the device it runs on, empty = CPU
+    std::string predictor_start;  // hot spare mode with a predictor: start predictor file (role start), empty = none
 
     // hot spare mode: refresh of the resident experts between ubatches
     float  half_life = 0.0f; // tokens, 0 = the resident experts never change
@@ -63,6 +64,10 @@ public:
     // pos0: position of its first token (0 starts a new conversation), -1 = unknown; gen: 1 if it is generation (it
     // outputs all its tokens), 0 if it is a prompt, -1 = unknown (up to 4 tokens is generation)
     void update(int64_t n_tokens, int64_t pos0 = -1, int gen = -1);
+
+    // hot spare mode with a predictor, before a ubatch is computed (pos0 and gen as for update): with a start
+    // predictor, a turn's first prompt ubatch uploads the experts it predicts from the turn's text while it computes
+    void before_ubatch(const llama_token * tokens, int64_t n_tokens, int64_t pos0 = -1, int gen = -1);
 
     // hot spare mode with a predictor: the layers whose input it reads at the newest token of each ubatch, empty = none
     const std::vector<int32_t> & predictor_layers() const;
