@@ -205,7 +205,6 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
-| `LLAMA_MOE_CACHE_WARM_ONCE=0` | a hot file's rule (the rebalance after a prompt stays within the budget, the restore after a large batch keeps the resident set) holds for the whole run instead of the first generation |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops |
@@ -278,8 +277,7 @@ compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 aga
 
 - a large batch frees the cache's GPU memory, and the compute buffers are reserved for `-ub` tokens;
 - the next small batch reserves compute buffers for the small batches, allocates the cache again and uploads its experts:
-  the resident set if it came from `--moe-cache-hot` and no generation has run yet, otherwise the refresh fills the slots
-  from the scores (prompt included).
+  the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
 
 Small batches are those of up to the `--moe-cache-batch` size whose compute buffers fit next to the cache (see
 [Prompts](#prompts---moe-cache-resize)). On Kallista (RTX 4070 Ti, Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
