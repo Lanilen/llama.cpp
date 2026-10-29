@@ -205,7 +205,8 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
-| `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 1) |
+| `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
+| `LLAMA_MOE_CACHE_COPY_NT=1` | the copies to the staging memory use non-temporal stores: they skip reading the destination lines and leave the caches to the CPU experts |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
