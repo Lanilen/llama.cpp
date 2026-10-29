@@ -438,7 +438,8 @@ struct llama_moe_cache::impl {
     spare_stats * spare_cur = nullptr; // the stats of the running update
     std::unique_ptr<copy_worker> worker; // LLAMA_MOE_CACHE_ASYNC=0 copies on the generation thread
     bool rebalance = false;  // large ubatches were processed since the last refresh
-    bool warm      = false;  // the resident experts were loaded from a file
+    bool warm      = false;  // the resident experts were loaded from a file and no prompt has followed a generation yet
+    bool generated = false;  // small ubatches ran since the hot file was loaded
     int64_t refill_tokens = 0; // generated tokens after which the cache is rebalanced from their scores, 0 = never
     int64_t refill_left   = 0; // generated tokens until that rebalance, 0 = none pending
     std::string save_path;   // the resident experts are written there at exit
@@ -1140,6 +1141,18 @@ struct llama_moe_cache::impl {
         // the selections of this ubatch ran on the hot spare if they were resident, for small ubatches
         const bool small = n_tokens <= max_batch;
         spare_stats & st = small ? spare_small : spare_large;
+
+        // the hot file predicts the first generation; after one, the prompt and its scores predict the next better, so
+        // the prompt after it rebalances the cache in full (LLAMA_MOE_CACHE_WARM_ONCE=0 keeps the hot set's rule for good)
+        static const bool warm_once = [] {
+            const char * env = getenv("LLAMA_MOE_CACHE_WARM_ONCE");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (small) {
+            generated = true;
+        } else if (warm && generated && warm_once) {
+            warm = false;
+        }
         st.tokens += n_tokens;
         st.t_sync_us += t_sync_us;
         spare_cur = &st;
