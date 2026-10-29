@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-predictor.h"
 
 #include "ggml-cpp.h"
 
@@ -169,25 +170,48 @@ struct moe_cache_slru {
     }
 };
 
-// hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the count vector of the layer
+// hot spare mode: what the record op of a layer counts for the update after the ubatch
+struct llama_moe_cache_rec {
+    std::vector<uint32_t> count;   // [n_expert] selections
+    std::vector<float>    half_lives; // with a predictor: the half-lives (tokens) of its decayed count maps
+    std::vector<float>    decayed; // [half-lives][n_expert] the selections weighted by 0.5^(age/half-life), the newest token has age 0
+};
+
+// hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the llama_moe_cache_rec of the layer
 static void llama_moe_cache_record(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
     // every thread of the CPU backend runs the op, one does the work
     if (ith != 0) {
         return;
     }
-    auto & count = *(std::vector<uint32_t> *) userdata;
+    auto & rec = *(llama_moe_cache_rec *) userdata;
+    auto & count = rec.count;
+    const size_t n_hl = rec.half_lives.size();
+    float w[8];
+    GGML_ASSERT(n_hl <= 8);
     int32_t * out = (int32_t *) dst->data;
     for (int64_t i1 = 0; i1 < a->ne[1]; ++i1) {
+        for (size_t k = 0; k < n_hl; ++k) {
+            w[k] = powf(0.5f, (float) (a->ne[1] - 1 - i1)/rec.half_lives[k]);
+        }
         for (int64_t i0 = 0; i0 < a->ne[0]; ++i0) {
             const int32_t id = *(const int32_t *) ((const char *) a->data + i0*a->nb[0] + i1*a->nb[1]);
             out[i1*a->ne[0] + i0] = id;
             if (id >= 0 && id < (int32_t) count.size()) {
                 count[id]++;
+                for (size_t k = 0; k < n_hl; ++k) {
+                    rec.decayed[k*count.size() + id] += w[k];
+                }
             }
         }
     }
 }
+
+// hot spare mode with a predictor: its count maps that decay, and their half-lives (see llama_moe_predictor::map_kind)
+static const llama_moe_predictor::map_kind LLAMA_MOE_PRED_DECAYED[] = {
+    llama_moe_predictor::MAP_LIVE64, llama_moe_predictor::MAP_CTX512, llama_moe_predictor::MAP_ANSWER32, llama_moe_predictor::MAP_ANSWER8,
+};
+static const float LLAMA_MOE_PRED_HALF_LIFE[] = { 64.0f, 512.0f, 32.0f, 8.0f };
 
 // gate, up, down or gate_up, down
 static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
@@ -471,7 +495,9 @@ struct llama_moe_cache::impl {
 
         std::vector<float>    score;  // [n_expert] decayed number of selections
         std::vector<float>    score_gen; // [n_expert] the same for the tokens generated since the last prompt, until the refill
-        std::vector<uint32_t> count;  // [n_expert] selections since the last update, see llama_moe_cache_record
+        llama_moe_cache_rec   rec;    // selections since the last update, see llama_moe_cache_record
+        std::vector<float>    pmap[llama_moe_predictor::MAP_PRIOR]; // with a predictor: its count maps, [n_expert] each
+        std::vector<float>    pred;   // with a predictor: the expected selections in its horizon, ranks the experts
         std::vector<uint8_t>  uploading; // [n_expert] the expert is being uploaded in the background
     };
 
@@ -525,6 +551,23 @@ struct llama_moe_cache::impl {
     int64_t refill_tokens = 0; // generated tokens after which the cache is rebalanced from their scores, 0 = never
     int64_t refill_left   = 0; // generated tokens until that rebalance, 0 = none pending
     bool    full_bg       = false; // a full rebalance is running in the background (LLAMA_MOE_CACHE_REFILL_BG)
+
+    // hot spare mode with a predictor (--moe-cache-predictor): it ranks the experts by their expected selections, at
+    // each answer's start (from the input of the prompt's last token) and every few generated tokens
+    std::unique_ptr<llama_moe_predictor> predictor;
+    std::vector<int32_t> hidden_layers;             // the layers whose input it reads
+    std::vector<std::vector<float>> hidden;         // [hidden layers][n_embd] at the newest token, see set_hidden
+    std::vector<std::vector<float>> hidden_prompt;  // the same at the last prompt ubatch
+    bool    have_prompt_hidden = false;
+    bool    pred_valid = false;  // l.pred holds a prediction
+    bool    pred_start = false;  // an answer started with a prediction: the next refresh installs it in full
+    bool    in_answer  = false;  // the last ubatch was generation
+    int64_t t_answer   = 0;      // tokens of the current answer
+    int64_t next_pred  = 0;      // t_answer of the next prediction
+    size_t  n_pred     = 0;
+    int64_t t_pred_us  = 0;
+    std::vector<std::vector<float>> pred_in;        // contiguous count maps for the predictor
+    std::vector<std::vector<float>> pred_out;
     std::string save_path;   // the resident experts are written there at exit
 
     // hot spare mode with resize: the device memory of the cache is released while large batches run
@@ -568,6 +611,20 @@ struct llama_moe_cache::impl {
         }
         refill_tokens = std::max<int64_t>(0, params.refill);
         refill_left   = refill_tokens; // also for a first prompt too short to count as one
+        if (!params.predictor.empty()) {
+            if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+                LLAMA_LOG_WARN("%s: --moe-cache-predictor needs --moe-cache-mode hot-spare, ignored\n", __func__);
+            } else if (!model.hparams.no_alloc) {
+                predictor = llama_moe_predictor::load(params.predictor, params.predictor_device, (int32_t) model.hparams.n_layer(),
+                                                      (int32_t) model.hparams.n_expert, (int32_t) model.hparams.n_embd);
+                if (!predictor) {
+                    throw std::runtime_error("failed to load the MoE predictor " + params.predictor);
+                }
+                hidden_layers = predictor->hidden_layers();
+                hidden.assign(hidden_layers.size(), std::vector<float>(model.hparams.n_embd, 0.0f));
+                hidden_prompt = hidden;
+            }
+        }
         const size_t size = params.size;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -821,7 +878,15 @@ struct llama_moe_cache::impl {
                     l.slot_of.assign(g.ref[0]->ne[2], -1);
                     l.score.assign(g.ref[0]->ne[2], 0.0f);
                     l.score_gen.assign(g.ref[0]->ne[2], 0.0f);
-                    l.count.assign(g.ref[0]->ne[2], 0);
+                    l.rec.count.assign(g.ref[0]->ne[2], 0);
+                    if (predictor) {
+                        l.rec.half_lives.assign(std::begin(LLAMA_MOE_PRED_HALF_LIFE), std::end(LLAMA_MOE_PRED_HALF_LIFE));
+                        l.rec.decayed.assign(l.rec.half_lives.size()*g.ref[0]->ne[2], 0.0f);
+                        for (auto & m : l.pmap) {
+                            m.assign(g.ref[0]->ne[2], 0.0f);
+                        }
+                        l.pred.assign(g.ref[0]->ne[2], 0.0f);
+                    }
                     l.uploading.assign(g.ref[0]->ne[2], 0);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
                     devices[g.id].buf_size += 2*GGML_PAD(ggml_nbytes(l.slot_dev), ggml_backend_buft_get_alignment(devices[g.id].buft));
@@ -937,7 +1002,7 @@ struct llama_moe_cache::impl {
             // rarely fills one and waits for its copies; LLAMA_MOE_CACHE_STAGING_MIB sets the whole size
             // a full rebalance in the background stages at most a half per ubatch: 512 MiB is ~37 ms of PCIe 3.0 x16
             d.staging_size = 2*std::max({ 8*budget, 4*expert_size_max, (size_t) 64*1024*1024,
-                llama_moe_cache_refill_bg_enabled() ? (size_t) 512*1024*1024 : 0 });
+                llama_moe_cache_refill_bg_enabled() || predictor ? (size_t) 512*1024*1024 : 0 });
             if (const char * env = getenv("LLAMA_MOE_CACHE_STAGING_MIB")) {
                 d.staging_size = std::max((size_t) 2*4*expert_size_max, (size_t) (atof(env)*1024*1024));
             }
@@ -1221,12 +1286,15 @@ struct llama_moe_cache::impl {
         if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size() || layers[il].miss_map == nullptr) {
             return nullptr;
         }
-        return ggml_map_custom1(ctx, ids, llama_moe_cache_record, 1, &layers[il].count);
+        return ggml_map_custom1(ctx, ids, llama_moe_cache_record, 1, &layers[il].rec);
     }
 
-    void update(int64_t n_tokens) {
+    void update(int64_t n_tokens, int64_t pos0, int gen) {
         if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || n_tokens <= 0) {
             return;
+        }
+        if (gen < 0) {
+            gen = n_tokens <= 4;
         }
         const int64_t t_start_us = ggml_time_us();
 
@@ -1256,16 +1324,20 @@ struct llama_moe_cache::impl {
         // the copies of the uploads of the previous update are done in the background by now
         finish_submits();
 
+        if (predictor) {
+            update_predictor(n_tokens, pos0, gen != 0);
+        }
+
         const float decay = half_life > 0.0f ? powf(0.5f, (float) n_tokens/half_life) : 1.0f;
         for (layer & l : layers) {
             if (l.ig < 0) {
                 continue;
             }
-            for (size_t e = 0; e < l.count.size(); ++e) {
-                const uint32_t c = l.count[e];
+            for (size_t e = 0; e < l.rec.count.size(); ++e) {
+                const uint32_t c = l.rec.count[e];
                 if (c > 0) {
                     (l.slot_of[e] >= 0 ? st.hits : st.misses) += c;
-                    l.count[e] = 0;
+                    l.rec.count[e] = 0;
                 }
                 l.score[e] = l.score[e]*decay + c;
                 if (small && refill_left > 0) {
@@ -1297,16 +1369,20 @@ struct llama_moe_cache::impl {
                 // a resident set from --moe-cache-hot predicts the generation better than the prompt, so it only changes within the budget
                 bool full = rebalance && !warm;
                 if (refill_left > 0 && (refill_left -= std::min<int64_t>(refill_left, n_tokens)) == 0) {
-                    // the first generated tokens predict the rest of the generation better than the prompt
+                    // the first generated tokens predict the rest of the generation better than the prompt (a predictor
+                    // ranks the experts itself)
                     for (layer & l : layers) {
-                        if (l.ig >= 0) {
+                        if (l.ig >= 0 && !predictor) {
                             l.score = l.score_gen;
                         }
                     }
                     full = true;
                 }
+                // an answer started with a prediction: its experts replace the others
+                full = full || pred_start;
+                pred_start = false;
                 rebalance = false;
-                if (full && llama_moe_cache_refill_bg_enabled()) {
+                if (full && (llama_moe_cache_refill_bg_enabled() || predictor)) {
                     full_bg = true;
                     st.n_full++;
                 }
@@ -1367,9 +1443,10 @@ struct llama_moe_cache::impl {
             int32_t n_empty = 0;
             for (int32_t il : g.layers) {
                 const layer & l = layers[il];
+                const std::vector<float> & rank = pred_valid ? l.pred : l.score;
                 for (int32_t e = 0; e < n_expert; ++e) {
-                    if (l.slot_of[e] < 0 && !l.uploading[e] && l.score[e] > 0.0f) {
-                        best.emplace_back(l.score[e], il*n_expert + e);
+                    if (l.slot_of[e] < 0 && !l.uploading[e] && rank[e] > 0.0f) {
+                        best.emplace_back(rank[e], il*n_expert + e);
                     }
                 }
             }
@@ -1382,7 +1459,8 @@ struct llama_moe_cache::impl {
                     n_empty++;
                     worst.emplace_back(-1.0f, s);
                 } else {
-                    worst.emplace_back(layers[key / n_expert].score[key % n_expert], s);
+                    const layer & lk = layers[key / n_expert];
+                    worst.emplace_back((pred_valid ? lk.pred : lk.score)[key % n_expert], s);
                 }
             }
 
@@ -1582,11 +1660,17 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // with a predictor, the experts it predicts for the answer after this prompt (all of them are uploaded anyway)
+        const bool predicted = hot_pending.empty() && predictor && have_prompt_hidden && predict(0, hidden_prompt);
+        if (predicted) {
+            set_predicted_experts();
+        }
+
         if (!hot_pending.empty()) {
             const std::string path = hot_pending;
             hot_pending.clear();
             load_hot(path);
-        } else if (warm) {
+        } else if (warm || predicted) {
             for (size_t ig = 0; ig < groups.size(); ++ig) {
                 group & g = groups[ig];
                 const int32_t n_expert = g.n_slots > 0 ? (int32_t) g.ref[0]->ne[2] : 0;
@@ -1633,6 +1717,188 @@ struct llama_moe_cache::impl {
             }
         }
         spare_restore.t_sync_us += ggml_time_us() - t_sync_start_us;
+    }
+
+    // hot spare mode with a predictor: its count maps after a ubatch, the answers' starts and ends, its predictions
+    void update_predictor(int64_t n_tokens, int64_t pos0, bool gen) {
+        using P = llama_moe_predictor;
+        if (pos0 == 0) {
+            // a new conversation: the maps start again
+            for (layer & l : layers) {
+                for (auto & m : l.pmap) {
+                    std::fill(m.begin(), m.end(), 0.0f);
+                }
+            }
+            in_answer = false;
+            have_prompt_hidden = false;
+        }
+        if (gen && !in_answer) {
+            // an answer starts: predict from the context's maps and the input of the prompt's last token
+            in_answer = true;
+            t_answer  = 0;
+            next_pred = predictor->every();
+            if (have_prompt_hidden && predict(0, hidden_prompt)) {
+                pred_start = true;
+            }
+        } else if (!gen && in_answer) {
+            // the answer ended: it is now the previous answer and part of the context, and a new turn starts
+            for (layer & l : layers) {
+                if (l.ig < 0) {
+                    continue;
+                }
+                l.pmap[P::MAP_PREV_ANSWER] = l.pmap[P::MAP_ANSWER];
+                for (size_t e = 0; e < l.pred.size(); ++e) {
+                    l.pmap[P::MAP_CONTEXT][e] += l.pmap[P::MAP_ANSWER][e];
+                }
+                for (P::map_kind k : { P::MAP_TURN, P::MAP_ANSWER, P::MAP_ANSWER32, P::MAP_ANSWER8 }) {
+                    std::fill(l.pmap[k].begin(), l.pmap[k].end(), 0.0f);
+                }
+            }
+            in_answer = false;
+        }
+
+        // the maps of the answer only count and decay over its tokens
+        float dec[std::size(LLAMA_MOE_PRED_HALF_LIFE)];
+        for (size_t k = 0; k < std::size(LLAMA_MOE_PRED_HALF_LIFE); ++k) {
+            dec[k] = powf(0.5f, (float) n_tokens/LLAMA_MOE_PRED_HALF_LIFE[k]);
+        }
+        for (layer & l : layers) {
+            if (l.ig < 0) {
+                continue;
+            }
+            const size_t n_expert = l.rec.count.size();
+            for (size_t k = 0; k < std::size(LLAMA_MOE_PRED_DECAYED); ++k) {
+                const P::map_kind m = LLAMA_MOE_PRED_DECAYED[k];
+                if (gen || m == P::MAP_LIVE64 || m == P::MAP_CTX512) {
+                    for (size_t e = 0; e < n_expert; ++e) {
+                        l.pmap[m][e] = l.pmap[m][e]*dec[k] + l.rec.decayed[k*n_expert + e];
+                    }
+                }
+            }
+            std::fill(l.rec.decayed.begin(), l.rec.decayed.end(), 0.0f);
+            for (size_t e = 0; e < n_expert; ++e) {
+                const float c = (float) l.rec.count[e];
+                if (gen) {
+                    l.pmap[P::MAP_ANSWER][e] += c;
+                } else {
+                    l.pmap[P::MAP_TURN][e]    += c;
+                    l.pmap[P::MAP_CONTEXT][e] += c;
+                }
+            }
+        }
+
+        if (!gen) {
+            hidden_prompt = hidden;
+            have_prompt_hidden = true;
+        } else {
+            t_answer += n_tokens;
+            if (t_answer >= next_pred) {
+                predict(t_answer, hidden);
+                while (next_pred <= t_answer) {
+                    next_pred += predictor->every();
+                }
+            }
+        }
+    }
+
+    // hot spare mode with a predictor: rank the experts by their expected selections over its first horizon (the
+    // horizons' predictions averaged), true if it ran
+    bool predict(int64_t t, const std::vector<std::vector<float>> & hid) {
+        const int64_t t_start_us = ggml_time_us();
+        const auto & maps = predictor->maps();
+        const size_t n_layer = layers.size();
+        size_t n_expert = 0;
+        for (const layer & l : layers) {
+            n_expert = std::max(n_expert, l.rec.count.size());
+        }
+        pred_in.resize(maps.size());
+        std::vector<const float *> mp(maps.size(), nullptr), hp;
+        for (size_t f = 0; f < maps.size(); ++f) {
+            if (maps[f] == llama_moe_predictor::MAP_PRIOR) {
+                continue;
+            }
+            pred_in[f].assign(n_layer*n_expert, 0.0f);
+            for (size_t il = 0; il < n_layer; ++il) {
+                if (layers[il].ig >= 0) {
+                    std::copy(layers[il].pmap[maps[f]].begin(), layers[il].pmap[maps[f]].end(), pred_in[f].begin() + il*n_expert);
+                }
+            }
+            mp[f] = pred_in[f].data();
+        }
+        for (const auto & h : hid) {
+            hp.push_back(h.data());
+        }
+        if (!predictor->predict(mp, hp, t, pred_out)) {
+            LLAMA_LOG_WARN("%s: the MoE predictor failed\n", __func__);
+            return false;
+        }
+        const float scale = (float) n_expert_used*predictor->horizons()[0]/pred_out.size();
+        for (size_t il = 0; il < n_layer; ++il) {
+            layer & l = layers[il];
+            if (l.ig < 0) {
+                continue;
+            }
+            for (size_t e = 0; e < l.pred.size(); ++e) {
+                float sum = 0.0f;
+                for (const auto & o : pred_out) {
+                    sum += o[il*n_expert + e];
+                }
+                l.pred[e] = scale*sum;
+            }
+        }
+        pred_valid = true;
+        n_pred++;
+        t_pred_us += ggml_time_us() - t_start_us;
+        double h2 = 0.0;
+        for (const auto & h : hid) {
+            for (float x : h) {
+                h2 += (double) x*x;
+            }
+        }
+        LLAMA_LOG_DEBUG("%s: t = %lld, |hidden| = %.2f, %.2f ms\n", __func__, (long long) t, sqrt(h2), (ggml_time_us() - t_start_us)/1000.0);
+        return true;
+    }
+
+    // hot spare mode with a predictor, after a release: the resident set becomes the experts with the most expected
+    // selections, the ones already in it keep their slots
+    void set_predicted_experts() {
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_expert = g.ref[0]->ne[2];
+            std::vector<std::pair<float, int32_t>> all;
+            for (int32_t il : g.layers) {
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    all.emplace_back(layers[il].pred[e], il*n_expert + e);
+                }
+            }
+            const size_t n = std::min<size_t>(g.n_slots, all.size());
+            std::nth_element(all.begin(), all.begin() + n, all.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            std::unordered_map<int32_t, bool> want; // key -> already in a slot
+            for (size_t i = 0; i < n; ++i) {
+                want[all[i].second] = false;
+            }
+            for (int32_t & key : g.key_of_slot) {
+                auto it = key >= 0 ? want.find(key) : want.end();
+                if (it != want.end()) {
+                    it->second = true;
+                } else {
+                    key = -1;
+                }
+            }
+            auto it = want.begin();
+            g.n_resident = 0;
+            for (int32_t & key : g.key_of_slot) {
+                while (key < 0 && it != want.end()) {
+                    if (!it->second) {
+                        key = it->first;
+                    }
+                    ++it;
+                }
+                g.n_resident += key >= 0;
+            }
+        }
     }
 
     // hot spare mode: count the next generated tokens apart, for one rebalance from their scores
@@ -1866,6 +2132,10 @@ struct llama_moe_cache::impl {
                 n_restores > 0 ? (spare_restore.t_us - spare_restore.t_wait_us - spare_restore.t_dma_us - spare_restore.t_alloc_us
                     - spare_restore.t_sync_us)/1000.0/n_restores : 0.0);
         }
+        if (predictor) {
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu predictions, %.2f ms each\n",
+                n_pred, n_pred > 0 ? t_pred_us/1000.0/n_pred : 0.0);
+        }
         if (worker) {
             const uint64_t bytes = worker->bytes;
             const int64_t  t_us  = worker->t_us;
@@ -1936,8 +2206,21 @@ void llama_moe_cache::restore() {
     pimpl->restore();
 }
 
-void llama_moe_cache::update(int64_t n_tokens) {
-    pimpl->update(n_tokens);
+void llama_moe_cache::update(int64_t n_tokens, int64_t pos0, int gen) {
+    pimpl->update(n_tokens, pos0, gen);
+}
+
+const std::vector<int32_t> & llama_moe_cache::predictor_layers() const {
+    return pimpl->hidden_layers;
+}
+
+void llama_moe_cache::set_hidden(int32_t il, const float * data, size_t n) {
+    for (size_t i = 0; i < pimpl->hidden_layers.size(); ++i) {
+        if (pimpl->hidden_layers[i] == il) {
+            auto & h = pimpl->hidden[i];
+            std::copy(data, data + std::min(n, h.size()), h.begin());
+        }
+    }
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {

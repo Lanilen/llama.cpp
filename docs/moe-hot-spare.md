@@ -65,6 +65,30 @@ from pinned staging memory of that GPU, and a worker thread copies the experts i
 submitted at the next update, and its experts count as resident once it is done, a ubatch or two later. An evicted expert
 leaves at once.
 
+### A learned predictor: `--moe-cache-predictor`
+
+The decayed scores look back. A predictor file looks ahead: a small learned model that ranks the experts by how often
+each layer will select them over the next tokens, from the input of a few layers at the newest token (the residual
+stream; for Flash-Next the inputs of layers 16 and 32) and counts of the selections so far (decayed over all tokens,
+over the context, the current turn's prompt, the previous answer, and the answer so far). With one:
+
+- at each answer's start (the first ubatch that outputs all its tokens) it predicts from the input of the prompt's last
+  token, and its experts replace the others in a background rebalance; after a release (`--moe-cache-resize`) the
+  restore uploads the predicted experts instead of the old ones;
+- every 16 generated tokens (the file says) it predicts again, and the budgeted refresh ranks by that prediction
+  (expected selections over the file's first horizon, the horizons' predictions averaged) instead of the scores;
+- the refill (`--moe-cache-refill`) rebalances in full from the prediction, in the background;
+- a ubatch starting at position 0 starts a new conversation: the counts start again.
+
+The file is a GGUF of its own (`general.architecture` = `moe-predictor`, see `src/llama-moe-predictor.cpp` for the
+contract): it names the layers and counts it reads, its horizons and how often it predicts, and holds the weights, so a
+retrained predictor replaces it without code changes. It runs as a ggml graph on the CPU (4 threads,
+`LLAMA_MOE_PREDICTOR_THREADS`) or on another device (`--moe-cache-predictor-device`); `llama-moe-predictor-check` checks
+a file against test vectors from its exporter. It assumes one conversation at a time (`-np 1`). The predictor for
+Flash-Next was trained offline on expert traces (`llama-moe-trace` with `LLAMA_MOE_TRACE_HIDDEN`): on held-out
+conversations its top 164 experts per layer served 86% of the next 128 tokens' selections from an answer's start,
+against 77% for the decayed scores.
+
 ### The two branches at the same time
 
 On its own, the scheduler would run the cache branch together with the layer's attention, and the CPU's input copy would
@@ -207,6 +231,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
 | `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
 | `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on perseus 29.5 GB/s instead of 20) |
+| `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
 | `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |

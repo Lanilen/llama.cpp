@@ -216,6 +216,7 @@ llama_context::llama_context(
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    cparams.moe_hidden_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type          = params.ctx_type;
@@ -571,10 +572,15 @@ llama_context::llama_context(
             mcp.save      = params.moe_cache_save ? params.moe_cache_save : "";
             mcp.refill    = params.moe_cache_refill;
             mcp.resize    = params.moe_cache_resize;
+            mcp.predictor        = params.moe_cache_predictor        ? params.moe_cache_predictor        : "";
+            mcp.predictor_device = params.moe_cache_predictor_device ? params.moe_cache_predictor_device : "";
             if (params.moe_cache_sizes != nullptr) {
                 mcp.sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + params.n_moe_cache_sizes);
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, mcp);
+            for (int32_t il : moe_cache->predictor_layers()) {
+                cparams.moe_hidden_inp[il] = true;
+            }
         }
 
         if (params.moe_cache_resize) {
@@ -1766,7 +1772,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the CPU part of the graph is done, so the selected experts of this ubatch are counted
     if (moe_cache) {
-        moe_cache->update(ubatch.n_tokens);
+        // the predictor reads some layers' input at the newest token
+        for (int32_t il : moe_cache->predictor_layers()) {
+            if (ggml_tensor * t = res->get_moe_hidden(il)) {
+                ggml_backend_sched_synchronize(sched.get());
+                moe_hidden_buf.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, moe_hidden_buf.data(), 0, ggml_nbytes(t));
+                moe_cache->set_hidden(il, moe_hidden_buf.data(), moe_hidden_buf.size());
+            }
+        }
+        // a ubatch that outputs all its tokens is generation (with drafts, their verification); a prompt outputs its last
+        uint32_t n_out = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            n_out += ubatch.output[i] != 0;
+        }
+        moe_cache->update(ubatch.n_tokens, ubatch.pos ? ubatch.pos[0] : -1, n_out == ubatch.n_tokens ? 1 : 0);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -4299,6 +4319,8 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_save              =*/ nullptr,
         /*.moe_cache_refill            =*/ 128,
         /*.moe_cache_batch             =*/ 512,
+        /*.moe_cache_predictor         =*/ nullptr,
+        /*.moe_cache_predictor_device  =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

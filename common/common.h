@@ -609,6 +609,8 @@ struct common_params {
     int32_t moe_cache_refill = 128;     // hot spare mode: generated tokens after a prompt for one rebalance from them
     bool    moe_cache_resize = false;   // hot spare mode: the cache gives its VRAM to the compute buffers of large batches
     int32_t moe_cache_batch  = 512;     // hot spare mode with resize: batches of up to N tokens keep the cache if their buffers fit
+    std::string moe_cache_predictor;        // hot spare mode: predictor file that ranks the experts
+    std::string moe_cache_predictor_device; // the device it runs on, empty = CPU
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

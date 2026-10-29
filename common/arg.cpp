@@ -2878,6 +2878,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_SAVE"));
     add_opt(common_arg(
+        {"--moe-cache-predictor"}, "FNAME",
+        "hot spare mode: a predictor file (general.architecture moe-predictor) that ranks the experts by their expected "
+        "selections, from the input of some layers and counts of the selections so far: at each answer's start and every "
+        "few generated tokens, instead of the decayed scores and the refill",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_predictor = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR"));
+    add_opt(common_arg(
+        {"--moe-cache-predictor-device"}, "DEV",
+        "the device the predictor runs on (default: CPU)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_predictor_device = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_DEVICE"));
+    add_opt(common_arg(
         {"--moe-cache-refill"}, "N",
         string_format("hot spare mode: after a prompt, rebalance the resident experts once from the selections of the first N generated tokens, 0 = never (default: %d)", params.moe_cache_refill),
         [](common_params & params, int value) {
