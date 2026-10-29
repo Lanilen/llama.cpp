@@ -205,6 +205,8 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
+| `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 1) |
+| `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops |
