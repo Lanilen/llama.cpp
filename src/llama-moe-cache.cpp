@@ -22,6 +22,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
+
 namespace {
 
 // SLRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
@@ -251,6 +255,53 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// copies with non-temporal stores: the destination lines are not read before they are written, and the copy does not push
+// the data of the CPU experts out of the caches; for the staging memory, which only the uploads read
+static void llama_moe_cache_copy_nt(uint8_t * dst, const uint8_t * src, size_t n) {
+#if defined(__SSE2__) || defined(_M_X64)
+    const size_t head = std::min(n, (size_t) ((16 - ((uintptr_t) dst & 15)) & 15));
+    memcpy(dst, src, head);
+    dst += head; src += head; n -= head;
+    __m128i * d = (__m128i *) dst;
+    const __m128i * s = (const __m128i *) src;
+    for (; n >= 64; n -= 64, d += 4, s += 4) {
+        const __m128i a = _mm_loadu_si128(s + 0);
+        const __m128i b = _mm_loadu_si128(s + 1);
+        const __m128i c = _mm_loadu_si128(s + 2);
+        const __m128i e = _mm_loadu_si128(s + 3);
+        _mm_stream_si128(d + 0, a);
+        _mm_stream_si128(d + 1, b);
+        _mm_stream_si128(d + 2, c);
+        _mm_stream_si128(d + 3, e);
+    }
+    for (; n >= 16; n -= 16, ++d, ++s) {
+        _mm_stream_si128(d, _mm_loadu_si128(s));
+    }
+    memcpy(d, s, n);
+    // the stores are visible to the uploads that read them after this
+    _mm_sfence();
+#else
+    memcpy(dst, src, n);
+#endif
+}
+
+// LLAMA_MOE_CACHE_COPY_NT=1 copies the experts to the staging memory with non-temporal stores
+static bool llama_moe_cache_copy_nt_enabled() {
+    static const bool nt = [] {
+        const char * env = getenv("LLAMA_MOE_CACHE_COPY_NT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return nt;
+}
+
+static void llama_moe_cache_copy(uint8_t * dst, const uint8_t * src, size_t n) {
+    if (llama_moe_cache_copy_nt_enabled()) {
+        llama_moe_cache_copy_nt(dst, src, n);
+    } else {
+        memcpy(dst, src, n);
+    }
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -307,7 +358,7 @@ struct llama_moe_cache::impl {
                 busy++;
                 lock.unlock();
                 const int64_t t_start_us = ggml_time_us();
-                memcpy(j.dst, j.src, j.n);
+                llama_moe_cache_copy(j.dst, j.src, j.n);
                 t_us  += ggml_time_us() - t_start_us;
                 bytes += j.n;
                 lock.lock();
@@ -428,6 +479,7 @@ struct llama_moe_cache::impl {
         int64_t t_wait_next_us = 0; // of t_wait_us, at the next update, for the copies of the previous one
         int64_t t_dma_us  = 0; // of t_us, waiting for the uploads of a half before reusing it
         int64_t t_full_us = 0; // of t_us, full rebalances (after a prompt, the refill)
+        int64_t t_alloc_us = 0; // of t_us, restores: waiting for the device memory, allocating and clearing the banks
         size_t  n_full    = 0;
     };
 
@@ -1051,7 +1103,7 @@ struct llama_moe_cache::impl {
 
     void copy_to_staging(uint8_t * dst, const uint8_t * src, size_t size) {
         const int64_t t_start_us = ggml_time_us();
-        memcpy(dst, src, size);
+        llama_moe_cache_copy(dst, src, size);
         if (spare_cur != nullptr) {
             spare_cur->t_copy_us += ggml_time_us() - t_start_us;
         }
@@ -1063,9 +1115,10 @@ struct llama_moe_cache::impl {
             return env == nullptr || atoi(env) != 0;
         }();
         // LLAMA_MOE_CACHE_COPY_THREADS=N spreads the copies to the staging memory over N threads
+        // (one thread copies at ~9 GB/s on perseus; 4 reach its RAM's ~20 GB/s, more are no faster)
         static const int n_threads = [] {
             const char * env = getenv("LLAMA_MOE_CACHE_COPY_THREADS");
-            return env != nullptr ? std::max(1, atoi(env)) : 1;
+            return env != nullptr ? std::max(1, atoi(env)) : 4;
         }();
         if (async && !worker) {
             worker = std::make_unique<copy_worker>(n_threads);
@@ -1450,6 +1503,7 @@ struct llama_moe_cache::impl {
     }
 
     void restore_impl() {
+        const int64_t t_alloc_start_us = ggml_time_us();
         for (device & d : devices) {
             if (!d.ctx) {
                 continue;
@@ -1462,6 +1516,7 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_clear(d.buf.get(), 0);
             ggml_backend_buffer_set_usage(d.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
+        spare_restore.t_alloc_us += ggml_time_us() - t_alloc_start_us;
         released = false;
         n_restores++;
         for (layer & l : layers) {
@@ -1742,15 +1797,16 @@ struct llama_moe_cache::impl {
         log_spare("ubatch  > 32", spare_large, false);
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "
-                "%.1f ms per restore (waiting for the copies %.1f, for a half's uploads %.1f)\n",
+                "%.1f ms per restore (waiting for the copies %.1f, for a half's uploads %.1f, allocating the banks %.1f)\n",
                 n_restores, restore_bytes/1024.0/1024.0, n_restores > 0 ? spare_restore.t_us/1000.0/n_restores : 0.0,
-                n_restores > 0 ? spare_restore.t_wait_us/1000.0/n_restores : 0.0, n_restores > 0 ? spare_restore.t_dma_us/1000.0/n_restores : 0.0);
+                n_restores > 0 ? spare_restore.t_wait_us/1000.0/n_restores : 0.0, n_restores > 0 ? spare_restore.t_dma_us/1000.0/n_restores : 0.0,
+                n_restores > 0 ? spare_restore.t_alloc_us/1000.0/n_restores : 0.0);
         }
         if (worker) {
             const uint64_t bytes = worker->bytes;
             const int64_t  t_us  = worker->t_us;
-            LLAMA_LOG_INFO("llama_moe_cache: hot spare, copy worker: %zu threads, %.2f GiB copied in %.1f s of thread time, %.2f GB/s per thread\n",
-                worker->threads.size(), bytes/1024.0/1024.0/1024.0, t_us/1e6, t_us > 0 ? bytes/1e3/t_us : 0.0);
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, copy worker: %zu threads%s, %.2f GiB copied in %.1f s of thread time, %.2f GB/s per thread\n",
+                worker->threads.size(), llama_moe_cache_copy_nt_enabled() ? " (non-temporal stores)" : "", bytes/1024.0/1024.0/1024.0, t_us/1e6, t_us > 0 ? bytes/1e3/t_us : 0.0);
         }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
