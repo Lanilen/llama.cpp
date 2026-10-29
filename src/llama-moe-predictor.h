@@ -14,7 +14,8 @@
 // llama.cpp), so it can be retrained and replaced without code changes. The file says what it reads: the inputs of
 // some layers (the residual stream) at the newest token, and count maps of the selections so far (see map_kind); and
 // what it predicts: for each horizon H, the distribution of each layer's selections over the next H tokens. It runs
-// as a small ggml graph on a backend of its own, the CPU by default.
+// as a small ggml graph on a backend of its own, the CPU by default. A start predictor (role "start") runs before a
+// turn's prompt is processed instead: it reads the mean of the model's token embeddings over the turn's tokens.
 class llama_moe_predictor {
 public:
     // the count maps a predictor file can ask for, each [n_layer][n_expert] selections:
@@ -42,13 +43,16 @@ public:
     const std::vector<map_kind> & maps() const;          // the count maps it reads, in this order
     const std::vector<int32_t>  & horizons() const;      // tokens, one prediction each
     int32_t every() const;                               // generated tokens between predictions
+    bool reads_turn_embd() const;                        // it reads the turn's mean token embedding
+    bool is_start() const;                               // role "start": it predicts before the turn's prompt runs
 
     // maps: one pointer per entry of maps() to n_layer*n_expert counts (layer-major), nullptr for MAP_PRIOR
     // hidden: one pointer per entry of hidden_layers() to the n_embd inputs of that layer at the newest token
     // t: tokens of the answer generated so far (0: right after the prompt)
+    // turn_embd: with reads_turn_embd(), the n_embd mean of the token embeddings over the turn's tokens
     // out: per horizon, n_layer*n_expert probabilities (each layer's sum to 1); false if the graph failed
     bool predict(const std::vector<const float *> & maps, const std::vector<const float *> & hidden, int64_t t,
-                 std::vector<std::vector<float>> & out);
+                 std::vector<std::vector<float>> & out, const float * turn_embd = nullptr);
 
 private:
     llama_moe_predictor();

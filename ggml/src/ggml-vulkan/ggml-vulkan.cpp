@@ -13144,6 +13144,10 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
+    if (ctx->bg_gates && ctx->device->device.getSemaphoreCounterValue(ctx->bg_host.s) < ctx->bg_gate_last) {
+        // batches still waiting for a gate would never finish
+        ctx->device->device.signalSemaphore(vk::SemaphoreSignalInfo{ ctx->bg_host.s, ctx->bg_gate_last });
+    }
     if (ctx->bg_initialized) {
         if (ctx->bg_semaphore.value > 0) {
             vk::SemaphoreWaitInfo wi{ {}, 1, &ctx->bg_semaphore.s, &ctx->bg_semaphore.value };
@@ -13152,6 +13156,9 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->bg_ctx.reset();
         ctx->device->device.destroySemaphore(ctx->bg_semaphore.s);
         ctx->bg_cmd_pool.destroy(ctx->device->device);
+    }
+    if (ctx->bg_gates) {
+        ctx->device->device.destroySemaphore(ctx->bg_host.s);
     }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true, ctx->name.c_str());
@@ -15598,6 +15605,13 @@ static uint64_t ggml_backend_vk_upload_bg_submit(ggml_backend_t backend) {
     ggml_vk_ctx_end(ctx->bg_ctx);
     ctx->bg_semaphore.value++;
     ctx->bg_ctx->seqs.back().back().signal_semaphores.push_back(ctx->bg_semaphore);
+    // a batch waits for its gate; a batch without one waits for the gates given out before it, so the batches signal
+    // the timeline in their order
+    const uint64_t gate = ctx->bg_gate_next > 0 ? ctx->bg_gate_next : ctx->bg_gate_last;
+    if (gate > 0) {
+        ctx->bg_ctx->seqs.back().back().wait_semaphores.push_back({ ctx->bg_host.s, gate });
+        ctx->bg_gate_next = 0;
+    }
     ggml_vk_submit(ctx->bg_ctx, {});
     ctx->bg_ctx.reset();
     ctx->bg_inflight.emplace_back(ctx->bg_semaphore.value, cmd_buf);
@@ -15627,6 +15641,43 @@ static bool ggml_backend_vk_upload_bg_done(ggml_backend_t backend, uint64_t tick
     }
     ctx->bg_ready = std::max(ctx->bg_ready, ticket);
     return true;
+}
+
+// gates: the next submitted batch waits until the host opens the returned gate (ggml_backend_vk_upload_bg_open), so
+// its copies can be recorded and submitted before the host has written the staging memory they read; 0 if the
+// backend has no background uploads. Gates open in the order they were given out.
+static uint64_t ggml_backend_vk_upload_bg_gate(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ggml_vk_bg_init(ctx)) {
+        return 0;
+    }
+    if (!ctx->bg_gates) {
+        vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+        vk::SemaphoreCreateInfo ci{};
+        ci.setPNext(&tci);
+        ctx->bg_host.s = ctx->device->device.createSemaphore(ci);
+        ctx->bg_host.value = 0;
+        ctx->bg_gates = true;
+    }
+    ctx->bg_gate_next = ++ctx->bg_gate_last;
+    return ctx->bg_gate_next;
+}
+
+// opens a gate, from any thread
+static void ggml_backend_vk_upload_bg_open(ggml_backend_t backend, uint64_t gate) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (ctx->bg_gates && gate > 0) {
+        ctx->device->device.signalSemaphore(vk::SemaphoreSignalInfo{ ctx->bg_host.s, gate });
+    }
+}
+
+// waits until the batch of a ticket is complete, from any thread (ggml_backend_vk_upload_bg_done does the bookkeeping)
+static void ggml_backend_vk_upload_bg_wait(ggml_backend_t backend, uint64_t ticket) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (ctx->bg_initialized && ticket > 0) {
+        vk::SemaphoreWaitInfo wi{ {}, 1, &ctx->bg_semaphore.s, &ticket };
+        VK_CHECK(ctx->device->device.waitSemaphores(wi, UINT64_MAX), "bg waitSemaphores", ctx->device);
+    }
 }
 
 // frees the scratch buffers (prealloc x, y, split_k) and the staging buffer of synchronous copies, which grow with
@@ -16770,6 +16821,15 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_upload_bg_done") == 0) {
         return (void *) ggml_backend_vk_upload_bg_done;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg_gate") == 0) {
+        return (void *) ggml_backend_vk_upload_bg_gate;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg_open") == 0) {
+        return (void *) ggml_backend_vk_upload_bg_open;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg_wait") == 0) {
+        return (void *) ggml_backend_vk_upload_bg_wait;
     }
     if (strcmp(name, "ggml_backend_release_scratch") == 0) {
         return (void *) ggml_backend_vk_release_scratch;

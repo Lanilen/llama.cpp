@@ -415,6 +415,7 @@ extern "C" {
         int32_t moe_cache_batch;       // hot spare mode with moe_cache_resize: batches of up to this many tokens keep the cache, if their compute buffers fit next to it, 0 = n_ubatch [EXPERIMENTAL]
         const char * moe_cache_predictor;        // hot spare mode: predictor file that ranks the experts, nullptr = none [EXPERIMENTAL]
         const char * moe_cache_predictor_device; // the device the predictor runs on, nullptr = CPU [EXPERIMENTAL]
+        const char * moe_cache_predictor_start;  // hot spare mode with a predictor: start predictor file (from the turn's text), nullptr = none [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

@@ -2894,6 +2894,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_DEVICE"));
     add_opt(common_arg(
+        {"--moe-cache-predictor-start"}, "FNAME",
+        "with --moe-cache-predictor: a start predictor file (role start) that predicts from the counts and the turn's "
+        "text (the mean of the model's token embeddings) before a turn's prompt runs, so its experts upload while the "
+        "prompt computes (the cache must stay in device memory for the prompt); the answer's start then tops up from the "
+        "main predictor, at most 1000 swaps (LLAMA_MOE_PREDICTOR_START_SWAPS, LLAMA_MOE_PREDICTOR_TOPUP)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_predictor_start = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_START"));
+    add_opt(common_arg(
         {"--moe-cache-refill"}, "N",
         string_format("hot spare mode: after a prompt, rebalance the resident experts once from the selections of the first N generated tokens, 0 = never (default: %d)", params.moe_cache_refill),
         [](common_params & params, int value) {

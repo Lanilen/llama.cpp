@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <thread>
+#include <unordered_set>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -447,6 +448,9 @@ struct llama_moe_cache::impl {
         ggml_backend_upload_bg_t        upload_bg        = nullptr;
         ggml_backend_upload_bg_submit_t upload_bg_submit = nullptr;
         ggml_backend_upload_bg_done_t   upload_bg_done   = nullptr;
+        ggml_backend_upload_bg_gate_t   upload_bg_gate   = nullptr; // optional: uploads submitted before their copies (text starts)
+        ggml_backend_upload_bg_open_t   upload_bg_open   = nullptr;
+        ggml_backend_upload_bg_wait_t   upload_bg_wait   = nullptr;
         int      half        = 0;
         uint64_t half_ticket[2] = { 0, 0 };
         bool     bg_recorded = false;    // background uploads were recorded since the last submission
@@ -568,6 +572,22 @@ struct llama_moe_cache::impl {
     int64_t t_pred_us  = 0;
     std::vector<std::vector<float>> pred_in;        // contiguous count maps for the predictor
     std::vector<std::vector<float>> pred_out;
+
+    // hot spare mode with a start predictor (--moe-cache-predictor-start): before a turn's prompt runs, it predicts
+    // from the counts and the turn's text (the mean of the model's token embeddings) and its experts upload while the
+    // prompt computes (the text start); the answer's start then tops up from the main predictor, capped
+    std::unique_ptr<llama_moe_predictor> predictor_start;
+    const ggml_tensor * tok_embd = nullptr;
+    int32_t n_embd = 0;
+    size_t  start_swaps = 1600;  // LLAMA_MOE_PREDICTOR_START_SWAPS: experts the text start uploads at most
+    size_t  topup_swaps = 1000;  // LLAMA_MOE_PREDICTOR_TOPUP: swaps of the answer's start after a text start
+    bool    turn_seen   = false; // the turn's first prompt ubatch came (the text start ran or was skipped)
+    bool    text_started = false; // the text start ran for this turn
+    size_t  full_left   = SIZE_MAX; // swaps left to the running full rebalance
+    size_t  full_cap    = SIZE_MAX; // the swaps of the next full rebalance (the answer's start after a text start)
+    std::thread installer;       // fills the staging memory of a text start while the prompt computes
+    size_t  n_text = 0, text_swaps = 0;
+    int64_t t_text_us = 0;
     std::string save_path;   // the resident experts are written there at exit
 
     // hot spare mode with resize: the device memory of the cache is released while large batches run
@@ -611,6 +631,9 @@ struct llama_moe_cache::impl {
         }
         refill_tokens = std::max<int64_t>(0, params.refill);
         refill_left   = refill_tokens; // also for a first prompt too short to count as one
+        if (!params.predictor_start.empty() && params.predictor.empty()) {
+            LLAMA_LOG_WARN("%s: --moe-cache-predictor-start needs --moe-cache-predictor, ignored\n", __func__);
+        }
         if (!params.predictor.empty()) {
             if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
                 LLAMA_LOG_WARN("%s: --moe-cache-predictor needs --moe-cache-mode hot-spare, ignored\n", __func__);
@@ -623,6 +646,18 @@ struct llama_moe_cache::impl {
                 hidden_layers = predictor->hidden_layers();
                 hidden.assign(hidden_layers.size(), std::vector<float>(model.hparams.n_embd, 0.0f));
                 hidden_prompt = hidden;
+                if (!params.predictor_start.empty()) {
+                    predictor_start = llama_moe_predictor::load(params.predictor_start, params.predictor_device, (int32_t) model.hparams.n_layer(),
+                                                                (int32_t) model.hparams.n_expert, (int32_t) model.hparams.n_embd);
+                    if (!predictor_start || !predictor_start->is_start() || !predictor_start->hidden_layers().empty()) {
+                        throw std::runtime_error("failed to load the MoE start predictor " + params.predictor_start +
+                                                 " (it needs role start and reads no layer input)");
+                    }
+                    tok_embd = model.tok_embd;
+                    n_embd   = (int32_t) model.hparams.n_embd;
+                    if (const char * env = getenv("LLAMA_MOE_PREDICTOR_START_SWAPS")) { start_swaps = (size_t) std::max(0, atoi(env)); }
+                    if (const char * env = getenv("LLAMA_MOE_PREDICTOR_TOPUP"))       { topup_swaps = (size_t) std::max(0, atoi(env)); }
+                }
             }
         }
         const size_t size = params.size;
@@ -1015,6 +1050,9 @@ struct llama_moe_cache::impl {
             d.upload_bg        = (ggml_backend_upload_bg_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg");
             d.upload_bg_submit = (ggml_backend_upload_bg_submit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_submit");
             d.upload_bg_done   = (ggml_backend_upload_bg_done_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_done");
+            d.upload_bg_gate   = (ggml_backend_upload_bg_gate_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_gate");
+            d.upload_bg_open   = (ggml_backend_upload_bg_open_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_open");
+            d.upload_bg_wait   = (ggml_backend_upload_bg_wait_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_wait");
             // LLAMA_MOE_CACHE_BG=0 keeps the uploads on the compute queue, to compare
             const char * env_bg = getenv("LLAMA_MOE_CACHE_BG");
             if (!d.upload_bg || !d.upload_bg_submit || !d.upload_bg_done || (env_bg != nullptr && atoi(env_bg) == 0)) {
@@ -1296,6 +1334,7 @@ struct llama_moe_cache::impl {
         if (gen < 0) {
             gen = n_tokens <= 4;
         }
+        join_installer();
         const int64_t t_start_us = ggml_time_us();
 
         // the compute of this ubatch is done, so the slots of the victims can be overwritten
@@ -1383,7 +1422,9 @@ struct llama_moe_cache::impl {
                 pred_start = false;
                 rebalance = false;
                 if (full && (llama_moe_cache_refill_bg_enabled() || predictor)) {
-                    full_bg = true;
+                    full_bg   = true;
+                    full_left = full_cap;
+                    full_cap  = SIZE_MAX;
                     st.n_full++;
                 }
                 if (full_bg) {
@@ -1415,14 +1456,16 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // no_wait: stage only the swaps that need no waiting for copies or uploads, false if some were left for later
-    bool refresh_impl(size_t budget_bytes, spare_stats & st, bool no_wait = false) {
-        struct swap {
-            float   gain;
-            int32_t ig;
-            int32_t key; // il*n_expert + expert of the new expert
-            int32_t slot;
-        };
+    struct swap {
+        float   gain;
+        int32_t ig;
+        int32_t key; // il*n_expert + expert of the new expert
+        int32_t slot;
+    };
+
+    // hot spare mode: the swaps that bring the best experts in for the weakest residents, best gain first; the budget
+    // limits how many each group plans beyond its empty slots
+    std::vector<swap> plan_swaps(size_t budget_bytes) {
         std::vector<swap> swaps;
         std::vector<std::pair<float, int32_t>> best;  // score, key of the experts that are not resident
         std::vector<std::pair<float, int32_t>> worst; // score, slot of the resident experts, -1 for the empty slots
@@ -1480,10 +1523,19 @@ struct llama_moe_cache::impl {
         }
 
         std::sort(swaps.begin(), swaps.end(), [](const swap & a, const swap & b) { return a.gain > b.gain; });
+        return swaps;
+    }
 
+    // no_wait: stage only the swaps that need no waiting for copies or uploads, false if some were left for later
+    // (or a full rebalance used its swaps, full_left)
+    bool refresh_impl(size_t budget_bytes, spare_stats & st, bool no_wait = false) {
+        const std::vector<swap> swaps = plan_swaps(budget_bytes);
         size_t spent = 0;
         bool complete = true;
         for (const swap & sw : swaps) {
+            if (no_wait && full_left == 0) {
+                break;
+            }
             group & g = groups[sw.ig];
             const int32_t n_expert = g.ref[0]->ne[2];
             size_t expert_size = 0;
@@ -1516,6 +1568,9 @@ struct llama_moe_cache::impl {
             }
             st.swaps++;
             st.bytes += expert_size;
+            if (no_wait && full_left != SIZE_MAX) {
+                full_left--;
+            }
         }
 
         for (device & d : devices) {
@@ -1524,6 +1579,176 @@ struct llama_moe_cache::impl {
             }
         }
         return complete;
+    }
+
+    // hot spare mode with a start predictor, before a ubatch is computed: a turn's first prompt ubatch, while the cache
+    // is in device memory, predicts from the counts and the turn's text, and the predicted experts upload while the
+    // prompt computes: the copies are submitted now behind gates the installer thread opens as it fills each chunk
+    // of the staging memory (each chunk waits for the uploads that last read its half)
+    void before_ubatch(const llama_token * tokens, int64_t n_tokens, int64_t pos0, int gen) {
+        if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || !predictor || n_tokens <= 0) {
+            return;
+        }
+        if (gen < 0) {
+            gen = n_tokens <= 4;
+        }
+        if (pos0 == 0) {
+            start_conversation();
+        }
+        if (gen || turn_seen) {
+            return;
+        }
+        if (in_answer) {
+            end_answer();
+        }
+        turn_seen = true;
+        if (!predictor_start || released || tokens == nullptr || start_swaps == 0 || tok_embd == nullptr) {
+            return;
+        }
+        const int64_t t_start_us = ggml_time_us();
+        join_installer();
+        finish_submits();
+
+        // the turn's text: the mean of its tokens' embeddings (the ubatch is the turn, or its first part)
+        std::vector<float> te(n_embd, 0.0f), row(n_embd);
+        std::vector<uint8_t> raw(tok_embd->nb[1]);
+        const auto * traits = ggml_get_type_traits(tok_embd->type);
+        const bool host = tok_embd->buffer != nullptr && ggml_backend_buffer_is_host(tok_embd->buffer);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const size_t off = (size_t) tokens[i]*tok_embd->nb[1];
+            const void * src = (const uint8_t *) tok_embd->data + off;
+            if (!host) {
+                ggml_backend_tensor_get(tok_embd, raw.data(), off, raw.size());
+                src = raw.data();
+            }
+            if (tok_embd->type == GGML_TYPE_F32) {
+                std::copy((const float *) src, (const float *) src + n_embd, row.begin());
+            } else if (traits->to_float) {
+                traits->to_float(src, row.data(), n_embd);
+            } else {
+                return;
+            }
+            for (int32_t k = 0; k < n_embd; ++k) {
+                te[k] += row[k]/n_tokens;
+            }
+        }
+        if (!predict_with(*predictor_start, 0, {}, te.data())) {
+            return;
+        }
+
+        // the swaps, best gain first, each device in chunks of a staging half
+        std::vector<swap> swaps = plan_swaps(SIZE_MAX);
+        if (swaps.size() > start_swaps) {
+            swaps.resize(start_swaps);
+        }
+        struct chunk { uint64_t wait = 0, gate = 0, ticket = 0; std::vector<copy_worker::job> jobs; };
+        std::vector<std::pair<device *, std::vector<chunk>>> work;
+        size_t n_done = 0;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            if (!d.buf || d.upload_bg == nullptr || d.upload_bg_gate == nullptr || d.upload_bg_open == nullptr || d.upload_bg_wait == nullptr) {
+                continue;
+            }
+            const size_t half_size = d.staging_size/2;
+            std::vector<chunk> chunks;
+            int h = d.half ^ 1;
+            size_t used = 0;
+            std::vector<size_t> first_upload(1, pending_uploads.size());
+            auto close = [&]() {
+                chunk & c = chunks.back();
+                c.wait   = chunks.size() > 2 ? chunks[chunks.size() - 3].ticket : d.half_ticket[h];
+                c.gate   = d.upload_bg_gate(d.backend);
+                c.ticket = d.upload_bg_submit(d.backend);
+                for (size_t i = first_upload.back(); i < pending_uploads.size(); ++i) {
+                    pending_uploads[i].ticket = c.ticket;
+                }
+                d.half_ticket[h] = c.ticket;
+            };
+            for (const swap & sw : swaps) {
+                group & g = groups[sw.ig];
+                if (g.id != (int32_t) id) {
+                    continue;
+                }
+                const int32_t n_expert = g.ref[0]->ne[2];
+                layer & l = layers[sw.key / n_expert];
+                const int32_t e = sw.key % n_expert;
+                size_t need = 0;
+                for (const ggml_tensor * t : l.experts) {
+                    need += GGML_PAD(t->nb[2], 64);
+                }
+                if (need > half_size) {
+                    break;
+                }
+                if (chunks.empty() || used + need > half_size) {
+                    if (!chunks.empty()) {
+                        close();
+                        h ^= 1;
+                    }
+                    chunks.emplace_back();
+                    first_upload.push_back(pending_uploads.size());
+                    used = 0;
+                }
+                const int32_t old_key = g.key_of_slot[sw.slot];
+                if (old_key >= 0) {
+                    set_resident(layers[old_key / n_expert], old_key % n_expert, -1);
+                } else {
+                    g.n_resident++;
+                }
+                g.key_of_slot[sw.slot] = sw.key;
+                bool ok = true;
+                for (size_t ip = 0; ip < l.experts.size() && ok; ++ip) {
+                    const size_t sz = l.experts[ip]->nb[2];
+                    uint8_t * dst = d.staging + h*half_size + used;
+                    ok = d.upload_bg(d.backend, g.banks[ip], dst, sw.slot*sz, sz);
+                    chunks.back().jobs.push_back({ dst, (const uint8_t *) l.experts[ip]->data + e*sz, sz });
+                    used += GGML_PAD(sz, 64);
+                }
+                GGML_ASSERT(ok && "background upload failed in a text start");
+                l.uploading[e] = 1;
+                g.slot_pending[sw.slot] = 1;
+                pending_uploads.push_back({ (int32_t) sw.ig, sw.key, sw.slot, 0 });
+                n_done++;
+            }
+            if (!chunks.empty()) {
+                close();
+                d.half = h;
+                d.staging_used = used;
+                d.bg_recorded = false;
+                d.submit_waiting = false;
+                work.emplace_back(&d, std::move(chunks));
+            }
+        }
+        flush_maps(); // the evicted experts leave before the prompt computes
+        text_started = n_done > 0;
+        n_text += text_started;
+        text_swaps += n_done;
+        t_text_us += ggml_time_us() - t_start_us;
+        if (work.empty()) {
+            return;
+        }
+        copy_worker * w = get_worker();
+        installer = std::thread([w, work = std::move(work)]() mutable {
+            for (auto & [d, chunks] : work) {
+                for (chunk & c : chunks) {
+                    d->upload_bg_wait(d->backend, c.wait);  // the last uploads that read this half are done
+                    if (w) {
+                        w->post(c.jobs);
+                        w->wait();
+                    } else {
+                        for (const auto & j : c.jobs) {
+                            llama_moe_cache_copy(j.dst, j.src, j.n);
+                        }
+                    }
+                    d->upload_bg_open(d->backend, c.gate);
+                }
+            }
+        });
+    }
+
+    void join_installer() {
+        if (installer.joinable()) {
+            installer.join();
+        }
     }
 
     // hot spare mode: whether an expert of group g can be staged now without waiting for copies or uploads; moves on to the
@@ -1571,6 +1796,7 @@ struct llama_moe_cache::impl {
 
     // hot spare mode with resize: free the device memory of the cache, the scores and the resident set are kept
     void release() {
+        join_installer();
         if (!resize || released) {
             return;
         }
@@ -1722,39 +1948,23 @@ struct llama_moe_cache::impl {
     // hot spare mode with a predictor: its count maps after a ubatch, the answers' starts and ends, its predictions
     void update_predictor(int64_t n_tokens, int64_t pos0, bool gen) {
         using P = llama_moe_predictor;
-        if (pos0 == 0) {
-            // a new conversation: the maps start again
-            for (layer & l : layers) {
-                for (auto & m : l.pmap) {
-                    std::fill(m.begin(), m.end(), 0.0f);
-                }
-            }
-            in_answer = false;
-            have_prompt_hidden = false;
+        if (pos0 == 0 && !(predictor_start && turn_seen)) {
+            start_conversation(); // (before_ubatch did it already with a start predictor)
         }
         if (gen && !in_answer) {
-            // an answer starts: predict from the context's maps and the input of the prompt's last token
+            // an answer starts: predict from the context's maps and the input of the prompt's last token; after a
+            // text start, only the best of the prediction's swaps are made
             in_answer = true;
             t_answer  = 0;
             next_pred = predictor->every();
             if (have_prompt_hidden && predict(0, hidden_prompt)) {
                 pred_start = true;
+                full_cap   = text_started ? topup_swaps : SIZE_MAX;
             }
+            turn_seen    = false;
+            text_started = false;
         } else if (!gen && in_answer) {
-            // the answer ended: it is now the previous answer and part of the context, and a new turn starts
-            for (layer & l : layers) {
-                if (l.ig < 0) {
-                    continue;
-                }
-                l.pmap[P::MAP_PREV_ANSWER] = l.pmap[P::MAP_ANSWER];
-                for (size_t e = 0; e < l.pred.size(); ++e) {
-                    l.pmap[P::MAP_CONTEXT][e] += l.pmap[P::MAP_ANSWER][e];
-                }
-                for (P::map_kind k : { P::MAP_TURN, P::MAP_ANSWER, P::MAP_ANSWER32, P::MAP_ANSWER8 }) {
-                    std::fill(l.pmap[k].begin(), l.pmap[k].end(), 0.0f);
-                }
-            }
-            in_answer = false;
+            end_answer();
         }
 
         // the maps of the answer only count and decay over its tokens
@@ -1801,11 +2011,47 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // hot spare mode with a predictor: a new conversation, the counts start again
+    void start_conversation() {
+        for (layer & l : layers) {
+            for (auto & m : l.pmap) {
+                std::fill(m.begin(), m.end(), 0.0f);
+            }
+        }
+        in_answer = false;
+        have_prompt_hidden = false;
+        turn_seen = false;
+        text_started = false;
+    }
+
+    // hot spare mode with a predictor: the answer ended, it is now the previous answer and part of the context, and a
+    // new turn starts
+    void end_answer() {
+        using P = llama_moe_predictor;
+        for (layer & l : layers) {
+            if (l.ig < 0) {
+                continue;
+            }
+            l.pmap[P::MAP_PREV_ANSWER] = l.pmap[P::MAP_ANSWER];
+            for (size_t e = 0; e < l.pred.size(); ++e) {
+                l.pmap[P::MAP_CONTEXT][e] += l.pmap[P::MAP_ANSWER][e];
+            }
+            for (P::map_kind k : { P::MAP_TURN, P::MAP_ANSWER, P::MAP_ANSWER32, P::MAP_ANSWER8 }) {
+                std::fill(l.pmap[k].begin(), l.pmap[k].end(), 0.0f);
+            }
+        }
+        in_answer = false;
+    }
+
     // hot spare mode with a predictor: rank the experts by their expected selections over its first horizon (the
     // horizons' predictions averaged), true if it ran
     bool predict(int64_t t, const std::vector<std::vector<float>> & hid) {
+        return predict_with(*predictor, t, hid, nullptr);
+    }
+
+    bool predict_with(llama_moe_predictor & pr, int64_t t, const std::vector<std::vector<float>> & hid, const float * turn_embd) {
         const int64_t t_start_us = ggml_time_us();
-        const auto & maps = predictor->maps();
+        const auto & maps = pr.maps();
         const size_t n_layer = layers.size();
         size_t n_expert = 0;
         for (const layer & l : layers) {
@@ -1828,11 +2074,11 @@ struct llama_moe_cache::impl {
         for (const auto & h : hid) {
             hp.push_back(h.data());
         }
-        if (!predictor->predict(mp, hp, t, pred_out)) {
+        if (!pr.predict(mp, hp, t, pred_out, turn_embd)) {
             LLAMA_LOG_WARN("%s: the MoE predictor failed\n", __func__);
             return false;
         }
-        const float scale = (float) n_expert_used*predictor->horizons()[0]/pred_out.size();
+        const float scale = (float) n_expert_used*pr.horizons()[0]/pred_out.size();
         for (size_t il = 0; il < n_layer; ++il) {
             layer & l = layers[il];
             if (l.ig < 0) {
@@ -1928,6 +2174,7 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         // the background uploads read the staging memory until they are done
+        join_installer();
         finish_submits();
         for (device & d : devices) {
             if (d.upload_bg != nullptr) {
@@ -2136,6 +2383,11 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu predictions, %.2f ms each\n",
                 n_pred, n_pred > 0 ? t_pred_us/1000.0/n_pred : 0.0);
         }
+        if (predictor_start) {
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, text starts: %zu, %.0f swaps each, %.2f ms each on the generation thread "
+                "(the top-up after one: at most %zu swaps)\n", n_text, n_text > 0 ? (double) text_swaps/n_text : 0.0,
+                n_text > 0 ? t_text_us/1000.0/n_text : 0.0, topup_swaps);
+        }
         if (worker) {
             const uint64_t bytes = worker->bytes;
             const int64_t  t_us  = worker->t_us;
@@ -2208,6 +2460,10 @@ void llama_moe_cache::restore() {
 
 void llama_moe_cache::update(int64_t n_tokens, int64_t pos0, int gen) {
     pimpl->update(n_tokens, pos0, gen);
+}
+
+void llama_moe_cache::before_ubatch(const llama_token * tokens, int64_t n_tokens, int64_t pos0, int gen) {
+    pimpl->before_ubatch(tokens, n_tokens, pos0, gen);
 }
 
 const std::vector<int32_t> & llama_moe_cache::predictor_layers() const {

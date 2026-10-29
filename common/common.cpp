@@ -1768,6 +1768,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_batch      = params.moe_cache_batch;
     cparams.moe_cache_predictor        = params.moe_cache_predictor.empty()        ? nullptr : params.moe_cache_predictor.c_str();
     cparams.moe_cache_predictor_device = params.moe_cache_predictor_device.empty() ? nullptr : params.moe_cache_predictor_device.c_str();
+    cparams.moe_cache_predictor_start  = params.moe_cache_predictor_start.empty()  ? nullptr : params.moe_cache_predictor_start.c_str();
 
     return cparams;
 }

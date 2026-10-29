@@ -611,6 +611,7 @@ struct common_params {
     int32_t moe_cache_batch  = 512;     // hot spare mode with resize: batches of up to N tokens keep the cache if their buffers fit
     std::string moe_cache_predictor;        // hot spare mode: predictor file that ranks the experts
     std::string moe_cache_predictor_device; // the device it runs on, empty = CPU
+    std::string moe_cache_predictor_start;  // start predictor file: experts from the turn's text, before its prompt runs
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
