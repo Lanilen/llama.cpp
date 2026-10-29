@@ -263,13 +263,13 @@ struct llama_moe_cache::impl {
             size_t          n;
         };
 
-        std::thread thread;
         std::mutex mutex;
         std::condition_variable cv;
         std::vector<job> queue;
         bool busy = false;
         bool stop = false;
         std::atomic<int64_t> t_us { 0 };
+        std::thread thread; // last: members are built in order, and the thread uses the ones above as soon as it starts
 
         copy_worker() : thread([this] { run(); }) {}
 
