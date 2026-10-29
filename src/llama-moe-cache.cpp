@@ -285,13 +285,24 @@ static void llama_moe_cache_copy_nt(uint8_t * dst, const uint8_t * src, size_t n
 #endif
 }
 
-// LLAMA_MOE_CACHE_COPY_NT=1 copies the experts to the staging memory with non-temporal stores
+// the experts are copied to the staging memory with non-temporal stores, LLAMA_MOE_CACHE_COPY_NT=0 uses memcpy
+// (perseus: 29.5 GB/s instead of 20 with 4 threads, restores 190 ms shorter, the same generation speed)
 static bool llama_moe_cache_copy_nt_enabled() {
     static const bool nt = [] {
         const char * env = getenv("LLAMA_MOE_CACHE_COPY_NT");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     }();
     return nt;
+}
+
+// LLAMA_MOE_CACHE_REFILL_BG=1: the full rebalances run in the background over the next ubatches, as fast as the staging
+// memory frees up, instead of stalling the generation until all their uploads are done
+static bool llama_moe_cache_refill_bg_enabled() {
+    static const bool bg = [] {
+        const char * env = getenv("LLAMA_MOE_CACHE_REFILL_BG");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return bg;
 }
 
 static void llama_moe_cache_copy(uint8_t * dst, const uint8_t * src, size_t n) {
@@ -480,6 +491,7 @@ struct llama_moe_cache::impl {
         int64_t t_dma_us  = 0; // of t_us, waiting for the uploads of a half before reusing it
         int64_t t_full_us = 0; // of t_us, full rebalances (after a prompt, the refill)
         int64_t t_alloc_us = 0; // of t_us, restores: waiting for the device memory, allocating and clearing the banks
+        size_t  full_bg_tokens = 0; // tokens over which the full rebalances ran in the background
         size_t  n_full    = 0;
     };
 
@@ -512,6 +524,7 @@ struct llama_moe_cache::impl {
     bool warm      = false;  // the resident experts were loaded from a file
     int64_t refill_tokens = 0; // generated tokens after which the cache is rebalanced from their scores, 0 = never
     int64_t refill_left   = 0; // generated tokens until that rebalance, 0 = none pending
+    bool    full_bg       = false; // a full rebalance is running in the background (LLAMA_MOE_CACHE_REFILL_BG)
     std::string save_path;   // the resident experts are written there at exit
 
     // hot spare mode with resize: the device memory of the cache is released while large batches run
@@ -922,7 +935,9 @@ struct llama_moe_cache::impl {
             }
             // a half holds about 8 tokens of the budget, so the refresh of a decode step (the budget times its tokens)
             // rarely fills one and waits for its copies; LLAMA_MOE_CACHE_STAGING_MIB sets the whole size
-            d.staging_size = 2*std::max({ 8*budget, 4*expert_size_max, (size_t) 64*1024*1024 });
+            // a full rebalance in the background stages at most a half per ubatch: 512 MiB is ~37 ms of PCIe 3.0 x16
+            d.staging_size = 2*std::max({ 8*budget, 4*expert_size_max, (size_t) 64*1024*1024,
+                llama_moe_cache_refill_bg_enabled() ? (size_t) 512*1024*1024 : 0 });
             if (const char * env = getenv("LLAMA_MOE_CACHE_STAGING_MIB")) {
                 d.staging_size = std::max((size_t) 2*4*expert_size_max, (size_t) (atof(env)*1024*1024));
             }
@@ -1278,19 +1293,32 @@ struct llama_moe_cache::impl {
                 // then the generated tokens are counted apart, for one more rebalance from them alone
                 rebalance = true;
                 start_refill();
-            } else if (refill_left > 0 && (refill_left -= std::min<int64_t>(refill_left, n_tokens)) == 0) {
-                // the first generated tokens predict the rest of the generation better than the prompt
-                for (layer & l : layers) {
-                    if (l.ig >= 0) {
-                        l.score = l.score_gen;
-                    }
-                }
-                refresh(SIZE_MAX, st);
-                rebalance = false;
             } else {
                 // a resident set from --moe-cache-hot predicts the generation better than the prompt, so it only changes within the budget
-                refresh(rebalance && !warm ? SIZE_MAX : budget*n_tokens, st);
+                bool full = rebalance && !warm;
+                if (refill_left > 0 && (refill_left -= std::min<int64_t>(refill_left, n_tokens)) == 0) {
+                    // the first generated tokens predict the rest of the generation better than the prompt
+                    for (layer & l : layers) {
+                        if (l.ig >= 0) {
+                            l.score = l.score_gen;
+                        }
+                    }
+                    full = true;
+                }
                 rebalance = false;
+                if (full && llama_moe_cache_refill_bg_enabled()) {
+                    full_bg = true;
+                    st.n_full++;
+                }
+                if (full_bg) {
+                    // each ubatch stages what fits without waiting, the experts become resident as their uploads land
+                    const int64_t t0_us = ggml_time_us();
+                    full_bg = !refresh_impl(SIZE_MAX, st, true);
+                    st.t_full_us += ggml_time_us() - t0_us;
+                    st.full_bg_tokens += n_tokens;
+                } else {
+                    refresh(full ? SIZE_MAX : budget*n_tokens, st);
+                }
             }
         }
 
@@ -1311,7 +1339,8 @@ struct llama_moe_cache::impl {
         }
     }
 
-    void refresh_impl(size_t budget_bytes, spare_stats & st) {
+    // no_wait: stage only the swaps that need no waiting for copies or uploads, false if some were left for later
+    bool refresh_impl(size_t budget_bytes, spare_stats & st, bool no_wait = false) {
         struct swap {
             float   gain;
             int32_t ig;
@@ -1375,12 +1404,17 @@ struct llama_moe_cache::impl {
         std::sort(swaps.begin(), swaps.end(), [](const swap & a, const swap & b) { return a.gain > b.gain; });
 
         size_t spent = 0;
+        bool complete = true;
         for (const swap & sw : swaps) {
             group & g = groups[sw.ig];
             const int32_t n_expert = g.ref[0]->ne[2];
             size_t expert_size = 0;
             for (const ggml_tensor * t : g.ref) {
                 expert_size += t->nb[2];
+            }
+            if (no_wait && !stage_now(devices[g.id], g)) {
+                complete = false;
+                continue;
             }
             const int32_t old_key = g.key_of_slot[sw.slot];
             if (old_key >= 0) {
@@ -1411,6 +1445,29 @@ struct llama_moe_cache::impl {
                 submit_bg(d, true);
             }
         }
+        return complete;
+    }
+
+    // hot spare mode: whether an expert of group g can be staged now without waiting for copies or uploads; moves on to the
+    // other half of the staging memory if the current one is full, its copies were submitted and the other's uploads are done
+    bool stage_now(device & d, const group & g) {
+        if (d.upload_bg == nullptr) {
+            return true;
+        }
+        size_t need = 0;
+        for (const ggml_tensor * t : g.ref) {
+            need += GGML_PAD(t->nb[2], 64);
+        }
+        const size_t half_size = d.staging_size/2;
+        if (d.staging_used + need <= half_size) {
+            return true;
+        }
+        if (d.bg_recorded || need > half_size || !d.upload_bg_done(d.backend, d.half_ticket[d.half ^ 1], false)) {
+            return false;
+        }
+        d.half ^= 1;
+        d.staging_used = 0;
+        return true;
     }
 
     // the driver may make freed device memory available some time after the buffer is released (amdgpu releases
@@ -1565,6 +1622,7 @@ struct llama_moe_cache::impl {
         }
 
         flush_maps();
+        const int64_t t_sync_start_us = ggml_time_us();
         for (device & d : devices) {
             if (d.pending) {
                 ggml_backend_synchronize(d.backend);
@@ -1574,11 +1632,13 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        spare_restore.t_sync_us += ggml_time_us() - t_sync_start_us;
     }
 
     // hot spare mode: count the next generated tokens apart, for one rebalance from their scores
     void start_refill() {
         refill_left = refill_tokens;
+        full_bg     = false;
         for (layer & l : layers) {
             if (l.ig >= 0) {
                 std::fill(l.score_gen.begin(), l.score_gen.end(), 0.0f);
@@ -1789,18 +1849,22 @@ struct llama_moe_cache::impl {
                 st.swaps, st.bytes/1024.0/1024.0, st.bytes/1024.0/1024.0/st.tokens, st.t_us/1000.0/st.tokens,
                 st.t_sync_us/1000.0/st.tokens, st.t_copy_us/1000.0/st.tokens, st.t_wait_us/1000.0/st.tokens);
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: per token, waiting for the copies %.3f ms in a refresh that filled a staging half "
-                "and %.3f at the next update, for a half's uploads %.3f; %zu full rebalances, %.1f ms each\n",
+                "and %.3f at the next update, for a half's uploads %.3f; %zu full rebalances, %.1f ms each%s\n",
                 name, st.t_wait_half_us/1000.0/st.tokens, st.t_wait_next_us/1000.0/st.tokens, st.t_dma_us/1000.0/st.tokens,
-                st.n_full, st.n_full > 0 ? st.t_full_us/1000.0/st.n_full : 0.0);
+                st.n_full, st.n_full > 0 ? st.t_full_us/1000.0/st.n_full : 0.0,
+                st.full_bg_tokens > 0 ? format(" (in the background, over %.1f tokens each)", (double) st.full_bg_tokens/st.n_full).c_str() : "");
         };
         log_spare("ubatch <= 32", spare_small, true);
         log_spare("ubatch  > 32", spare_large, false);
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "
-                "%.1f ms per restore (waiting for the copies %.1f, for a half's uploads %.1f, allocating the banks %.1f)\n",
+                "%.1f ms per restore (waiting for the copies %.1f, for a half's uploads %.1f, allocating the banks %.1f, "
+                "synchronizing %.1f, the rest %.1f)\n",
                 n_restores, restore_bytes/1024.0/1024.0, n_restores > 0 ? spare_restore.t_us/1000.0/n_restores : 0.0,
                 n_restores > 0 ? spare_restore.t_wait_us/1000.0/n_restores : 0.0, n_restores > 0 ? spare_restore.t_dma_us/1000.0/n_restores : 0.0,
-                n_restores > 0 ? spare_restore.t_alloc_us/1000.0/n_restores : 0.0);
+                n_restores > 0 ? spare_restore.t_alloc_us/1000.0/n_restores : 0.0, n_restores > 0 ? spare_restore.t_sync_us/1000.0/n_restores : 0.0,
+                n_restores > 0 ? (spare_restore.t_us - spare_restore.t_wait_us - spare_restore.t_dma_us - spare_restore.t_alloc_us
+                    - spare_restore.t_sync_us)/1000.0/n_restores : 0.0);
         }
         if (worker) {
             const uint64_t bytes = worker->bytes;
