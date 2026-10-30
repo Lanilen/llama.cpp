@@ -87,7 +87,8 @@ retrained predictor replaces it without code changes. It runs as a ggml graph on
 a file against test vectors from its exporter. It assumes one conversation at a time (`-np 1`). The predictor for
 Flash-Next was trained offline on expert traces (`llama-moe-trace` with `LLAMA_MOE_TRACE_HIDDEN`): on held-out
 conversations its top 164 experts per layer served 86% of the next 128 tokens' selections from an answer's start,
-against 77% for the decayed scores.
+against 77% for the decayed scores. How to train one, the model and the results:
+[docs/moe-predictor.md](moe-predictor.md); the training scripts are in `tools/moe-predictor`.
 
 **A start from the turn's text: `--moe-cache-predictor-start`.** A second predictor file (role `start`) predicts before a
 turn's prompt runs. It reads the counts up to the turn and the mean of the model's token embeddings over the turn's
