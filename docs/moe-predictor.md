@@ -29,8 +29,8 @@ The trained Flash-Next files aren't published.
 - [Training](#training)
   - [1. Traces](#1-traces)
   - [2. Records](#2-records)
-  - [3. Training the main predictor](#3-training-the-main-predictor)
-  - [4. Training the start predictor](#4-training-the-start-predictor)
+  - [3.  the main predictor](#3--the-main-predictor)
+  - [4.  the start predictor](#4--the-start-predictor)
   - [5. Export and check](#5-export-and-check)
   - [6. Use](#6-use)
   - [What the experiments found](#what-the-experiments-found)
@@ -175,7 +175,7 @@ over the next `H` tokens.
   | `turn` | the current turn's prompt (since the previous answer) |
   | `prev_answer` | the previous answer |
   | `answer`, `answer32`, `answer8` | the answer so far: plain, half-life 32, half-life 8 |
-  | `prior` | a static distribution: the training answers' average |
+  | `prior` | a static distribution: the  answers' average |
 
 - **`b`** is a bucket of the answer position: 0, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, the nearest
   one is used. The map weights `w` depend on it: at an answer's start the context matters, later the answer's own
@@ -196,7 +196,7 @@ instead of the hidden rows.
 The pipeline, from nothing to a file the cache loads:
 
 ```
-build_corpus.py ─┐                      ┌─ train.py ──────── export_predictor.py ─┐
+build_corpus.py ─┐                      ┌─ train.py ──────── export_predictor.py ───┐
                  ├─ llama-moe-trace ─ prep.py                                       ├─ llama-moe-predictor-check ─ llama-server
 gen_sessions.py ─┘   (traces)        (records)  └─ train_pre.py ── export_start.py ─┘
                                         ↑
