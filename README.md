@@ -1,40 +1,4 @@
-# llama.cpp — Polaris Anniversary Fork
-
-> **The Polaris Anniversary Fork.** The AMD Radeon RX 480 came out in June 2016. Ten years on, this fork of llama.cpp
-> keeps a home lab with two of them (8 GB each, no fp16) useful for today's large mixture-of-experts models, with the
-> Vulkan backend and the experts in system memory: sparse-attention ops that used to fall back to the CPU on GPUs without
-> fp16, and a GPU cache of the most used experts that runs beside the CPU, with the scheduler and Vulkan changes around it.
-> With Qwen3.8-Flash-Next on that machine, a 9.6k-token prompt reads at 86 tok/s instead of 36.5, and generation runs at
-> 14.5 tok/s instead of 11.7.
->
-> **It is tuned for one home lab.** Some changes work around the RX 480's Vulkan driver and could make other GPUs slower
-> where they collide with features that modern GPUs use. We try to avoid that, but besides the RX 480s the fork is tested
-> on only one other architecture, an NVIDIA RTX 4070 Ti, also with Vulkan. It is not affiliated with ggml-org, and the
-> changes have not been submitted upstream.
->
-> **Branches:** `polaris` has everything and is the one to use; `vk-sparse-attn` and `moe-hot-spare` have each part on
-> its own; `master` is upstream, unchanged. What changed, the results and how it was made:
-> [FORK.md](https://github.com/Lanilen/llama.cpp/blob/vk-sparse-attn/FORK.md). The expert cache, its options and how to
-> size it: [docs/moe-hot-spare.md](https://github.com/Lanilen/llama.cpp/blob/moe-hot-spare/docs/moe-hot-spare.md).
-
-## Install this fork
-
-The fork has no packages, installers or release binaries: build it from source with the Vulkan backend (the Vulkan SDK or
-your distribution's Vulkan headers and `glslc`, see [the Vulkan build guide](docs/build.md#vulkan)):
-
-```bash
-git clone -b polaris https://github.com/Lanilen/llama.cpp
-cd llama.cpp
-cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-vk -j
-```
-
-The programs are in `build-vk/bin`. The setup used on the RX 480 machine is in
-[FORK.md](https://github.com/Lanilen/llama.cpp/blob/vk-sparse-attn/FORK.md#build).
-
----
-
-*The rest of this README is upstream llama.cpp's.*
+# llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -53,10 +17,7 @@ The programs are in `build-vk/bin`. The setup used on the RX 480 machine is in
 
 </div>
 
-## Quick start (regular llama.cpp)
-
-> The installers, packages, Docker images and release binaries below install **regular llama.cpp from ggml-org, not this
-> fork**. To use the fork, build it as in [Install this fork](#install-this-fork).
+## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
 
