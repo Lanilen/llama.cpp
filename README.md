@@ -1,4 +1,66 @@
-# llama.cpp
+# llama.cpp — Polaris Anniversary Fork
+
+![The Polaris Anniversary Fork](media/polaris-banner.png)
+
+> **The Polaris Anniversary Fork.** The AMD Radeon RX 480 came out in June 2016. Ten years on, this fork of llama.cpp
+> keeps a home lab useful for today's large mixture-of-experts models, with the Vulkan backend and the experts in system
+> memory. The lab started with two RX 480s (8 GB each, no fp16) and now also has a Radeon AI PRO R9700 (32 GB):
+> - sparse-attention ops that used to fall back to the CPU on GPUs without fp16;
+> - a GPU cache of the most used experts that runs beside the CPU, with the scheduler and Vulkan changes around it;
+> - a small learned model that predicts which experts the next tokens need;
+> - kernel tuning for RDNA4.
+>
+> With Qwen3.8-Flash-Next on the two RX 480s, a 9.6k-token prompt reads at 86 tok/s instead of 36.5, and generation runs
+> at 14.5 tok/s instead of 11.7. On the R9700, the cache took generation from 16.8 to 25.9 tok/s with the same
+> settings, and with the predictor and two MTP drafts it now runs at about 30. The results and how they were measured
+> are in [FORK.md](FORK.md).
+>
+> **It is tuned for one home lab.** Some changes work around the RX 480's Vulkan driver and could make other GPUs slower
+> where they collide with features that modern GPUs use. We try to avoid that: the changes that apply to every GPU were
+> also tested on an NVIDIA RTX 4070 Ti, also with Vulkan. The fork isn't affiliated with ggml-org, and the changes haven't been submitted
+> upstream.
+
+## Branches
+
+Each part is a branch of its own, on top of upstream llama.cpp, so it can be used without the rest. Several are
+useful beyond Polaris.
+
+| branch | what it has | for | guide |
+|---|---|---|---|
+| [`polaris`](https://github.com/Lanilen/llama.cpp/tree/polaris) | everything below, and this README | the lab's setup: the one to use | [FORK.md](FORK.md) |
+| [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan support for the sparse-attention ops on GPUs without fp16 | any Vulkan GPU without fp16 (Polaris, older GCN) with Qwen3.8-Flash-Next or DeepSeek-style indexers | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
+| [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | a GPU cache of the most used experts that runs beside the CPU; scheduler and Vulkan changes for models with experts on the CPU; trace tools | any MoE model whose experts don't fit in VRAM, on Vulkan GPUs (tested on AMD and NVIDIA) | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
+| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus a learned predictor of the next experts, and its training pipeline | the same; trained so far for Qwen3.8-Flash-Next | [docs/moe-predictor.md](docs/moe-predictor.md) |
+| [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4 (**work in progress, stable**) | AMD RDNA4 GPUs (RX 9060/9070, AI PRO R9700) | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
+| `master` | upstream, unchanged | | |
+
+## Install this fork
+
+The fork has no packages, installers or release binaries. Build it from source with the Vulkan backend (the Vulkan SDK
+or your distribution's Vulkan headers and `glslc`, see [the Vulkan build guide](docs/build.md#vulkan)):
+
+```bash
+git clone -b polaris https://github.com/Lanilen/llama.cpp
+cd llama.cpp
+cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vk -j
+```
+
+The programs are in `build-vk/bin`.
+
+- **A newer `glslc`:** Ubuntu 24.04's (shaderc 2023.8) builds without the int8 dot product, bf16 and coopmat2 shaders,
+  and doesn't say so. Point CMake at a newer one with `-DVulkan_GLSLC_EXECUTABLE=/path/to/glslc` (see
+  [docs/vk-rdna4.md](docs/vk-rdna4.md#building-for-rdna4)).
+- **ROCm beside Vulkan:** ROCm 6 and later fail to start when a GPU they don't support, such as Polaris (gfx803), is in
+  the machine. [rocm-hide-gpus](https://github.com/Lanilen/rocm-hide-gpus), a separate repository, is a preload library
+  that hides those GPUs from ROCm only. With it, one llama.cpp process can run the R9700 on ROCm and the RX 480s on
+  Vulkan.
+
+The setups used in the lab are in [FORK.md](FORK.md#setups).
+
+---
+
+*The rest of this README is upstream llama.cpp's.*
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -17,7 +79,10 @@
 
 </div>
 
-## Quick start
+## Quick start (regular llama.cpp)
+
+> The installers, packages, Docker images and release binaries below install **regular llama.cpp from ggml-org, not this
+> fork**. To use the fork, build it as in [Install this fork](#install-this-fork).
 
 A few options to get `llama.cpp` installed on your machine:
 
