@@ -15,6 +15,14 @@ It takes the usual model, placement and sampling flags. It applies the model's c
 - `trace.npy`: int16 `[n_tokens, n_moe_layers, n_expert_used]`. Row `i` is the token processed at position `i`; rows from `n_prompt` on are generated tokens. `-1` marks prompt tokens that a layer did not compute: the last layer only computes the tokens whose logits are needed (output pruning).
 - `trace.json`: model, MoE layer indices, experts per layer, bytes per expert of each expert tensor, prompt length, generated tokens and text, timings and the flags used.
 
+For the [expert predictor](../../docs/moe-predictor.md) a trace also needs:
+
+- `--trace-conversation conversation.json`: a whole conversation (`{"messages": [...]}`) read as one sequence, its prompt
+  and answer segments marked in `trace.json` (`segments`), with every token (`tokens`);
+- `LLAMA_MOE_TRACE_HIDDEN=16,32`: the inputs of those layers (float16), every `LLAMA_MOE_TRACE_HIDDEN_STRIDE`-th token
+  (default 16) and around each answer's start, in `trace.hid.npy` `[rows, layers, n_embd]`, their positions in
+  `trace.json` (`hidden`).
+
 The router selections are the `ffn_moe_topk-<il>` tensors, read with the eval callback. Reading them adds a sync per layer, so traced runs are slower, but routing does not change: `LLAMA_MOE_TRACE_OFF=1` runs the same generation without the callback for comparison. Routing does depend slightly on the batch sizes (`-b`, `-ub`), because different kernels round differently, so trace with the same batch settings as the run you want to model.
 
 ## Simulate
