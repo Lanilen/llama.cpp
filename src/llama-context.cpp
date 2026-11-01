@@ -194,6 +194,8 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    dt.enabled = getenv("LLAMA_WINDOW_TIMING") != nullptr;
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -639,6 +641,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    dt.print(moe_cache != nullptr);
 
     if (moe_resize_follower) {
         g_moe_resize.followers--;
@@ -1762,6 +1766,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
+    dt.lap(decode_timing::SETUP);
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -1780,6 +1786,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
+
+        dt.built = true;
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -1805,6 +1813,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    dt.lap(decode_timing::GRAPH);
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1814,6 +1824,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+
+    dt.lap(decode_timing::INPUTS);
 
     // a ubatch that outputs all its tokens is generation (with drafts, their verification); a prompt outputs its last
     uint32_t n_out = 0;
@@ -1825,12 +1837,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache->before_ubatch(ubatch.token, ubatch.n_tokens, moe_pos0, n_out == ubatch.n_tokens ? 1 : 0);
     }
 
+    dt.lap(decode_timing::BEFORE);
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
+
+    dt.lap(decode_timing::COMPUTE);
 
     // the CPU part of the graph is done, so the selected experts of this ubatch are counted
     if (moe_cache) {
@@ -1843,7 +1859,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 moe_cache->set_hidden(il, moe_hidden_buf.data(), moe_hidden_buf.size());
             }
         }
+        dt.lap(decode_timing::HIDDEN);
         moe_cache->update(ubatch.n_tokens, moe_pos0, n_out == ubatch.n_tokens ? 1 : 0);
+        dt.lap(decode_timing::UPDATE);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2094,7 +2112,56 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+void llama_context::decode_timing::begin() {
+    if (enabled) {
+        std::fill(std::begin(t_cur), std::end(t_cur), 0);
+        built  = false;
+        t_last = ggml_time_us();
+    }
+}
+
+void llama_context::decode_timing::lap(step s) {
+    if (enabled) {
+        const int64_t t_now = ggml_time_us();
+        t_cur[s] += t_now - t_last;
+        t_last = t_now;
+    }
+}
+
+void llama_context::decode_timing::end(int64_t n_tokens, int64_t n_outputs) {
+    if (!enabled) {
+        return;
+    }
+    lap(EXTRACT);
+    if (n_outputs != n_tokens || n_tokens < 1) {
+        return;
+    }
+    const int kind = std::min<int64_t>(n_tokens, N_KINDS) - 1;
+    for (int i = 0; i < N_STEPS; ++i) {
+        t_sum[kind][i] += t_cur[i];
+    }
+    n[kind]++;
+    n_built[kind] += built;
+}
+
+void llama_context::decode_timing::print(bool with_moe_cache) const {
+    for (int k = 0; k < N_KINDS; ++k) {
+        if (n[k] == 0) {
+            continue;
+        }
+        const auto ms = [&](step s) { return t_sum[k][s] / 1e3 / n[k]; };
+        double total = 0;
+        for (int i = 0; i < N_STEPS; ++i) {
+            total += ms((step) i);
+        }
+        LLAMA_LOG_INFO("%s: decode timing, %s, %d%s tokens: %" PRId64 " batches, %" PRId64 " graphs built; ms setup %.2f graph %.2f inputs %.2f before %.2f compute %.2f hidden %.2f update %.2f extract %.2f total %.2f\n",
+                __func__, with_moe_cache ? "MoE cache" : "no MoE cache", k + 1, k + 1 == N_KINDS ? "+" : "", n[k], n_built[k], ms(SETUP), ms(GRAPH), ms(INPUTS), ms(BEFORE), ms(COMPUTE), ms(HIDDEN), ms(UPDATE), ms(EXTRACT), total);
+    }
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    dt.begin();
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2592,6 +2659,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    dt.end(n_tokens_prev, n_outputs_prev);
 
     return 0;
 }
