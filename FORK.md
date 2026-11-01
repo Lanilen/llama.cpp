@@ -94,9 +94,11 @@ the same counts plus the input of two layers at the newest token. The cache runs
 so the experts upload while the prompt computes. The training pipeline is in `tools/moe-predictor`: traces of the
 model's routing on public conversations and its own answers, records, training, export and a check against llama.cpp.
 
-On held-out Flash-Next Q4_K_XL conversations, the predictor's top 164 experts per layer served 86% of the next 128
-tokens' selections from an answer's start, against 77% for the counts. Live on the R9700 (Q4_K_XL, 2 MTP drafts,
-PCIe 3.0 x16, 2026-10-30):
+Trained on 948 traces (13.1M tokens), on held-out Flash-Next Q4_K_XL conversations, the predictor's top 164 experts per
+layer served 86.7% of the next 128 tokens' selections from an answer's start, against 76.0% for the counts. With whole
+sources held out it was 83.5% against 74.1%. The same predictor carries over to Q6_K_XL, whose routing is 93.8% the same
+as Q4_K_XL's. Live on the R9700, with a predictor trained on the first 160 traces (Q4_K_XL, 2 MTP drafts, PCIe 3.0 x16,
+2026-10-30):
 
 | | hits | generation, all requests | after a 2k-token question |
 |---|---|---|---|
@@ -163,9 +165,8 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
 
 - **The RX 480 tables above** used UD-IQ4_XS and predate the predictor. They'll be run again with it (after checking
   that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are back in the lab.
-- **The predictor's settings on both quants:** the refill, the budget and the text start crossed, with repeats for the
-  noise.
-- **The predictor on Q6_K_XL routing,** from traces of the same conversations through Q6.
+- **The predictor's settings on both quants,** with the predictor trained on all 948 traces: the refill, the budget and
+  the text start crossed, with repeats for the noise.
 
 ## How it was made
 
