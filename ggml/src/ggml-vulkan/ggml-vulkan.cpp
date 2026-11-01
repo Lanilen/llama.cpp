@@ -902,6 +902,8 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 static bool vk_host_timing_enabled = getenv("GGML_VK_HOST_TIMING") != nullptr;
 // spin this long at each graph_compute: if a pass slows by all of it, host time on the Vulkan side is on its critical path
 static const int64_t vk_host_delay_us = getenv("GGML_VK_HOST_DELAY_US") ? atoll(getenv("GGML_VK_HOST_DELAY_US")) : 0;
+// async writes smaller than this go through the compute queue, so they don't wait behind the background uploads on the transfer queue
+static const size_t vk_async_transfer_min = getenv("GGML_VK_ASYNC_TRANSFER_MIN") ? (size_t) atoll(getenv("GGML_VK_ASYNC_TRANSFER_MIN")) : 0;
 // large mul_mat_vec workgroups on AMD for matrices of up to this many rows and at least 1024 columns; NVIDIA and Intel always choose them this way
 static const uint32_t vk_dmmv_large_m = getenv("GGML_VK_DMMV_LARGE_M") ? (uint32_t) atoi(getenv("GGML_VK_DMMV_LARGE_M")) : 0;
 // mul_mat_vec subgroup size, when the device allows it: RDNA reports 64 and allows 32
@@ -13431,7 +13433,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     vk_context cpy_ctx;
 
-    if (ctx->device->async_use_transfer_queue) {
+    if (ctx->device->async_use_transfer_queue && size*n_copies >= vk_async_transfer_min) {
         cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -13629,7 +13631,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         }
 
         vk_context cpy_ctx;
-        if (ctx->device->async_use_transfer_queue) {
+        if (ctx->device->async_use_transfer_queue && ggml_nbytes(src) >= vk_async_transfer_min) {
             cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
         } else {
             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
