@@ -900,6 +900,8 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 }
 
 static bool vk_host_timing_enabled = getenv("GGML_VK_HOST_TIMING") != nullptr;
+// spin this long at each graph_compute: if a pass slows by all of it, host time on the Vulkan side is on its critical path
+static const int64_t vk_host_delay_us = getenv("GGML_VK_HOST_DELAY_US") ? atoll(getenv("GGML_VK_HOST_DELAY_US")) : 0;
 static thread_local int64_t vk_host_timing_submit_us = 0;
 static thread_local int64_t vk_host_timing_submits = 0;
 
@@ -14553,6 +14555,11 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    if (vk_host_delay_us > 0) {
+        for (const int64_t t_end = ggml_time_us() + vk_host_delay_us; ggml_time_us() < t_end;) {
+        }
+    }
 
     const int64_t t_start_us = vk_host_timing_enabled ? ggml_time_us() : 0;
     const int64_t submit_start_us = vk_host_timing_submit_us;
