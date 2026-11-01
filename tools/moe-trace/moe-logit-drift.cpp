@@ -290,6 +290,7 @@ int main(int argc, char ** argv) {
         fflush(stdout);
     }
 
+    llama_init.reset(); // the backends print their timing as they go
     llama_backend_free();
     return 0;
 }
