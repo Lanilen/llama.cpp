@@ -233,6 +233,8 @@ The refill moves up to the whole cache in one step, and the generation waits for
   13.95 and 13.76 tok/s. The copies and uploads cost about what the extra hits save. Keep the budget at 5-10.
 - the margin hardly matters.
 
+**Finding the settings for your machine.** These numbers come from one machine, and the best settings depend on the CPU, the link and the model. `tools/moe-trace/moe-cache-tune.py` searches them with real runs in stages, within a time budget, and writes a results file you can share: [Tuning a machine](../tools/moe-trace/README.md#tuning-a-machine).
+
 ### Environment variables
 
 | Variable | Effect |
