@@ -17,7 +17,7 @@ struct llama_moe_cache_params {
     std::string device; // hot spare mode: cache device, empty = the device of each layer
     std::string hot;    // hot spare mode: file with the resident experts
     std::string save;   // hot spare mode: file the resident experts are written to at exit
-    int64_t refill = 0; // hot spare mode: generated tokens after a prompt for one rebalance from their scores alone, 0 = none
+    int64_t refill = -1; // hot spare mode: generated tokens after a prompt for one rebalance from their scores alone, 0 = none, < 0 = 128, or 0 with a predictor
     bool resize = false; // hot spare mode: release the device memory for large batches (see llama_moe_cache::release)
     std::string predictor;        // hot spare mode: predictor file (see llama-moe-predictor.h), empty = none
     std::string predictor_device; // the device it runs on, empty = CPU

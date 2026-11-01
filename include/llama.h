@@ -412,7 +412,7 @@ extern "C" {
         float moe_cache_margin;        // hot spare mode: score margin for a new expert to replace a resident one [EXPERIMENTAL]
         float moe_cache_budget_mib;    // hot spare mode: MiB uploaded per token to replace resident experts [EXPERIMENTAL]
         const char * moe_cache_save;   // hot spare mode: file the resident experts are written to at exit, for moe_cache_hot, nullptr = none [EXPERIMENTAL]
-        int32_t moe_cache_refill;      // hot spare mode: generated tokens after a prompt for one rebalance from their selections alone, 0 = none [EXPERIMENTAL]
+        int32_t moe_cache_refill;      // hot spare mode: generated tokens after a prompt for one rebalance from their selections alone, 0 = none, < 0 = 128, or 0 with moe_cache_predictor [EXPERIMENTAL]
         int32_t moe_cache_batch;       // hot spare mode with moe_cache_resize: batches of up to this many tokens keep the cache, if their compute buffers fit next to it, 0 = n_ubatch [EXPERIMENTAL]
         const char * moe_cache_predictor;        // hot spare mode: predictor file that ranks the experts, nullptr = none [EXPERIMENTAL]
         const char * moe_cache_predictor_device; // the device the predictor runs on, nullptr = CPU [EXPERIMENTAL]

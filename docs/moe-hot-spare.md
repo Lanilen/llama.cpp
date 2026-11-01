@@ -77,7 +77,7 @@ over the context, the current turn's prompt, the previous answer, and the answer
   restore uploads the predicted experts instead of the old ones;
 - every 16 generated tokens (the file says) it predicts again, and the budgeted refresh ranks by that prediction
   (expected selections over the file's first horizon, the horizons' predictions averaged) instead of the scores;
-- the refill (`--moe-cache-refill`) rebalances in full from the prediction, in the background;
+- the refill is off unless set (`--moe-cache-refill N`, then it rebalances in full from the prediction, in the background);
 - a ubatch starting at position 0 starts a new conversation: the counts start again.
 
 The file is a GGUF of its own (`general.architecture` = `moe-predictor`, see `src/llama-moe-predictor.cpp` for the
@@ -202,7 +202,7 @@ The help text of the options (`llama-server --help`, `llama-cli --help`):
                               them with --moe-cache-hot
                               (env: LLAMA_ARG_MOE_CACHE_SAVE)
 --moe-cache-refill N          hot spare mode: after a prompt, rebalance the resident experts once from the selections of
-                              the first N generated tokens, 0 = never (default: 128)
+                              the first N generated tokens, 0 = never (default: 128, or 0 with --moe-cache-predictor)
                               (env: LLAMA_ARG_MOE_CACHE_REFILL)
 --moe-cache-resize            hot spare mode: release the cache's GPU memory while large batches (prompts) run, so that
                               their compute buffers can use it (e.g. a large --ubatch-size), and restore the cache for
@@ -222,7 +222,7 @@ A saved set from one kind of work (code, chat, a language) is a good start for t
 `--moe-cache-save code.hot`, then start later runs with `--moe-cache-hot code.hot`.
 
 The refill moves up to the whole cache in one step, and the generation waits for its copies. It pays on long sessions
-(14.1 against 13.9 tok/s over the 5-turn session below); on a single short answer `--moe-cache-refill 0` can be faster.
+(14.1 against 13.9 tok/s over the 5-turn session below); on a single short answer `--moe-cache-refill 0` can be faster. With a predictor the refill is off by default.
 
 **Tuning the refresh.** `tools/moe-trace/hot_spare_sim.py` replays a recorded session through the refresh logic. On the
 5-turn session below (simulated hit rates within 1 point of the measured ones):

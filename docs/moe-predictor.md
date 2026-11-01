@@ -10,7 +10,8 @@ loads what the answer is about to need instead of what the last answer used.
 - **It runs inside the cache** (`--moe-cache-predictor FILE`): at each answer's start and every 16 generated tokens,
   as a ggml graph on the CPU (a few ms per prediction) or on another device.
 - **A second, optional file** (`--moe-cache-predictor-start FILE`) predicts from a turn's text before its prompt is
-  processed, so the experts upload while the prompt computes.
+  processed, so the experts upload while the prompt computes. It cuts the uploads by a quarter to over 40%, but was
+  usually slower on the R9700 (see [Results](#results)).
 - **Training is offline**, with the Python scripts in [`tools/moe-predictor`](../tools/moe-predictor): record which
   experts the model picks on a set of conversations, turn the traces into records, train, export, check. That
   pipeline is the main part of this document ([Training](#training)), because a predictor is only as good as its data
@@ -47,8 +48,8 @@ With `--moe-cache-predictor FILE` the hot spare cache:
 - **Every 16 generated tokens** (the file sets the interval), predicts again. The budgeted refresh
   (`--moe-cache-budget`) then ranks by the prediction instead of the decayed scores: the expected selections over the
   next tokens, the file's horizons averaged.
-- **At the refill** (`--moe-cache-refill N`), rebalances in full from the prediction. With a predictor, `--moe-cache-refill 0`
-  was faster in the live runs (see [Results](#results)).
+- **The refill is off by default with a predictor.** It was slower in the live runs (see [Results](#results)).
+  `--moe-cache-refill N` turns it on: it then rebalances in full from the prediction.
 - **At position 0** (a new conversation), starts its counts again. It assumes one conversation at a time (`-np 1`).
 
 The predictor reads two kinds of input, both kept by the cache:
@@ -128,41 +129,53 @@ conversations scored 84.1% on both, at the same cache size. Other kinds of quant
 
 ### Live, on the R9700
 
-These runs are from 2026-10-30, with the predictor trained on the first 160 traces, each one server answering the same
-requests at temperature 0:
+These runs are from 2026-11-01, with the predictor trained on all 948 traces. Each server answered the same requests at
+temperature 0, twice, the second pass in reverse order:
 - a 512-token story;
 - two 2k-token code questions, each in a new conversation;
 - a question on 20k tokens of code;
 - a 4-turn coding session on a 2k-token paste.
 
 The setup:
-- Qwen3.8-Flash-Next with its MTP head (2 drafts);
+- Qwen3.8-Flash-Next with its MTP head (2 drafts unless noted);
 - the hot spare at 23500 MiB, `--moe-cache-resize`, `-ub 16384`;
 - the R9700 on PCIe 3.0 x16 and a Threadripper 1920X.
 
-Generation speed in tok/s:
-- **all** is weighted by tokens over every request;
-- **after a large prompt** is the 2k-token question with a fresh context.
+Generation speed in tok/s, weighted by tokens:
+- **all** is every request;
+- **short** is the answers after a large prompt: the three questions and the session's first turn, 91–143 tokens each;
+- **long** is the story and the session's later turns, 300–512 tokens each.
 
-| | hits | uploads, MiB/token | all | after a large prompt |
-|---|---|---|---|---|
-| Q4, decayed scores, refill at 64 (the previous best) | 82.1% | 20.6 | 29.35 | 21.0 |
-| Q4, predictor, refill at 64 | 87.7% | 23.0 | 29.99 | 28.5 |
-| Q4, predictor, no refill | 85.7% | 19.0 | 30.40 | **32.4** |
-| Q4, predictor, refill at 64, budget 10 | 87.7% | 26.5 | **30.72** | 30.1 |
-| Q4, predictor and text start, refill at 64 | 85.8% | 17.2 | 29.40 | 27.4 |
-| Q6, decayed scores, refill at 64 | 74.0% | 22.5 | 25.61 | 18.5 |
-| Q6, predictor, refill at 64 | 76.7% | 41.5 | 24.87 | 24.9 |
+Hits and uploads count every token in a verify batch, so they include rejected drafts.
 
-Each request generates only 100–500 tokens, so single cells vary by about 5–10%.
+| | budget | hits | uploads, MiB/token | all | short | long |
+|---|---|---|---|---|---|---|
+| Q4, decayed scores, refill at 64 (the previous best) | 5 | 82.1% | 20.6 | 29.17 | 26.75 | 30.05 |
+| Q4, decayed scores, no refill | 5 | 68.8% | 4.6 | 27.28 | 25.92 | 27.75 |
+| Q4, predictor, refill at 64 | 5 | 88.1% | 19.5 | 29.89 | 29.73 | 29.94 |
+| Q4, predictor, no refill | 5 | 87.0% | 16.9 | 30.80 | 31.62 | 30.54 |
+| Q4, predictor, no refill | 10 | 88.5% | 20.4 | **31.14** | **32.46** | 30.71 |
+| Q4, predictor and text start, no refill | 5 | 84.7% | 10.9 | 29.68 | 31.12 | 29.24 |
+| Q4, predictor, no refill, 3 drafts | 10 | 88.8% | 20.8 | 30.75 | 30.63 | 30.79 |
+| Q6, decayed scores, refill at 64 | 5 | 74.0% | 22.5 | 25.60 | 23.88 | 26.25 |
+| Q6, decayed scores, no refill | 5 | 57.1% | 4.3 | 22.36 | 22.60 | 22.29 |
+| Q6, predictor, refill at 64 | 5 | 78.6% | 30.9 | 25.72 | 25.57 | 25.77 |
+| Q6, predictor, no refill | 5 | 78.9% | 23.7 | **26.45** | **27.31** | 26.17 |
+| Q6, predictor, no refill | 10 | 78.5% | 28.5 | 26.02 | 27.45 | 25.58 |
+| Q6, predictor and text start, no refill | 5 | 74.6% | 13.3 | 25.36 | 26.96 | 24.89 |
+| Q6, predictor, no refill, 3 drafts | 5 | 79.6% | 32.5 | 25.10 | 23.04 | 25.91 |
 
-- **The hit rate reaches the offline figures:** 87.7% on Q4, the replay's 85–86% plus the free start after a large prompt.
-- **The speed gain is largest right after a large prompt,** where the decayed scores know least: 21.0 → 32.4 tok/s on
-  Q4 without the refill.
-- **Over long answers all the settings come close to the same speed.**
-- **On Q6 the predictor nearly doubled the uploads** and was slower overall with the refill on.
+The two passes of a configuration differ by about 0.2 tok/s.
 
-A run that crosses the refill, the budget and the text start on both quants is the next measurement.
+- **The gain is in the answers after a large prompt,** where the decayed scores know least: +21% on Q4 and +14% on Q6.
+  Over long answers all the settings come close to the same speed: +2% on Q4, none on Q6.
+- **With a predictor the refill is not worth having.** It costs 0.7–0.9 tok/s (1.7–2.9 on short answers) for at most a
+  point of hits, so it's off by default with a predictor. Without one it's still worth 1.9 tok/s on Q4 and 3.2 on Q6.
+- **The budget is a small effect, and it differs by quant:** 10 is best on Q4 (+0.35 tok/s) and 5 on Q6 (+0.43).
+- **The text start was usually slower here,** and always on the short answers it's meant for, though it cuts the
+  uploads by 24–44%. It might still pay on a slower link; that isn't measured yet.
+- **A third draft is slower,** by 0.4–1.3 tok/s; on Q6 the short answers lose over 4.
+- **Fewer copy threads don't help:** 2 instead of 4 changed nothing on Q6 and cost 0.3 tok/s on Q4.
 
 ## The model
 
@@ -396,8 +409,8 @@ The check runs the file through llama.cpp's own code on held-out inputs and comp
 
 ```bash
 llama-server -m model.gguf <placement> -np 1 \
-    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 23500 --moe-cache-refill 0 \
-    --moe-cache-predictor pred.gguf --moe-cache-predictor-start start.gguf
+    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 23500 \
+    --moe-cache-predictor pred.gguf
 ```
 
 The cache's own statistics (`-v`, at exit) count the predictions and their time.

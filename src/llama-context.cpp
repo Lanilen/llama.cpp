@@ -4373,7 +4373,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_margin            =*/ 0.5f,
         /*.moe_cache_budget_mib        =*/ 10.0f,
         /*.moe_cache_save              =*/ nullptr,
-        /*.moe_cache_refill            =*/ 128,
+        /*.moe_cache_refill            =*/ -1,
         /*.moe_cache_batch             =*/ 512,
         /*.moe_cache_predictor         =*/ nullptr,
         /*.moe_cache_predictor_device  =*/ nullptr,
