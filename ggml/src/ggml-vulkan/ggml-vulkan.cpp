@@ -902,6 +902,10 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 static bool vk_host_timing_enabled = getenv("GGML_VK_HOST_TIMING") != nullptr;
 // spin this long at each graph_compute: if a pass slows by all of it, host time on the Vulkan side is on its critical path
 static const int64_t vk_host_delay_us = getenv("GGML_VK_HOST_DELAY_US") ? atoll(getenv("GGML_VK_HOST_DELAY_US")) : 0;
+// large mul_mat_vec workgroups on AMD for matrices of up to this many rows and at least 1024 columns; NVIDIA and Intel always choose them this way
+static const uint32_t vk_dmmv_large_m = getenv("GGML_VK_DMMV_LARGE_M") ? (uint32_t) atoi(getenv("GGML_VK_DMMV_LARGE_M")) : 0;
+// mul_mat_vec subgroup size, when the device allows it: RDNA reports 64 and allows 32
+static const uint32_t vk_dmmv_subgroup = getenv("GGML_VK_DMMV_SUBGROUP") ? (uint32_t) atoi(getenv("GGML_VK_DMMV_SUBGROUP")) : 0;
 static thread_local int64_t vk_host_timing_submit_us = 0;
 static thread_local int64_t vk_host_timing_submits = 0;
 
@@ -2922,7 +2926,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16 && !is_imagination_proprietary;
 
-    const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
+    const bool dmmv_subgroup_forced = vk_dmmv_subgroup != 0 && device->subgroup_size_control && device->subgroup_min_size <= vk_dmmv_subgroup && vk_dmmv_subgroup <= device->subgroup_max_size;
+    const uint32_t subgroup_size = dmmv_subgroup_forced ? vk_dmmv_subgroup : (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
@@ -5676,6 +5681,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             }
         }
     }
+    if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && m <= vk_dmmv_large_m && k >= 1024) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+    }
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -5763,6 +5771,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+    }
+    if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && m <= vk_dmmv_large_m && k >= 1024) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
