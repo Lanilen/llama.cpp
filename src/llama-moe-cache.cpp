@@ -2424,6 +2424,10 @@ int64_t llama_moe_cache::resize_batch() {
     return g_resize_batch;
 }
 
+void llama_moe_cache::set_resize_batch(int64_t n) {
+    g_resize_batch = n;
+}
+
 void llama_moe_cache::limit_resize_batch(int64_t n) {
     int64_t cur = g_resize_batch;
     while (n < cur && !g_resize_batch.compare_exchange_weak(cur, n)) {

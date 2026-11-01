@@ -134,10 +134,14 @@ can still drop by about a GB), the context measures, without allocating them, th
 checks what the reserve allocated, and otherwise tries half the size, down to 32. Batches up to the size that fits are small:
 they keep the cache and run on the hot spare, the cached experts on the GPU and the misses on the CPU, so a medium prompt such
 as a tool output neither copies every expert to the GPU nor uploads the cache again. Larger batches are large. The log says
-`MoE cache resize: batches of up to N tokens keep the cache`. An MTP draft context then fits its own small reserve for the same
-size in what is left (its buffers for a batch can be larger than the main context's: on perseus 2048-token reserves for both
-spilled into system memory and generation fell from 26 to 8.5 tok/s), and if it fits only a smaller one, the main context
-follows it.
+`MoE cache resize: batches of up to N tokens keep the cache`. With an MTP draft context the two share what is left (the draft's
+buffers for a batch can be larger than the main context's: on perseus 2048-token reserves for both spilled into system memory
+and generation fell from 26 to 8.5 tok/s). The main context measures its buffers for each size and stays at 32 tokens, the draft
+picks the largest size that fits both, and the main context takes its share. If either then finds less room, the other follows
+it down. The two used to fit in turn, so more free memory could mean less: with 2048 tokens taking most of it, the draft got
+128, and both stayed at 128 with the rest unused. Kallista (RTX 4070 Ti, Ornith 35B with a 3000 MiB cache, Ornith 9B as the draft, follow-up
+prompts of about 350 tokens): 128 tokens and 4 releases before, 1024 and 1 release now, the later prompts 3.2-3.7 s before and
+1.8-2.0 s now.
 
 Backends also keep memory of their own between graphs, sized by the largest graph so far and outside the scheduler's buffers:
 the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch grows them a lot (the sparse attention
