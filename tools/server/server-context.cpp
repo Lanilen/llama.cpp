@@ -1652,7 +1652,13 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            wt.pass_start();
             update_slots();
+            bool any_processing = false;
+            for (const auto & slot : slots) {
+                any_processing |= slot.is_processing();
+            }
+            wt.pass_end(any_processing);
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -3445,6 +3451,70 @@ private:
         }
     }
 
+    // LLAMA_WINDOW_TIMING: host time of a pass with drafts by step, after each answer and so far. Every moment between two laps counts,
+    // so the steps add up to the pass, and so does the wait between two passes of an answer
+    struct window_timing {
+        enum step { GAP, PRE, HANDOFF, DRAFT, BATCH, PROCESS, SYNC, HEAD, SAMPLE, ROLLBACK, TOKENS, OTHER, N_STEPS };
+        struct totals {
+            int64_t n = 0, n_batch = 0, n_got = 0;
+            int64_t t[N_STEPS] = {};
+        } answer, all;
+
+        bool    enabled = getenv("LLAMA_WINDOW_TIMING") != nullptr;
+        bool    prev    = false;
+        int64_t t_last  = 0;
+        int64_t t_cur[N_STEPS] = {};
+        int64_t n_batch = 0, n_got = 0;
+
+        void lap(step s) {
+            if (enabled) {
+                const int64_t t_now = ggml_time_us();
+                t_cur[s] += t_now - t_last;
+                t_last = t_now;
+            }
+        }
+        void pass_start() {
+            if (enabled) {
+                const int64_t t_now = ggml_time_us();
+                std::fill(std::begin(t_cur), std::end(t_cur), 0);
+                t_cur[GAP] = prev ? t_now - t_last : 0;
+                t_last  = t_now;
+                n_batch = n_got = 0;
+            }
+        }
+        void pass_end(bool any_processing) {
+            if (!enabled) {
+                return;
+            }
+            lap(OTHER);
+            prev = n_batch > 0;
+            if (prev) {
+                for (totals * x : {&answer, &all}) {
+                    x->n++;
+                    x->n_batch += n_batch;
+                    x->n_got   += n_got;
+                    for (int i = 0; i < N_STEPS; ++i) {
+                        x->t[i] += t_cur[i];
+                    }
+                }
+            }
+            if (!any_processing && answer.n > 0) {
+                print("answer", answer);
+                print("so far", all);
+                answer = totals();
+            }
+        }
+        static void print(const char * name, const totals & x) {
+            const auto ms = [&](step s) { return x.t[s] / 1e3 / x.n; };
+            double total = 0;
+            for (int i = 0; i < N_STEPS; ++i) {
+                total += ms((step) i);
+            }
+            SRV_INF("window timing, %s: %" PRId64 " passes, batch %.2f, got %.2f; ms pre %.2f draft %.2f batch %.2f process %.2f sync %.2f head %.2f sample %.2f rollback %.2f tokens %.2f other %.2f handoff %.2f gap %.2f total %.2f\n",
+                    name, x.n, (double) x.n_batch / x.n, (double) x.n_got / x.n, ms(PRE), ms(DRAFT), ms(BATCH), ms(PROCESS), ms(SYNC), ms(HEAD), ms(SAMPLE), ms(ROLLBACK), ms(TOKENS), ms(OTHER), ms(HANDOFF), ms(GAP), total);
+        }
+    } wt;
+
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
@@ -3910,9 +3980,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            wt.lap(window_timing::PRE);
             queue_tasks.yield_to_queue([&]() {
+                wt.lap(window_timing::HANDOFF);
                 common_speculative_draft(spec.get());
+                wt.lap(window_timing::DRAFT);
             });
+            wt.lap(window_timing::HANDOFF);
         }
 
         // make checkpoints if needed
@@ -4689,12 +4763,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        wt.lap(window_timing::BATCH);
         queue_tasks.yield_to_queue([&]() {
+            wt.lap(window_timing::HANDOFF);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            wt.lap(window_timing::PROCESS);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            wt.lap(window_timing::SYNC);
         });
+        wt.lap(window_timing::HANDOFF);
 
         if (ret != 0) {
             {
@@ -4754,9 +4833,13 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            wt.lap(window_timing::OTHER);
             queue_tasks.yield_to_queue([&]() {
+                wt.lap(window_timing::HANDOFF);
                 ok = common_speculative_process(spec.get(), batch.view);
+                wt.lap(window_timing::HEAD);
             });
+            wt.lap(window_timing::HANDOFF);
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4929,6 +5012,8 @@ private:
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
 
+            wt.lap(window_timing::OTHER);
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
@@ -5002,7 +5087,12 @@ private:
                 slot.spec_draft = std::move(accepted);
             }
 
+            wt.lap(window_timing::SAMPLE);
+            wt.n_batch = n_draft + 1;
+
             const auto ids = std::move(slot.spec_draft);
+
+            wt.n_got = ids.size();
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
@@ -5033,6 +5123,8 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            wt.lap(window_timing::ROLLBACK);
+
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -5055,6 +5147,8 @@ private:
                     return;
                 }
             }
+
+            wt.lap(window_timing::TOKENS);
 
             slot.print_timings_tg();
 

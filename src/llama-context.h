@@ -349,6 +349,25 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<float> moe_hidden_buf; // the newest token's input of a layer the MoE predictor reads
+
+    // LLAMA_WINDOW_TIMING: host time of the batches that output all their tokens, by step and length, printed when the context is freed
+    struct decode_timing {
+        enum step { SETUP, GRAPH, INPUTS, BEFORE, COMPUTE, HIDDEN, UPDATE, EXTRACT, N_STEPS };
+        static constexpr int N_KINDS = 5; // 1, 2, 3, 4 tokens, longer
+
+        bool    enabled = false;
+        bool    built   = false;
+        int64_t t_last  = 0;
+        int64_t t_cur[N_STEPS] = {};
+        int64_t t_sum[N_KINDS][N_STEPS] = {};
+        int64_t n[N_KINDS]       = {};
+        int64_t n_built[N_KINDS] = {};
+
+        void begin();
+        void lap(step s);
+        void end(int64_t n_tokens, int64_t n_outputs);
+        void print(bool with_moe_cache) const;
+    } dt;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
