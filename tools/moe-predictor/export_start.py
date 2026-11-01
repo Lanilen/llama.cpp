@@ -74,13 +74,13 @@ if args.vectors:
             for ai in picks:
                 aa = torch.tensor([int(ai)], device=TP.dev)
                 B = 1
-                ctx = TP.TE["ctx"][aa].float().view(B, -1, NL * NE)
-                cp = TP.PTE["ctx_pre"][aa].float().view(B, 3, NL * NE)
+                ctx = TP.T.take(TP.TE["ctx"], aa).float().view(B, -1, NL * NE)
+                cp = TP.T.take(TP.PTE["ctx_pre"], aa).float().view(B, 3, NL * NE)
                 raw = torch.stack([cp[:, 0], cp[:, 1], cp[:, 2], ctx[:, 4], TP.prior.view(1, -1)], 1).view(len(MAPS), NL, NE)
                 logp, x = TP.pre_inputs(TP.TE, TP.PTE, aa)
                 np.array([0], np.int32).tofile(f)
                 f32(raw.cpu().numpy()).tofile(f)
-                f32(TP.PTE["turn_emb"][aa].float().cpu().numpy()[0]).tofile(f)
+                f32(TP.T.take(TP.PTE["turn_emb"], aa).float().cpu().numpy()[0]).tofile(f)
                 for H in HS:
                     f32(torch.softmax(TP.model(logp, x, H)[0], -1).cpu().numpy()).tofile(f)
     print(f"wrote {len(picks)} test vectors to {args.vectors}")

@@ -37,32 +37,24 @@ torch.manual_seed(0)
 HS = [128, 512]
 NF = 5   # live64, ctx512, context (all at the turn's start), previous answer, prior
 
-def load_pre(names_):
-    cp, hp, te_, tl = [], [], [], []
-    for n in names_:
-        z = np.load(f"{T.WORK}/{n}.npz")
-        cp.append(z["ctx_pre"]); hp.append(z["hid_pre"]); te_.append(z["turn_emb"]); tl.append(z["turn_len"])
-    return {"ctx_pre": torch.from_numpy(np.concatenate(cp)).to(dev), "hid_pre": torch.from_numpy(np.concatenate(hp)).to(dev),
-            "turn_emb": torch.from_numpy(np.concatenate(te_)).to(dev), "turn_len": np.concatenate(tl)}
-
 tr_n, te_n = split(names())
 TR, TE = T.load(tr_n), T.load(te_n)
-PTR, PTE = load_pre(tr_n), load_pre(te_n)
+PTR, PTE = TR["store"], TE["store"]
 prior = ck["prior"].to(dev).view(-1)
 
 def pre_inputs(D, P, a):
     B = len(a)
-    ctx = D["ctx"][a].float().view(B, -1, NL * NE)
-    cp = P["ctx_pre"][a].float().view(B, 3, NL * NE)
+    ctx = T.take(D["ctx"], a).float().view(B, -1, NL * NE)
+    cp = T.take(P["ctx_pre"], a).float().view(B, 3, NL * NE)
     maps = torch.stack([cp[:, 0], cp[:, 1], cp[:, 2], ctx[:, 4], prior.view(1, -1).expand(B, -1)], 1).view(B, NF, NL, NE)
     p = maps / maps.sum(-1, keepdim=True).clamp(min=1e-9)
     p = torch.where(maps.sum(-1, keepdim=True) > 0, p, torch.full_like(p, 1.0 / NE))
     logp = torch.log(p + 1e-4)
     parts = []
     if not args.no_hidden:
-        parts.append(P["hid_pre"][a].float().view(B, -1))
+        parts.append(T.take(P["hid_pre"], a).float().view(B, -1))
     if not args.no_text:
-        parts.append(P["turn_emb"][a].float() * 100.0)          # the embeddings are small (mean |x| ~ 0.007)
+        parts.append(T.take(P["turn_emb"], a).float() * 100.0)          # the embeddings are small (mean |x| ~ 0.007)
     x = torch.cat(parts, 1) if parts else None
     return logp, x
 
@@ -136,7 +128,7 @@ with torch.no_grad():
                 return torch.zeros_like(f, dtype=torch.bool).scatter_(-1, f.topk(S * NL, -1).indices, True).view_as(tgt)
             ms, me = sset(pp), sset(pe)
             mc = sset(maps[:, 0] + 1e-6 * prior.view(1, NL, NE))        # the live score at the answer's start (counts only)
-            cp = PTE["ctx_pre"][a].float()
+            cp = T.take(PTE["ctx_pre"], a).float()
             mpre = sset(cp[:, 0] + 1e-6 * prior.view(1, NL, NE))         # the live score before the turn: what the cache has
             for j in range(len(a)):
                 grp = "short" if short[int(a[j])] <= 256 else "long"

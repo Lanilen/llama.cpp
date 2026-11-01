@@ -85,40 +85,51 @@ exporter and compares with the PyTorch model. A good file agrees to about 1e-7 a
 ### Offline, on held-out conversations
 
 Qwen3.8-Flash-Next Q4_K_XL traces:
-- 160 traces, 5944 answers;
-- tested on 31 held-out traces, every 5th of each source.
+- 948 traces, 13.1M tokens, 22,097 answers;
+- tested on every 5th trace of each source, 4455 answers.
 
 Hit rate means the share of the answer's next 128 tokens' expert selections served by the 164 experts per layer the
 predictor ranks highest (7860 slots, what fits next to Q4_K_XL in 23.5 GB on the R9700).
 
 | tokens into the answer | decayed score (today's cache) | predictor | best possible in hindsight |
 |---|---|---|---|
-| 0 (the answer's start) | 77.2% | **86.2%** | 95.7% |
-| 32 | 79.1% | **86.1%** | 95.9% |
-| 64 | 80.7% | **86.3%** | 95.6% |
-| 256 | 83.2% | **85.2%** | 94.9% |
+| 0 (the answer's start) | 76.0% | **86.7%** | 95.8% |
+| 64 | 80.6% | **86.7%** | 95.7% |
+| 256 | 84.1% | **86.3%** | 95.5% |
 
-- **Q6_K_XL** (115 per layer, 5543 slots): 67.4% → 77.8% at the answer's start.
-- **Whole sources held out** (the model's own sessions, coding agents, math): 76.6% → 83.2% at the start, so it carries
-  over to kinds of conversation it never saw.
+- **A Q6_K_XL-sized cache** (115 per layer, 5543 slots): 66.0% → 78.2% at the answer's start.
+- **Whole sources held out** (the model's own sessions, a coding agent's runs, math; 5778 answers): 74.1% → 83.5% at
+  the start. It carries over to kinds of conversation it never saw.
 - **The best possible column** knows the future window. A perfect forecaster of the window's rates would get about 92%;
   the rest is chance that no predictor can reach.
+
+**More data helps.** On those same 4455 answers, a predictor trained on the first 160 traces (5944 answers) got 85.1%
+at the answer's start and 79.9% over the next 512 tokens. Trained on all of them it gets 86.7% and 82.2%. A larger model
+(rank 256) on the same data gets the same 86.7%.
 
 **Swap-limited replays.** The held-out answers are replayed with a refresh every 16 tokens at the cache's default
 budget, 1.7 swaps per token:
 - today's cache, with the refill at 64 tokens: 79.2%, at 11.5 swaps per token;
-- the predictor: 85.1%, at 1.6 swaps per token.
+- the predictor: 85.8%, at 1.6 swaps per token.
 
 That's more hits with a seventh of the uploads.
 
-**The text start.** It reaches 82.0% of the selections from the turn's text alone, against 86.6% at the end of the prompt.
-- With up to 1600 of its experts uploaded during a short prompt and a top-up capped at 1000, the answers after short
-  turns got 85.7% hits with 4.9 uploads per generated token.
-- The main predictor alone got 86.1% with 13.7.
+**The text start.** It reaches 84.3% of the selections from the turn's text alone, against 87.1% at the end of the prompt
+and 76.7% for the decayed score at the answer's start.
+- It leaves about 1400 swaps to reach the end-of-prompt set, against about 2700 from what the cache holds.
+- In a replay on the first 160 traces, with up to 1600 of its experts uploaded during a short prompt and a top-up
+  capped at 1000, the answers after short turns got 85.7% hits with 4.9 uploads per generated token. The main predictor
+  alone got 86.1% with 13.7.
+
+**Other quants.** A predictor trained on Q4_K_XL routing works on Q6_K_XL without retraining. On 46 conversations traced
+through both, Q6 selects 93.8% of the same experts at each token and layer, and most of the differences are in the
+router's lowest-ranked picks (99.4% agree on the first pick, 71.5% on the tenth). A predictor that had seen none of those
+conversations scored 84.1% on both, at the same cache size. Other kinds of quant (such as IQ4_XS) are untested.
 
 ### Live, on the R9700
 
-These runs are from 2026-10-30, each one server answering the same requests at temperature 0:
+These runs are from 2026-10-30, with the predictor trained on the first 160 traces, each one server answering the same
+requests at temperature 0:
 - a 512-token story;
 - two 2k-token code questions, each in a new conversation;
 - a question on 20k tokens of code;
@@ -208,8 +219,9 @@ Requirements:
 - Python 3 with NumPy and PyTorch for prep, training and export (a CUDA GPU helps but isn't needed);
 - `gguf-py` from this checkout (the scripts find it).
 
-For Flash-Next, 160 traces (3.9M tokens) took 6 GB of disk with their hidden rows, their records another 6 GB, and
-training about 90 s on an RTX 4070 Ti.
+For Flash-Next, 948 traces (13.1M tokens) took 21 GB of disk with their hidden rows, and their records about 22 GB, then
+the same again for the store that training reads. Training took about 12 minutes on an RTX 4070 Ti. Neither the records
+nor the training need much memory: the training reads the records from disk, per batch.
 
 ### 1. Traces
 
@@ -233,7 +245,9 @@ llama-moe-trace -m model.gguf <the placement flags you serve with> -b 4096 -ub 4
   - Without it there are no hidden rows. A predictor can still be trained for evaluation (`--no-hidden`), but version
     1 of the file needs them.
 - **Use the batch sizes you serve with.** Routing depends slightly on them, because the kernels round differently.
-- **Trace through the quant you'll run.** A predictor trained on one quant's routing is untested on another's.
+- **Trace through a quant close to the one you'll run.** Q4_K_XL and Q6_K_XL route almost alike, and a predictor carries
+  over between them ([Results](#results)). Check another kind of quant by scoring the predictor on a few of its traces
+  (below).
 
 Two kinds of conversation are worth tracing:
 
@@ -262,8 +276,8 @@ Two kinds of conversation are worth tracing:
   `session-prompts.json`: the session plans for `gen_sessions.py`. They are 5-turn sessions of several kinds (coding,
   writing, how-to, math), switching subject on purpose.
 
-How much: the Flash-Next numbers above came from 160 traces (108 dataset packs, 40 generated sessions and 12
-calibration runs; 3.9M tokens, 5944 answers). A larger model (rank 256, more epochs) did no better, so more and more varied traces are what improves it.
+How much: the Flash-Next numbers above came from 948 traces: 340 dataset packs, 596 generated sessions and 12 calibration
+runs. More and more varied traces are what improves it.
 
 ### 2. Records
 
@@ -284,7 +298,8 @@ python3 tools/moe-predictor/prep.py --traces traces --work work --tok-embd tok-e
     turn's tokens, for the start predictor.
 - **The model's shape** comes from the first trace and goes to `work/model.json`. Traces of another shape are
   skipped.
-- **The other scripts** find the records through `MOE_PRED_WORK` (default `./work`).
+- **The other scripts** find the records through `MOE_PRED_WORK` (default `./work`). The first training run joins them
+  into one memory-mapped file per kind under `work/store`, and reads those per batch.
 
 ### 3. Training the main predictor
 
@@ -294,7 +309,8 @@ python3 tools/moe-predictor/train.py --hid-last-only --save pred.pt --sim 1.7
 ```
 
 **The split.** Every 5th trace of each source is held out (sources are the trace names without the trailing
-`-NN`). `HOLDOUT=src1,src2` holds out whole sources instead, to test how it carries over.
+`-NN`). `HOLDOUT=src1,src2` holds out whole sources instead, to test how it carries over. `HOLDOUT=all` with `--load`
+scores a saved model on other traces, such as another quant's.
 
 **The samples.** A sample is an answer `a` at a position `t` (its first `t` tokens generated, `t = 0` right after the
 prompt), for every position in `--probes` that leaves at least 32 tokens. The default positions are 0, 16, 32, 48, 64,
@@ -338,6 +354,7 @@ They are given at each cache size in `MOE_PRED_SLOTS` (experts per layer, defaul
 | `--answers-map` | a map of all earlier answers' selections (no gain) |
 | `--switch-weight a` | weights samples by how far their target is from the decayed score, to train for large swaps (no gain) |
 | `--load pred.pt` | evaluates a saved model without training |
+| `--init pred.pt` | starts from a saved model, keeping its prior: fine-tuning, for example on another quant's traces |
 
 ### 4. Training the start predictor
 
@@ -389,7 +406,8 @@ The cache's own statistics (`-v`, at exit) count the predictions and their time.
 
 These were measured on Flash-Next. They're here so a retraining doesn't repeat them.
 
-- **Data, not model size, limits it.** Rank 256 and twice the epochs gave the same hit rates.
+- **Data, not model size, limits it.** Going from 5944 to 17,642 training answers added 1.6 points at an answer's start
+  and 2.3 over 512 tokens. Rank 256 added nothing, on either amount of data.
 - **The newest hidden row is enough**, and one hidden layer gives almost all of it (layer 32 alone: 85.8% against
   86.1%).
 - **About 4 of the 10 points to the best set are chance.** Experts used once or twice in a window can't be known in

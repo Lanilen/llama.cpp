@@ -36,6 +36,7 @@ ap.add_argument("--eval-probes", default="0,32,64,128,256,512")
 ap.add_argument("--save", default="")
 ap.add_argument("--answers-map", action="store_true", help="also the counts over all previous answers (map answers_all)")
 ap.add_argument("--load", default="", help="a saved model: skip the training")
+ap.add_argument("--init", default="", help="a saved model to start from (fine-tuning, e.g. on another quant's routing); it keeps that model's prior")
 ap.add_argument("--switch-weight", type=float, default=0.0, help="weight samples by 1 + this x their switch size (the "
                 "distance of the target from the live score), normalised to mean 1: training for large swaps")
 ap.add_argument("--by-source", action="store_true", help="hit rates of the model and the live rule per source of the held-out traces")
@@ -56,27 +57,22 @@ if args.answers_map:
     MAPS.insert(5, "answers_all")
 NF = len(MAPS)
 
+def take(mm, idx):
+    """rows of a memory-mapped array as a tensor on the device"""
+    return torch.from_numpy(np.array(mm[idx.cpu().numpy()])).to(dev)
+
 def load(names):
-    ctx, ids, lens, hid, hpos, hans, src = [], [], [], [], [], [], []
-    na = 0
-    for n in names:
-        t = Trace(n, hidden=True)
-        ctx.append(t.ctx); lens.append(t.lens)
-        ids.append(t.ids)
-        hid.append(t.hid); hpos.append(t.hid_pos); hans.append(t.hid_ans + na)
-        src += [source(n)] * len(t)
-        na += len(t)
-    D = {"ctx": torch.from_numpy(np.concatenate(ctx)).to(dev),
-         "ids": torch.from_numpy(np.concatenate(ids)).to(dev),
-         "lens": torch.from_numpy(np.concatenate(lens)).to(dev),
-         "hid": torch.from_numpy(np.concatenate(hid)).to(dev),
-         "hpos": torch.from_numpy(np.concatenate(hpos)).to(dev),
-         "hans": torch.from_numpy(np.concatenate(hans)).to(dev)}
+    """the small indices on the device; ctx, ids and hid stay on disk (common.store) and are read per batch"""
+    S = store(names)
+    tn = lambda x: torch.from_numpy(np.array(x)).to(dev)
+    D = {"ctx": S["ctx"], "ids": S["ids"], "hid": S["hid"], "store": S,
+         "lens": tn(S["lens"]), "hpos": tn(S["hid_pos"]), "hans": tn(S["hid_ans"])}
+    na = len(D["lens"])
     D["off"] = torch.cumsum(D["lens"], 0) - D["lens"]
     # rows of each answer: they are stored in order of answer and position
     D["hoff"] = torch.searchsorted(D["hans"].contiguous(), torch.arange(na, device=dev))
     D["hcnt"] = torch.bincount(D["hans"], minlength=na)
-    D["src"] = src
+    D["src"] = [source(n) for n in names for _ in range(int(np.load(f"{WORK}/{n}.npz")["lens"].shape[0]))]
     return D
 
 LAYER = torch.arange(NL, device=dev).view(1, NL, 1) * NE
@@ -93,7 +89,7 @@ def scatter(D, a, t0, t1, w_fn):
     first = torch.cumsum(n, 0) - n
     k = torch.arange(tot, device=dev) - first[b] + t0[b]
     rows = D["off"][a][b] + k
-    ix = D["ids"][rows].long() + LAYER                      # [tot, 48, 10]
+    ix = take(D["ids"], rows).long() + LAYER                      # [tot, 48, 10]
     w = w_fn(k, t1[b]).view(-1, 1, 1).expand_as(ix).float()
     out.view(-1).index_add_(0, (ix + (b * NL * NE).view(-1, 1, 1)).reshape(-1), w.reshape(-1))
     return out
@@ -103,7 +99,7 @@ def features(D, a, t, prior):
     zero = torch.zeros_like(t)
     dec = lambda hl: (lambda k, end: 0.5 ** ((end - 1 - k).float() / hl))
     nc = D["ctx"].shape[1]
-    ctx = D["ctx"][a].float().view(B, nc, NL * NE)
+    ctx = take(D["ctx"], a).float().view(B, nc, NL * NE)
     live = ctx[:, 0] * (0.5 ** (t.float() / 64)).view(-1, 1) + scatter(D, a, zero, t, dec(64))
     c512 = ctx[:, 1] * (0.5 ** (t.float() / 512)).view(-1, 1) + scatter(D, a, zero, t, dec(512))
     gen = scatter(D, a, zero, t, lambda k, end: torch.ones_like(k, dtype=torch.float))
@@ -123,12 +119,15 @@ def hidden(D, a, t):
     # small loops over the batch: up to ~140 rows each
     for i in range(B):
         o, c = int(D["hoff"][a[i]]), int(D["hcnt"][a[i]])
-        pos = D["hpos"][o:o + c]; h = D["hid"][o:o + c].float()
-        before = pos < 0
-        known = (pos >= 0) & (pos < int(t[i]))
+        pos = D["hpos"][o:o + c]
         avail = pos < int(t[i])
         if avail.any():
-            out[i, 0] = h[avail.nonzero()[-1, 0]]
+            out[i, 0] = torch.from_numpy(np.array(D["hid"][o + int(avail.nonzero()[-1, 0])])).to(dev).float()
+        if args.hid_last_only:
+            continue
+        h = torch.from_numpy(np.array(D["hid"][o:o + c])).to(dev).float()
+        before = pos < 0
+        known = (pos >= 0) & (pos < int(t[i]))
         if before.any():
             out[i, 1] = h[before].mean(0)
         if known.any():
@@ -184,24 +183,31 @@ def topk_hits(score, tgt, S):
 if __name__ == "__main__":
     tr_names, te_names = split(names())
     t0 = time.time()
-    TR, TE = load(tr_names), load(te_names)
-    # the static prior: expert use over the training answers
-    prior = torch.zeros(NL * NE, device=dev)
-    for i in range(0, len(TR["ids"]), 65536):
-        prior.index_add_(0, (TR["ids"][i:i + 65536].long() + LAYER).reshape(-1), torch.ones(TR["ids"][i:i + 65536].numel(), device=dev))
-    prior = (prior.view(NL, NE) / prior.view(NL, NE).sum(1, keepdim=True)).view(-1)
-    print(f"loaded {len(TR['lens'])} train / {len(TE['lens'])} test answers in {time.time() - t0:.0f} s, "
-          + (f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB on the GPU" if dev.type == "cuda" else "on the CPU"), flush=True)
-    model = Model(prior.view(NL, NE)).to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    S_tr = samples(TR, PROBES)
+    TE = load(te_names)
     bidx = {p: i for i, p in enumerate(BUCKETS)}
-    steps = args.epochs * math.ceil(len(S_tr) / args.batch)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.1)
-    step = 0
-    if args.load:
-        ck = torch.load(args.load)
+    ck = torch.load(args.load or args.init) if args.load or args.init else None
+    if ck is not None:
+        prior = ck["prior"].to(dev).view(-1)        # the prior is part of the model
+    if not args.load:
+        TR = load(tr_names)
+        if ck is None:
+            # the static prior: expert use over the training answers
+            prior = torch.zeros(NL * NE, device=dev)
+            for i in range(0, len(TR["ids"]), 65536):
+                ids = torch.from_numpy(np.array(TR["ids"][i:i + 65536])).to(dev)
+                prior.index_add_(0, (ids.long() + LAYER).reshape(-1), torch.ones(ids.numel(), device=dev))
+            prior = (prior.view(NL, NE) / prior.view(NL, NE).sum(1, keepdim=True)).view(-1)
+    print(f"loaded {0 if args.load else len(TR['lens'])} train / {len(TE['lens'])} test answers in {time.time() - t0:.0f} s, "
+          f"{dev.type}, reading the records from disk", flush=True)
+    model = Model(prior.view(NL, NE)).to(dev)
+    if ck is not None:
         model.load_state_dict(ck["state"] if "state" in ck else ck)
+    if not args.load:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        S_tr = samples(TR, PROBES)
+        steps = args.epochs * math.ceil(len(S_tr) / args.batch)
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.1)
+    step = 0
     for ep in range(0 if args.load else args.epochs):
         perm = np.random.permutation(len(S_tr))
         tl, tn = 0.0, 0
@@ -308,7 +314,7 @@ if __name__ == "__main__":
                 mix = 0.5 * p[HS[0]] + 0.5 * p[HS[-1]]
                 sc = {"live+refill64": (live, gen), "model 128": (p[HS[0]], None), "model mix": (mix, None),
                       "model 512": (p[HS[-1]], None), "mix+full64": (mix, mix)}
-                ids = TE["ids"][int(TE["off"][a]):int(TE["off"][a]) + L].long()
+                ids = torch.from_numpy(np.array(TE["ids"][int(TE["off"][a]):int(TE["off"][a]) + L])).to(dev).long()
                 for kind in kinds:
                     s, full = sc[kind]
                     at = lambda t, s=s, full=full: (full[t // 16], True) if full is not None and t == 64 else (s[t // 16], False)
