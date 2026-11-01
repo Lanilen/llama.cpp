@@ -14,13 +14,23 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// --moe-cache-resize, a context with the cache and one without share the device memory: the first offers the batches that fit
+// next to its cache and what each would take, the second picks the largest that fits both, then the first takes its share
+static struct {
+    std::atomic<int>  followers{0};
+    std::atomic<bool> pending{false};
+    std::map<int64_t, std::map<ggml_backend_dev_t, size_t>> grow; // set before pending, read after it
+} g_moe_resize;
 
 //
 // llama_context
@@ -601,6 +611,8 @@ llama_context::llama_context(
                 // context is released (the draft reads the prompt after the main context, and drafts before it verifies)
                 resize_small_max = 31;
                 moe_resize_large = false;
+                moe_resize_follower = true;
+                g_moe_resize.followers++;
             }
         }
 
@@ -627,6 +639,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (moe_resize_follower) {
+        g_moe_resize.followers--;
+    }
 
     // the MoE cache waits for its uploads on the backends, which are freed before the members declared after them
     moe_cache.reset();
@@ -797,8 +813,10 @@ void llama_context::release_scratch() {
     moe_scratch_grown = false;
 }
 
-int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
+int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
     const size_t headroom = 256u*1024*1024;
+    // a context without the cache picks for both while the one with the cache waits at its smallest reserve
+    const bool joint = !moe_cache && g_moe_resize.pending;
     const uint32_t n_seqs = cparams.n_seq_max;
 
     // the free memory of each GPU, with the current compute buffers given back; SIZE_MAX = not a GPU
@@ -817,9 +835,17 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
         ggml_backend_dev_memory(dev, &free, &total);
         free_dev[i] = free + (sched ? ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0);
     }
-    const auto fits = [&](const std::vector<size_t> & sizes) {
+    // what the context with the cache still takes on device i for a batch of n tokens
+    const auto grows = [&](size_t i, int64_t n) {
+        const auto it = g_moe_resize.grow.at(n).find(ggml_backend_get_device(backend_ptrs[i]));
+        return it != g_moe_resize.grow.at(n).end() ? it->second : 0;
+    };
+    const auto fits = [&](const std::vector<size_t> & sizes, int64_t n) {
+        if (joint && g_moe_resize.grow.count(n) == 0) {
+            return false;
+        }
         for (size_t i = 0; i < sizes.size(); ++i) {
-            if (free_dev[i] != SIZE_MAX && sizes[i] + headroom > free_dev[i]) {
+            if (free_dev[i] != SIZE_MAX && sizes[i] + (joint ? grows(i, n) : 0) + headroom > free_dev[i]) {
                 return false;
             }
         }
@@ -848,8 +874,9 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
     };
 
     std::vector<size_t> sizes(backend_ptrs.size());
+    std::map<int64_t, std::vector<size_t>> measures;
     int64_t n_fit = 0;
-    for (int64_t n = n_max; n > n_min && n_fit == 0; n /= 2) {
+    for (int64_t n = n_max; n > n_min && (plan || n_fit == 0); n /= 2) {
         set_batch(n);
 
         // measure first, without allocating
@@ -869,7 +896,12 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
         const bool measured = graph_reserve(n, n_seqs, std::min<uint32_t>(n, cparams.n_outputs_max), mctx.get(), true, sizes.data()) != nullptr;
         LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB measured, %.2f MiB free\n", __func__, n, gpu_mib(sizes, true), gpu_mib(free_dev, false));
         mctx.reset();
-        if (!measured || !fits(sizes)) {
+        if (!measured || !fits(sizes, n)) {
+            continue;
+        }
+        if (plan) {
+            measures[n] = sizes;
+            n_fit = n_fit == 0 ? n : n_fit;
             continue;
         }
 
@@ -884,9 +916,27 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
             sizes[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
         }
         LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB allocated\n", __func__, n, gpu_mib(sizes, true));
-        if (fits(sizes)) {
+        if (fits(sizes, n)) {
             n_fit = n;
         }
+    }
+
+    if (plan) {
+        set_batch(n_min);
+        reserve();
+        g_moe_resize.grow.clear();
+        for (const auto & m : measures) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t cur = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                g_moe_resize.grow[m.first][ggml_backend_get_device(backend_ptrs[i])] = m.second[i] > cur ? m.second[i] - cur : 0;
+            }
+        }
+        if (n_fit > n_min) {
+            llama_moe_cache::set_resize_batch(n_fit);
+            g_moe_resize.pending = true;
+            LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens fit next to the cache, without the draft's buffers\n", __func__, n_fit);
+        }
+        return n_fit > n_min ? n_fit : n_min;
     }
 
     if (n_fit == 0) {
@@ -898,9 +948,9 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min) {
         }
     }
 
-    LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens %s%s (compute buffer %.2f MiB, %.2f MiB free for it)\n",
+    LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens %s%s (compute buffer %.2f MiB, %.2f MiB free for it%s)\n",
             __func__, n_fit, moe_cache ? "keep the cache" : "use the small reserve", n_fit < n_max ? ", larger ones don't fit" : "",
-            gpu_mib(sizes, true), gpu_mib(free_dev, false));
+            gpu_mib(sizes, true), gpu_mib(free_dev, false), joint ? " and the cache's context" : "");
 
     return n_fit;
 }
@@ -2158,7 +2208,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // cache came back: until then the free memory the driver reports can still drop by a GB (RADV)
                 synchronize();
                 moe_resize_fitted = true;
-                moe_resize_fit(moe_resize_batch > 0 ? std::min<int64_t>(moe_resize_batch, cparams.n_ubatch) : cparams.n_ubatch, n_min);
+                moe_resize_fit(moe_resize_batch > 0 ? std::min<int64_t>(moe_resize_batch, cparams.n_ubatch) : cparams.n_ubatch, n_min, g_moe_resize.followers > 0);
+                moe_resize_wait = g_moe_resize.pending;
+                moe_resize_gen = 0;
+            } else if (moe_resize_wait) {
+                // the draft context picks the batch at its next call; a context that never decodes does not hold this one back
+                moe_resize_gen += balloc->get_n_tokens();
+                if (!moe_resize_large && (!g_moe_resize.pending || moe_resize_gen >= 256)) {
+                    synchronize();
+                    moe_resize_wait = false;
+                    g_moe_resize.pending = false;
+                    const int64_t n_picked = llama_moe_cache::resize_batch();
+                    if (n_picked > n_min) {
+                        moe_resize_fit(n_picked, n_min);
+                    }
+                }
             } else if (moe_resize_fitted) {
                 // a context without the cache (the MTP draft) found less room for its own buffers
                 const int64_t n_shared = llama_moe_cache::resize_batch();
@@ -2185,6 +2249,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 if (n < n_main) {
                     llama_moe_cache::limit_resize_batch(n);
                 }
+                g_moe_resize.pending = false;
             }
         }
         const bool large = balloc->get_n_tokens() > resize_small_max;

@@ -87,6 +87,9 @@ public:
     // its device memory (an MTP draft) keep their small reserve for the same batches
     static int64_t resize_batch();
 
+    // a context with the cache offers n to the contexts without it, before its own small reserve grows to what they pick
+    static void set_resize_batch(int64_t n);
+
     // a context without the cache whose small reserve fits only up to n tokens lowers resize_batch() to n, and the
     // context with the cache follows
     static void limit_resize_batch(int64_t n);

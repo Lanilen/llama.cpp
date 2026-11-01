@@ -317,6 +317,8 @@ private:
     bool    moe_resize_fitted = false;
     int64_t moe_resize_gen   = 0;    // tokens of small batches since the cache came back, before moe_resize_fit
     bool    moe_scratch_grown = false; // a batch larger than the hot spare's ran with the small reserve
+    bool    moe_resize_wait = false;   // the context without the cache has yet to pick the batch of the small reserves
+    bool    moe_resize_follower = false; // a context without the cache that follows the one with it
 
     // reserve the compute buffers for small batches again
     void resize_to_small();
@@ -327,8 +329,9 @@ private:
     void release_scratch();
 
     // the small reserve for the largest batch, from n_max down by halves to n_min, whose compute buffers fit in the free
-    // memory of the GPUs; returns that batch size
-    int64_t moe_resize_fit(int64_t n_max, int64_t n_min);
+    // memory of the GPUs; returns that batch size. plan: only measures each batch for the context without the cache that
+    // shares the memory, which then picks the batch that fits both, and keeps the reserve of n_min until then
+    int64_t moe_resize_fit(int64_t n_max, int64_t n_min, bool plan = false);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
