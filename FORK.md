@@ -97,19 +97,19 @@ model's routing on public conversations and its own answers, records, training, 
 Trained on 948 traces (13.1M tokens), on held-out Flash-Next Q4_K_XL conversations, the predictor's top 164 experts per
 layer served 86.7% of the next 128 tokens' selections from an answer's start, against 76.0% for the counts. With whole
 sources held out it was 83.5% against 74.1%. The same predictor carries over to Q6_K_XL, whose routing is 93.8% the same
-as Q4_K_XL's. Live on the R9700, with a predictor trained on the first 160 traces (Q4_K_XL, 2 MTP drafts, PCIe 3.0 x16,
-2026-10-30):
+as Q4_K_XL's. Live on the R9700 (2 MTP drafts, PCIe 3.0 x16, two passes each, 2026-11-01), against the previous best:
 
-| | hits | generation, all requests | after a 2k-token question |
-|---|---|---|---|
-| counts, refill at 64 tokens | 82.1% | 29.4 tok/s | 21.0 tok/s |
-| predictor, refill at 64 | 87.7% | 30.0 tok/s | 28.5 tok/s |
-| predictor, no refill | 85.7% | 30.4 tok/s | 32.4 tok/s |
+| | hits | generation, all requests | short answers after a large prompt | long answers |
+|---|---|---|---|---|
+| Q4, counts, refill at 64 tokens, budget 5 | 82.1% | 29.2 tok/s | 26.8 tok/s | 30.1 tok/s |
+| Q4, predictor, no refill, budget 10 | 88.5% | 31.1 tok/s (+6.8%) | 32.5 tok/s (+21%) | 30.7 tok/s (+2%) |
+| Q6, counts, refill at 64 tokens, budget 5 | 74.0% | 25.6 tok/s | 23.9 tok/s | 26.3 tok/s |
+| Q6, predictor, no refill, budget 5 | 78.9% | 26.5 tok/s (+3.3%) | 27.3 tok/s (+14%) | 26.2 tok/s (flat) |
 
-The hit rates reach the offline figures, and the gain in speed is largest right after a large prompt, where the
-counts know least. On Q6_K_XL the predictor raised the hits (74.0% → 76.7%) but nearly doubled the uploads and was
-slower overall with the refill on. How the pieces interact on both quants is being measured. The model, the training
-step by step, and all the results: [docs/moe-predictor.md](docs/moe-predictor.md).
+The gain is in the answers after a large prompt, where the counts know least. Over long answers the settings come close
+to the same speed. With a predictor the refill costs speed and adds at most a point of hits, so it's off by default.
+The start from the turn's text and a third draft were slower here. The model, the training step by step, and all the
+results: [docs/moe-predictor.md](docs/moe-predictor.md).
 
 ## RDNA4 (`vk-rdna4`, work in progress, stable)
 
@@ -155,8 +155,8 @@ lab's file isn't published):
 ```bash
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
-    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 23500 --moe-cache-budget 5 --moe-cache-batch 0 \
-    --moe-cache-predictor flashnext-pred.gguf --moe-cache-refill 0 \
+    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 23500 --moe-cache-budget 10 --moe-cache-batch 0 \
+    --moe-cache-predictor flashnext-pred.gguf \
     -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -cmoed -devd Vulkan0 \
     --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-n-ubatch 2048 --load-mode mmap+mlock
 ```
@@ -165,8 +165,8 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
 
 - **The RX 480 tables above** used UD-IQ4_XS and predate the predictor. They'll be run again with it (after checking
   that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are back in the lab.
-- **The predictor's settings on both quants,** with the predictor trained on all 948 traces: the refill, the budget and
-  the text start crossed, with repeats for the noise.
+- **Longer MTP drafts behind a gate,** on the usual requests and on real agent turns, where more of the text is copied
+  from the context.
 
 ## How it was made
 
