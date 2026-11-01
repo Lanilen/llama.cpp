@@ -2905,7 +2905,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_START"));
     add_opt(common_arg(
         {"--moe-cache-refill"}, "N",
-        string_format("hot spare mode: after a prompt, rebalance the resident experts once from the selections of the first N generated tokens, 0 = never (default: %d)", params.moe_cache_refill),
+        "hot spare mode: after a prompt, rebalance the resident experts once from the selections of the first N generated tokens, 0 = never (default: 128, or 0 with --moe-cache-predictor)",
         [](common_params & params, int value) {
             params.moe_cache_refill = value;
         }

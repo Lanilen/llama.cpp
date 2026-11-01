@@ -630,8 +630,6 @@ struct llama_moe_cache::impl {
         } else if (params.resize && mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
             LLAMA_LOG_WARN("%s: --moe-cache-resize needs --moe-cache-mode hot-spare, ignored\n", __func__);
         }
-        refill_tokens = std::max<int64_t>(0, params.refill);
-        refill_left   = refill_tokens; // also for a first prompt too short to count as one
         if (!params.predictor_start.empty() && params.predictor.empty()) {
             LLAMA_LOG_WARN("%s: --moe-cache-predictor-start needs --moe-cache-predictor, ignored\n", __func__);
         }
@@ -661,6 +659,9 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        // a predictor leaves the refill little to do: it added at most a point of hits and cost 0.7-0.9 tok/s
+        refill_tokens = params.refill >= 0 ? params.refill : (predictor ? 0 : 128);
+        refill_left   = refill_tokens; // also for a first prompt too short to count as one
         const size_t size = params.size;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
