@@ -241,6 +241,9 @@ extern "C" {
     typedef uint64_t                     (*ggml_backend_upload_bg_gate_t)(ggml_backend_t backend);
     typedef void                         (*ggml_backend_upload_bg_open_t)(ggml_backend_t backend, uint64_t gate);
     typedef void                         (*ggml_backend_upload_bg_wait_t)(ggml_backend_t backend, uint64_t ticket);
+    // the next graph the backend computes waits on the device for the uploads of the ticket, without the host waiting;
+    // copies and synchronizations before that graph do not wait for them
+    typedef void                         (*ggml_backend_upload_bg_require_t)(ggml_backend_t backend, uint64_t ticket);
     // Free the memory the backend keeps for itself between graphs (scratch, staging), sized by the largest graph so far;
     // waits for the backend, the next graph allocates what it needs again
     typedef void                         (*ggml_backend_release_scratch_t)(ggml_backend_t backend);

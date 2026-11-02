@@ -454,6 +454,8 @@ struct llama_moe_cache::impl {
         ggml_backend_upload_bg_gate_t   upload_bg_gate   = nullptr; // optional: uploads submitted before their copies (text starts)
         ggml_backend_upload_bg_open_t   upload_bg_open   = nullptr;
         ggml_backend_upload_bg_wait_t   upload_bg_wait   = nullptr;
+        ggml_backend_upload_bg_require_t upload_bg_require = nullptr; // optional: --moe-cache-jit's uploads only the cache branch waits for
+        uint64_t jit_ticket = 0; // the last background uploads of --moe-cache-jit
         int      half        = 0;
         uint64_t half_ticket[2] = { 0, 0 };
         bool     bg_recorded = false;    // background uploads were recorded since the last submission
@@ -516,6 +518,7 @@ struct llama_moe_cache::impl {
         int64_t jit_ubatch = -1; // the ubatch whose run of the layer filled the jit maps
         int32_t jit_copies = 0;  // copies of the jit maps in that run
         bool    jit_toggle = false; // the old pairing of the copies, a toggle, for the check
+        int32_t * jit_dev_maps = nullptr; // pinned copies of jit_slot and jit_hit that their device copies are written from
     };
 
     // --moe-cache-jit statistics
@@ -533,6 +536,7 @@ struct llama_moe_cache::impl {
         size_t  bad_maps  = 0; //   map entries that run an expert in neither or both branches, or point past the slots
         size_t  copies[4] = {}; // layer runs by their copies of the jit maps: 0 (unused), 1, 2, 3 or more
         size_t  toggle_off = 0; // copies the old toggle paired wrongly
+        size_t  bg = 0;        // layer runs whose uploads ran in the background
     };
 
     // hot spare mode statistics
@@ -1108,6 +1112,7 @@ struct llama_moe_cache::impl {
             d.upload_bg_gate   = (ggml_backend_upload_bg_gate_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_gate");
             d.upload_bg_open   = (ggml_backend_upload_bg_open_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_open");
             d.upload_bg_wait   = (ggml_backend_upload_bg_wait_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_wait");
+            d.upload_bg_require = (ggml_backend_upload_bg_require_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_bg_require");
             // LLAMA_MOE_CACHE_BG=0 keeps the uploads on the compute queue, to compare
             const char * env_bg = getenv("LLAMA_MOE_CACHE_BG");
             if (!d.upload_bg || !d.upload_bg_submit || !d.upload_bg_done || (env_bg != nullptr && atoi(env_bg) == 0)) {
@@ -1157,12 +1162,33 @@ struct llama_moe_cache::impl {
                 }
                 jit_size = std::max(jit_size, (size_t) g.n_jit*slot_bytes);
             }
+            // after it, each layer's device maps: written from pinned memory they are copied in order on the compute queue,
+            // after the uploads, so the CPU branch starts without waiting for them (LLAMA_MOE_CACHE_JIT_PINNED_MAPS=0: from
+            // the host maps, which synchronizes the device)
+            static const bool jit_pinned_maps = !getenv("LLAMA_MOE_CACHE_JIT_PINNED_MAPS") || atoi(getenv("LLAMA_MOE_CACHE_JIT_PINNED_MAPS")) != 0;
+            const size_t jit_staging_size = GGML_PAD(jit_size, 64);
+            if (jit_size > 0 && jit_pinned_maps) {
+                for (const layer & l : layers) {
+                    if (l.jit_slot != nullptr && groups[l.ig].id == (int32_t) id && groups[l.ig].n_jit > 0) {
+                        jit_size = GGML_PAD(jit_size, 64) + 2*GGML_PAD(ggml_nbytes(l.jit_slot), 64);
+                    }
+                }
+            }
             if (jit_size > 0) {
                 if (buft_pinned != nullptr) {
                     d.jit_pinned.reset(ggml_backend_buft_alloc_buffer(buft_pinned, jit_size));
                 }
                 if (d.jit_pinned) {
                     d.jit_staging = (uint8_t *) ggml_backend_buffer_get_base(d.jit_pinned.get());
+                    if (jit_pinned_maps) {
+                        uint8_t * p = d.jit_staging + jit_staging_size;
+                        for (layer & l : layers) {
+                            if (l.jit_slot != nullptr && groups[l.ig].id == (int32_t) id && groups[l.ig].n_jit > 0) {
+                                l.jit_dev_maps = (int32_t *) p;
+                                p += 2*GGML_PAD(ggml_nbytes(l.jit_slot), 64);
+                            }
+                        }
+                    }
                     LLAMA_LOG_INFO("%s: %10s large batches upload the experts that %d of their tokens select (--moe-cache-jit), "
                         "%d slots, %.0f MiB of staging memory\n", __func__, ggml_backend_name(d.backend), jit_min, jit_slots, jit_size/1024.0/1024.0);
                 } else {
@@ -2415,10 +2441,14 @@ struct llama_moe_cache::impl {
             const int32_t n_expert = (int32_t) l.slot_of.size();
 
             // the wait also covers the previous layer's uploads and cache branch, so its slots and staging memory are free
+            // (its cache branch waited for its background uploads); the check frees the backend's finished batches
             const ggml_tensor * sel = map_lookup_ids(dst, graph, il);
             ids.resize(ggml_nelements(sel));
             ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
             ggml_backend_synchronize(backend);
+            if (d.jit_ticket > 0) {
+                d.upload_bg_done(backend, d.jit_ticket, false);
+            }
             const int64_t t_sync_us = ggml_time_us();
 
             const int32_t * miss = (const int32_t *) l.miss_map->data;
@@ -2468,15 +2498,34 @@ struct llama_moe_cache::impl {
                 jit_worker->post(jit_jobs);
                 jit_worker->wait();
 
+                // in the background if the backend can make only the next graph, the cache branch, wait for them: the
+                // reads of the CPU branch's inputs before it do not, so the CPU experts start while they run
+                // (LLAMA_MOE_CACHE_JIT_BG=0: on the transfer queue of the compute, which every synchronization waits for)
+                static const bool jit_bg_env = !getenv("LLAMA_MOE_CACHE_JIT_BG") || atoi(getenv("LLAMA_MOE_CACHE_JIT_BG")) != 0;
+                bool bg = jit_bg_env && d.upload_bg != nullptr && d.upload_bg_require != nullptr;
                 staging = d.jit_staging;
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const size_t expert_size = l.experts[ip]->nb[2];
-                    ggml_backend_tensor_set_async(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size);
+                    if (bg && !d.upload_bg(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size)) {
+                        GGML_ASSERT(ip == 0 && "background upload failed after the first tensor of the jit experts");
+                        bg = false;
+                    }
+                    if (!bg) {
+                        ggml_backend_tensor_set_async(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size);
+                    }
                     staging += n*expert_size;
                     jit_st.bytes += n*expert_size;
                 }
-                if (jit_sync) {
+                if (bg) {
+                    d.jit_ticket = d.upload_bg_submit(backend);
+                    d.upload_bg_require(backend, d.jit_ticket);
+                    jit_st.bg++;
+                }
+                if (jit_sync || jit_check) {
                     ggml_backend_synchronize(backend);
+                    if (bg) {
+                        d.upload_bg_done(backend, d.jit_ticket, true);
+                    }
                 }
                 for (size_t j = 0; j < n; ++j) {
                     const int32_t e = jit_pick[j];
@@ -2488,7 +2537,6 @@ struct llama_moe_cache::impl {
                 jit_st.uploaded += n;
 
                 if (jit_check) {
-                    ggml_backend_synchronize(backend);
                     std::vector<uint8_t> back;
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         const ggml_tensor * w = l.experts[ip];
@@ -2527,7 +2575,14 @@ struct llama_moe_cache::impl {
             jit_st.t_copy_us += t_end_us - t_copy_start_us;
         }
 
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        // the pinned copy is read when the device runs the write, it changes at the layer's next run, a ubatch later
+        const void * data = src->data;
+        if (l.jit_dev_maps != nullptr) {
+            int32_t * p = (int32_t *) ((uint8_t *) l.jit_dev_maps + (src == l.jit_slot ? 0 : GGML_PAD(ggml_nbytes(l.jit_slot), 64)));
+            memcpy(p, src->data, ggml_nbytes(src));
+            data = p;
+        }
+        ggml_backend_tensor_set_async(backend, dst, data, 0, ggml_nbytes(src));
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -2646,7 +2701,8 @@ struct llama_moe_cache::impl {
                     jit_resident ? " (resident experts moved)" : "", jit_st.checked, jit_st.bad_data, jit_st.bad_maps);
             }
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, ubatch  > 32: --moe-cache-jit layer runs by their map copies: 1: %zu, 2: %zu, 3+: %zu; "
-                "the old toggle paired %zu copies wrongly\n", jit_st.copies[1], jit_st.copies[2], jit_st.copies[3], jit_st.toggle_off);
+                "the old toggle paired %zu copies wrongly; %zu runs uploaded in the background%s\n", jit_st.copies[1], jit_st.copies[2], jit_st.copies[3],
+                jit_st.toggle_off, jit_st.bg, std::any_of(layers.begin(), layers.end(), [](const layer & l) { return l.jit_dev_maps != nullptr; }) ? ", maps from pinned memory" : "");
         }
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "

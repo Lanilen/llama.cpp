@@ -1284,6 +1284,7 @@ struct ggml_backend_vk_context {
     std::vector<std::pair<uint64_t, vk_command_buffer *>> bg_inflight;
     uint64_t bg_ready  = 0;      // the batches up to this value are complete, the compute waits for them
     uint64_t bg_waited = 0;      // a compute submission already waits for the batches up to this value
+    uint64_t bg_require = 0;     // the next graph waits for the batches up to this value (ggml_backend_vk_upload_bg_require)
     // gates: a batch can wait for the host to open a gate (a timeline the host signals, see ggml_backend_vk_upload_bg_gate)
     bool bg_gates = false;
     vk_semaphore bg_host;        // timeline the host signals: value g opens gate g

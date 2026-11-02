@@ -14532,6 +14532,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ggml_vk_submit_transfer_ctx(ctx);
 
+    // background uploads this graph reads: its submissions wait for them on the device
+    if (ctx->bg_require > ctx->bg_ready) {
+        ctx->bg_ready = ctx->bg_require;
+    }
+
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
         // allocate/resize the query pool
@@ -15659,6 +15664,14 @@ static void ggml_backend_vk_upload_bg_open(ggml_backend_t backend, uint64_t gate
     }
 }
 
+// the next graph waits on the device for the batch of a ticket (it is complete before the graph's first submission runs)
+static void ggml_backend_vk_upload_bg_require(ggml_backend_t backend, uint64_t ticket) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (ctx->bg_initialized) {
+        ctx->bg_require = std::max(ctx->bg_require, ticket);
+    }
+}
+
 // waits until the batch of a ticket is complete, from any thread (ggml_backend_vk_upload_bg_done does the bookkeeping)
 static void ggml_backend_vk_upload_bg_wait(ggml_backend_t backend, uint64_t ticket) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
@@ -16778,6 +16791,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_upload_bg_wait") == 0) {
         return (void *) ggml_backend_vk_upload_bg_wait;
+    }
+    if (strcmp(name, "ggml_backend_upload_bg_require") == 0) {
+        return (void *) ggml_backend_vk_upload_bg_require;
     }
     if (strcmp(name, "ggml_backend_release_scratch") == 0) {
         return (void *) ggml_backend_vk_release_scratch;
