@@ -2803,6 +2803,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         struct hc_mix {
             ggml_tensor * cur;     // the mixed [n_embd, T] stream
             ggml_tensor * inject;  // [hc, T] scatter weights, null when the inject weights are null
+            ggml_tensor * side;    // the inject matmul when it is not one with hc_down: it reads only the norm, can be null
         };
 
         hc_mix build_hc_mix(
@@ -2859,7 +2860,8 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
-                            int   il);
+                            int   il,
+                    ggml_tensor * side = nullptr); // computed beside the MoE when the hot spare allows it
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,

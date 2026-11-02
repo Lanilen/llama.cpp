@@ -2174,6 +2174,26 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// whether the weights that t reads, down to depth nodes, are on dev (a tensor beside the MoE may join the cache branch)
+static bool moe_side_weights_on(const ggml_tensor * t, ggml_backend_dev_t dev, int depth) {
+    if (t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) == dev;
+    }
+    if (t->view_src != nullptr && t->view_src->buffer != nullptr &&
+            ggml_backend_buffer_get_usage(t->view_src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->view_src->buffer)) == dev;
+    }
+    if (depth == 0) {
+        return true;
+    }
+    for (int k = 0; k < GGML_MAX_SRC; k++) {
+        if (t->src[k] != nullptr && !moe_side_weights_on(t->src[k], dev, depth - 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2252,6 +2272,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    // the caller's tensors beside the MoE, for this call only
+    std::vector<ggml_tensor *> side;
+    side.swap(moe_side);
 
     ggml_tensor * logits = nullptr;
 
@@ -2666,6 +2690,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // the cache branch is a split of its own that runs while the CPU computes the misses
             ggml_backend_sched_set_tensor_overlap(sched, first_c);
             ggml_build_forward_expand(gf, experts_c);
+
+            // the tensors beside the MoE join the cache branch when their weights are on its device; otherwise they are
+            // computed where they are first used, after the MoE, as before
+            static const bool side_on = [] { const char * e = getenv("LLAMA_MOE_SIDE"); return e == nullptr || atoi(e) != 0; }();
+            ggml_backend_dev_t dev_cache = ggml_backend_get_device(backend_cache);
+            if (side_on && !side.empty() && std::all_of(side.begin(), side.end(), [&](const ggml_tensor * t) { return moe_side_weights_on(t, dev_cache, 6); })) {
+                const int n_before = ggml_graph_n_nodes(gf);
+                for (ggml_tensor * t : side) {
+                    ggml_build_forward_expand(gf, t);
+                }
+                for (int i = n_before; i < ggml_graph_n_nodes(gf); i++) {
+                    ggml_tensor * t = ggml_graph_node(gf, i);
+                    if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                        ggml_backend_sched_set_tensor_backend(sched, t, backend_cache);
+                    }
+                }
+            }
 
             ggml_tensor * ids_h = ggml_get_rows(ctx0, maps.miss, ggml_reshape_1d(ctx0, ids_rec, ggml_nelements(ids_rec)));
             ggml_tensor * first_h = ids_h;
