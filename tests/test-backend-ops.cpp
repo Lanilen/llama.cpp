@@ -12858,6 +12858,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // small mat-vecs at Qwen3.8-Flash-Next's widths (k = n_embd 2560, or 10240 for its 4 hyper-connection streams): how the
+    // time grows with the rows, to see what one mat-vec over concatenated weights would save against several
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
+        for (int64_t k : {2560, 10240}) {
+            for (int64_t m : {4, 16, 64, 320, 640, 1280, 2560, 5120, 10240}) {
+                for (int bs : {1, 3}) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {

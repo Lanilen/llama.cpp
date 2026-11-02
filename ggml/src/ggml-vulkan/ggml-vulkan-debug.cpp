@@ -10,6 +10,14 @@ bool vk_enable_sync_logger = false;
 
 uint32_t vk_perf_logger_frequency = 1;
 
+bool vk_perf_logger_nodes = false;
+
+std::mutex vk_perf_mark_mutex;
+
+std::string vk_perf_mark_label;
+
+uint64_t vk_perf_mark_gen = 0;
+
 std::string vk_pipeline_stats_filter;
 
 void vk_memory_logger::log_allocation(vk_buffer_ref buf_ref, size_t size) {
