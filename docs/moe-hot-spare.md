@@ -109,6 +109,15 @@ wait for both. The cache branch is marked as an overlapping split: the scheduler
 launches the cache branch at once, and the CPU's input copy waits for that event only. The CPU computes its experts while
 the GPU computes the resident ones (`GGML_SCHED_OVERLAP=0` turns this off).
 
+The cache branch is short (about 80 us a layer for a 3-token verify of Flash-Next on the R9700, against about 500 us of CPU
+experts), so the GPU mostly waits for the CPU. A model can give `build_moe_ffn` tensors that read the MoE's input but not
+its output (`moe_side`, set just before the call): with the hot spare they join the cache branch, so the GPU computes them
+in that wait rather than after the CPU experts. Flash-Next (qwen4exp) gives its shared expert, with its sigmoid gate, and
+the inject matrix product of the FFN's hyper-connection; Qwen3-Next style models compute the shared expert after the MoE,
+in the split that waits for the CPU, about 4-5 ms of a 62 ms verify pass. They join only when their weights are on the
+cache's device; otherwise, and without the hot spare, they are computed where they are first used, as before. The kernels
+and their inputs don't change, so neither do the logits (`LLAMA_MOE_SIDE=0` turns it off, to compare).
+
 ### Faster copies to the CPU
 
 Every split that runs on the CPU first reads its inputs from the GPUs. These reads were synchronous, a submission and a
@@ -322,6 +331,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_CACHE_JIT_SYNC=1` | `--moe-cache-jit`: wait for each layer's uploads before its cache branch, a test of their ordering |
 | `LLAMA_MOE_CACHE_JIT_CHECK=1` | `--moe-cache-jit`: read every upload back and compare it with the host expert, check every map entry, report at exit (slow, a test) |
 | `LLAMA_MOE_CACHE_JIT_MODE=resident` | `--moe-cache-jit`: move resident experts to the jit slots instead of uploading missing ones, a test of the slots (the output should match off's) |
+| `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
 | `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |

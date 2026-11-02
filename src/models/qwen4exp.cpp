@@ -406,12 +406,14 @@ llama_model_qwen4exp::graph::build_hc_mix(
     }
     cb(mixed, "hc_mixed", il);
 
+    ggml_tensor * side = nullptr;
     if (!w_down_inject && w_inject) {
-        inject = ggml_scale(ctx0, build_lora_mm(w_inject, xn), 1.0f / (float) hc);
+        side   = build_lora_mm(w_inject, xn);
+        inject = ggml_scale(ctx0, side, 1.0f / (float) hc);
         cb(inject, "hc_inject", il);
     }
 
-    return { mixed, inject };
+    return { mixed, inject, side };
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
@@ -544,7 +546,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 il);
         cur = ffn_mix.cur;
 
-        cur = build_layer_ffn(cur, il);
+        cur = build_layer_ffn(cur, il, ffn_mix.side);
         cb(cur, "ffn_out", il);
 
         res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
@@ -652,7 +654,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     hc_mix ffn_mix = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, il);
     cur    = ffn_mix.cur;
-    cur    = build_layer_ffn(cur, il);
+    cur    = build_layer_ffn(cur, il, ffn_mix.side);
     res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
 
     // the next draft step reads this residual as its h
@@ -1243,29 +1245,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * side) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
-
-    // shared experts, as in the Qwen3Next reference
+    // shared experts, as in the Qwen3Next reference; built before the MoE so that with the hot spare the GPU computes
+    // them while the CPU computes the missed experts (moe_side), they read the MoE input only
+    ggml_tensor * ffn_shexp = nullptr;
     if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
+        ffn_shexp =
             build_ffn(cur,
                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                 model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
@@ -1284,6 +1271,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
+        moe_side.push_back(ffn_shexp);
+    }
+    if (side != nullptr) {
+        moe_side.push_back(side);
+    }
+
+    ggml_tensor * moe_out =
+        build_moe_ffn(cur,
+            model.layers[il].ffn_gate_inp,
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, model.layers[il].ffn_gate_up_exps,
+            model.layers[il].ffn_up_exps_s,
+            model.layers[il].ffn_gate_exps_s,
+            model.layers[il].ffn_down_exps_s);
+    cb(moe_out, "ffn_moe_out", il);
+
+    if (ffn_shexp != nullptr) {
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {

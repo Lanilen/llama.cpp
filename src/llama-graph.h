@@ -1067,6 +1067,10 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    // tensors that read the MoE input but not its output (a shared expert, say), set before build_moe_ffn: with the
+    // hot spare the GPU computes them in the cache branch, while the CPU computes the misses, rather than after them
+    mutable std::vector<ggml_tensor *> moe_side;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
