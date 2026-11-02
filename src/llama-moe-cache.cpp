@@ -2335,7 +2335,7 @@ struct llama_moe_cache::impl {
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
 
-        // large ubatches do not run on the hot spare, only their swaps count
+        // large ubatches run on the hot spare only with --moe-cache-resize (they do not swap), else only their swaps count
         auto log_spare = [](const char * name, const spare_stats & st, bool hits) {
             if (st.tokens == 0) {
                 return;
@@ -2352,7 +2352,7 @@ struct llama_moe_cache::impl {
                 st.full_bg_tokens > 0 ? format(" (in the background, over %.1f tokens each)", (double) st.full_bg_tokens/st.n_full).c_str() : "");
         };
         log_spare("ubatch <= 32", spare_small, true);
-        log_spare("ubatch  > 32", spare_large, false);
+        log_spare("ubatch  > 32", spare_large, resize);
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "
                 "%.1f ms per restore (waiting for the copies %.1f, for a half's uploads %.1f, allocating the banks %.1f, "
