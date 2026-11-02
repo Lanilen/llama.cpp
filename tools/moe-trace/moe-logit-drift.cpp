@@ -8,8 +8,8 @@
 // LLAMA_DRIFT_RS      recurrent-state snapshots to allocate, what --spec-draft-n-max gives a server with a draft-mtp head
 // LLAMA_DRIFT_SAVE    write the base to this file
 // LLAMA_DRIFT_BASE    read the base from this file instead of generating it: compares another placement or cache state
-// LLAMA_DRIFT_PROMPT  S: only time a prompt's batches: up to 1024 tokens in one batch, then the rest of -f in batches of S tokens with only the last one output, at most
-//                     LLAMA_DRIFT_PROMPT_BATCHES (default 64) of them
+// LLAMA_DRIFT_PROMPT  S: only time a prompt's batches: up to 1024 tokens in one batch, 96 tokens as a generation in batches of 3 (the cache keeps larger batches only after 64
+//                     of them), then the rest of -f in batches of S tokens with only the last one output, at most LLAMA_DRIFT_PROMPT_BATCHES (default 64) of them
 
 #include "arg.h"
 #include "common.h"
@@ -186,8 +186,19 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s: can't decode the prompt\n", __func__);
             return 1;
         }
+        const int n_gen = n_warm + 96;
+        for (int i = n_warm; i < n_gen && i + 3 <= (int) prompt.size(); i += 3) {
+            batch.clear();
+            for (int k = i; k < i + 3; ++k) {
+                batch.add(prompt[k], k, 0, true);
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0 || llama_get_logits_ith(ctx, 0) == nullptr) {
+                LOG_ERR("%s: decode failed\n", __func__);
+                return 1;
+            }
+        }
         std::vector<double> t_batches;
-        for (int i = n_warm; i + S <= (int) prompt.size() && (int) t_batches.size() < n_batches; i += S) {
+        for (int i = n_gen; i + S <= (int) prompt.size() && (int) t_batches.size() < n_batches; i += S) {
             const int64_t t0 = ggml_time_us();
             if (!decode(i, i + S)) {
                 LOG_ERR("%s: decode failed\n", __func__);
