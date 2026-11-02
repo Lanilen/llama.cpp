@@ -588,6 +588,7 @@ llama_context::llama_context(
             mcp.predictor        = params.moe_cache_predictor        ? params.moe_cache_predictor        : "";
             mcp.predictor_device = params.moe_cache_predictor_device ? params.moe_cache_predictor_device : "";
             mcp.predictor_start  = params.moe_cache_predictor_start  ? params.moe_cache_predictor_start  : "";
+            mcp.jit              = std::max(0, params.moe_cache_jit);
             if (params.moe_cache_sizes != nullptr) {
                 mcp.sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + params.n_moe_cache_sizes);
             }
@@ -4512,6 +4513,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_predictor         =*/ nullptr,
         /*.moe_cache_predictor_device  =*/ nullptr,
         /*.moe_cache_predictor_start   =*/ nullptr,
+        /*.moe_cache_jit               =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

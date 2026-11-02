@@ -441,6 +441,8 @@ struct llama_moe_cache::impl {
         std::vector<uint8_t> unpinned;
         uint8_t * staging      = nullptr;
         size_t    staging_size = 0;
+        ggml_backend_buffer_ptr jit_pinned; // --moe-cache-jit: the staging memory of one layer's uploads, pinned
+        uint8_t * jit_staging = nullptr;
         size_t    staging_used = 0;
         bool      pending      = false; // uploads were queued since the last synchronization
 
@@ -474,6 +476,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> key_of_slot; // [n_slots] il*n_expert + expert, -1 if empty
         std::vector<uint8_t> slot_pending; // [n_slots] the expert of the slot is being uploaded
         int32_t n_resident = 0;
+        int32_t n_jit = 0; // --moe-cache-jit: slots after n_slots where a layer of a large ubatch uploads its experts just before it runs
     };
 
     // hot spare mode: an expert being uploaded in the background, it becomes resident when its ticket is done
@@ -504,6 +507,25 @@ struct llama_moe_cache::impl {
         std::vector<float>    pmap[llama_moe_predictor::MAP_PRIOR]; // with a predictor: its count maps, [n_expert] each
         std::vector<float>    pred;   // with a predictor: the expected selections in its horizon, ranks the experts
         std::vector<uint8_t>  uploading; // [n_expert] the expert is being uploaded in the background
+
+        // --moe-cache-jit: the maps of large ubatches in host memory, the resident maps plus the experts uploaded for the layer
+        // the device maps are host weights, so the copy callback fills them when the layer's cache branch starts
+        ggml_tensor * jit_miss = nullptr;
+        ggml_tensor * jit_slot = nullptr;
+        ggml_tensor * jit_hit  = nullptr;
+        bool jit_second = false; // the next copy of a map is the second of the layer's run
+    };
+
+    // --moe-cache-jit statistics
+    struct jit_stats {
+        size_t  layers   = 0; // layer runs that looked for experts to upload
+        size_t  uploaded = 0; // experts uploaded
+        size_t  capped   = 0; // experts left to the CPU because the slots were full
+        size_t  moved    = 0; // selections the uploaded experts took from the CPU
+        size_t  bytes    = 0;
+        int64_t t_us      = 0; // in the copy callback
+        int64_t t_sync_us = 0; // of t_us, waiting for the selected experts
+        int64_t t_copy_us = 0; // of t_us, copying the experts to the staging memory
     };
 
     // hot spare mode statistics
@@ -600,6 +622,17 @@ struct llama_moe_cache::impl {
     std::vector<pending_upload> pending_uploads;
     std::vector<ggml_backend_t> layer_backends; // [n_layer] backend of the device of each layer
 
+    // hot spare mode with --moe-cache-jit: large ubatches do not swap, so each layer uploads the non-resident experts that
+    // many of its tokens select into slots of its own, when its cache branch starts (the copy callback of its maps)
+    int32_t  jit_min   = 0;  // tokens an expert needs, 0 = off
+    int32_t  jit_slots = 0;  // LLAMA_MOE_CACHE_JIT_SLOTS: slots of each group, the most a layer uploads
+    jit_stats jit_st;
+    std::unique_ptr<copy_worker> jit_worker; // copies to the staging memory while the host waits
+    std::unordered_map<const ggml_tensor *, int32_t> jit_of; // device maps of large ubatches -> layer
+    std::vector<int32_t> jit_count;
+    std::vector<int32_t> jit_pick;
+    std::vector<copy_worker::job> jit_jobs;
+
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
@@ -624,6 +657,13 @@ struct llama_moe_cache::impl {
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_moe_cache_params & params) :
             n_expert_used(model.hparams.n_expert_used_max()), mode(params.mode),
             half_life(params.half_life), margin(params.margin), budget(params.budget), layers(model.layers.size()) {
+        if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && params.jit > 0) {
+            // the slots count with no_alloc too, for the memory breakdown
+            jit_min   = params.jit;
+            jit_slots = getenv("LLAMA_MOE_CACHE_JIT_SLOTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_JIT_SLOTS"))) : 64;
+        } else if (params.jit > 0) {
+            LLAMA_LOG_WARN("%s: --moe-cache-jit needs --moe-cache-mode hot-spare, ignored\n", __func__);
+        }
         if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && !no_alloc) {
             save_path = params.save;
             resize    = params.resize;
@@ -837,9 +877,14 @@ struct llama_moe_cache::impl {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            const int32_t max_slots = std::min<int32_t>(g.layers.size()*n_expert, g.max_slots);
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+            // the slots of --moe-cache-jit come out of the budget
+            g.n_jit = jit_min > 0 ? std::min<int32_t>(jit_slots, n_expert) : 0;
+            const int32_t max_slots = std::min<int32_t>(g.layers.size()*n_expert, g.max_slots - g.n_jit);
+            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + g.n_jit + 1) <= budget) {
                 g.n_slots++;
+            }
+            if (g.n_slots >= (int32_t) g.layers.size()*n_expert) {
+                g.n_jit = 0; // every expert is resident
             }
             if (g.n_slots < n_expert_used) {
                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
@@ -854,7 +899,7 @@ struct llama_moe_cache::impl {
                 g.slru.init(model.layers.size(), n_expert, g.n_slots);
             }
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size();
+            n_tensors_host  += g.layers.size()*(g.n_jit > 0 ? 4 : 1);
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -890,7 +935,7 @@ struct llama_moe_cache::impl {
             }
             ggml_context * ctx = devices[g.id].ctx.get();
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
+                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + g.n_jit + 1);
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -901,7 +946,7 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + g.n_jit, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -926,6 +971,17 @@ struct llama_moe_cache::impl {
                     }
                     l.uploading.assign(g.ref[0]->ne[2], 0);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
+                    if (g.n_jit > 0) {
+                        l.jit_miss = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        l.jit_slot = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        l.jit_hit  = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        ggml_format_name(l.jit_miss, "moe_cache.jit_miss_map-%d", il);
+                        ggml_format_name(l.jit_slot, "moe_cache.jit_slot_map-%d", il);
+                        ggml_format_name(l.jit_hit,  "moe_cache.jit_hit_map-%d",  il);
+                        jit_of[l.jit_slot] = il;
+                        jit_of[l.jit_hit]  = il;
+                        buf_host_size += 3*GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
+                    }
                     devices[g.id].buf_size += 2*GGML_PAD(ggml_nbytes(l.slot_dev), ggml_backend_buft_get_alignment(devices[g.id].buft));
                 } else {
                     l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
@@ -934,7 +990,7 @@ struct llama_moe_cache::impl {
                     buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
                 }
             }
-            devices[g.id].buf_size += alloc_size(g, g.n_slots);
+            devices[g.id].buf_size += alloc_size(g, g.n_slots + g.n_jit);
         }
 
         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
@@ -984,8 +1040,9 @@ struct llama_moe_cache::impl {
                 mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE ? ", hot spare mode" : "");
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
-                    LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%), %d resident\n", __func__,
-                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]), g.n_resident);
+                    LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%), %d resident%s\n", __func__,
+                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]), g.n_resident,
+                        g.n_jit > 0 ? format(", %d more for --moe-cache-jit", g.n_jit).c_str() : "");
                 }
             }
         }
@@ -1072,6 +1129,41 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: %10s hot spare uploads: %s, %s\n", __func__, ggml_backend_name(d.backend),
                 d.pinned ? ggml_backend_buft_name(ggml_backend_buffer_get_type(d.pinned.get())) : "unpinned memory",
                 d.upload_bg ? "in the background" : "on the compute queue");
+
+            // --moe-cache-jit: staging memory for the uploads of one layer, they are done before the next layer's
+            // selected experts can be read; a write from memory that is not pinned would synchronize the device
+            size_t jit_size = 0;
+            for (const group & g : groups) {
+                if (g.id != (int32_t) id || g.n_jit == 0) {
+                    continue;
+                }
+                size_t slot_bytes = 0;
+                for (const ggml_tensor * t : g.ref) {
+                    slot_bytes += t->nb[2];
+                }
+                jit_size = std::max(jit_size, (size_t) g.n_jit*slot_bytes);
+            }
+            if (jit_size > 0) {
+                if (buft_pinned != nullptr) {
+                    d.jit_pinned.reset(ggml_backend_buft_alloc_buffer(buft_pinned, jit_size));
+                }
+                if (d.jit_pinned) {
+                    d.jit_staging = (uint8_t *) ggml_backend_buffer_get_base(d.jit_pinned.get());
+                    LLAMA_LOG_INFO("%s: %10s large batches upload the experts that %d of their tokens select (--moe-cache-jit), "
+                        "%d slots, %.0f MiB of staging memory\n", __func__, ggml_backend_name(d.backend), jit_min, jit_slots, jit_size/1024.0/1024.0);
+                } else {
+                    LLAMA_LOG_WARN("%s: no pinned memory for %s, --moe-cache-jit is off\n", __func__, ggml_backend_name(d.backend));
+                    for (group & g : groups) {
+                        if (g.id == (int32_t) id) {
+                            g.n_jit = 0;
+                        }
+                    }
+                }
+            }
+        }
+        if (std::any_of(groups.begin(), groups.end(), [](const group & g) { return g.n_jit > 0; })) {
+            const char * env = getenv("LLAMA_MOE_CACHE_JIT_THREADS");
+            jit_worker = std::make_unique<copy_worker>(env != nullptr ? std::max(1, atoi(env)) : 4);
         }
 
         for (layer & l : layers) {
@@ -2153,6 +2245,9 @@ struct llama_moe_cache::impl {
         }
         const layer & l = layers[il];
         maps = { l.miss_map, l.slot_dev, l.hit_dev };
+        if (n_tokens > max_batch && l.jit_slot != nullptr && groups[l.ig].n_jit > 0) {
+            maps = { l.jit_miss, l.jit_slot, l.jit_hit };
+        }
         return true;
     }
 
@@ -2253,7 +2348,130 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // the get_rows of graph that reads dst, the copy of a map, and the selected experts it looks up, which an earlier split computed
+    static const ggml_tensor * map_lookup_ids(const ggml_tensor * dst, ggml_cgraph * graph, int32_t il) {
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        const ggml_tensor * lookup = nullptr;
+        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                lookup = node;
+            }
+        }
+        GGML_ASSERT(lookup != nullptr);
+
+        // the scheduler starts a new split at the lookup because it reads a host weight, but only if the split already has inputs
+        const ggml_tensor * sel = lookup->src[1];
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node == sel || node == sel->view_src) {
+                GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
+            }
+        }
+        GGML_ASSERT(ggml_is_contiguous(sel));
+        return sel;
+    }
+
+    // --moe-cache-jit: the copy of a device map of a large ubatch, when the layer's cache branch starts
+    // the first of its two maps reads the selected experts, uploads the non-resident ones that at least jit_min tokens
+    // select to the slots after n_slots, and fills the maps: the CPU branch skips those experts, the cache branch runs them
+    void jit_copy(ggml_backend_t backend, int32_t il, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        layer & l = layers[il];
+        group & g = groups[l.ig];
+        device & d = devices[g.id];
+        GGML_ASSERT(backend == d.backend);
+
+        // each run of the layer copies both maps, the first one fills them (the layers share the slots, so a layer never reuses its uploads)
+        l.jit_second = !l.jit_second;
+        if (l.jit_second) {
+            const int64_t t_start_us = ggml_time_us();
+            const int32_t n_expert = (int32_t) l.slot_of.size();
+
+            // the wait also covers the previous layer's uploads and cache branch, so its slots and staging memory are free
+            const ggml_tensor * sel = map_lookup_ids(dst, graph, il);
+            ids.resize(ggml_nelements(sel));
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+            ggml_backend_synchronize(backend);
+            const int64_t t_sync_us = ggml_time_us();
+
+            const int32_t * miss = (const int32_t *) l.miss_map->data;
+            jit_count.assign(n_expert, 0);
+            for (int32_t e : ids) {
+                if (e >= 0 && e < n_expert && miss[e] >= 0) {
+                    jit_count[e]++;
+                }
+            }
+            jit_pick.clear();
+            for (int32_t e = 0; e < n_expert; ++e) {
+                if (jit_count[e] >= jit_min) {
+                    jit_pick.push_back(e);
+                }
+            }
+            if ((int32_t) jit_pick.size() > g.n_jit) {
+                // the slots go to the experts with the most tokens
+                std::nth_element(jit_pick.begin(), jit_pick.begin() + g.n_jit, jit_pick.end(),
+                    [&](int32_t a, int32_t b) { return jit_count[a] != jit_count[b] ? jit_count[a] > jit_count[b] : a < b; });
+                jit_st.capped += jit_pick.size() - g.n_jit;
+                jit_pick.resize(g.n_jit);
+            }
+            // in expert order, so a bank gets one upload
+            std::sort(jit_pick.begin(), jit_pick.end());
+
+            const size_t n_map = l.slot_of.size()*sizeof(int32_t);
+            memcpy(l.jit_miss->data, l.miss_map->data, n_map);
+            memcpy(l.jit_slot->data, l.slot_host, n_map);
+            memcpy(l.jit_hit->data,  l.hit_host,  n_map);
+            int32_t * jmiss = (int32_t *) l.jit_miss->data;
+            int32_t * jslot = (int32_t *) l.jit_slot->data;
+            int32_t * jhit  = (int32_t *) l.jit_hit->data;
+
+            const int64_t t_copy_start_us = ggml_time_us();
+            if (!jit_pick.empty()) {
+                const size_t n = jit_pick.size();
+                uint8_t * staging = d.jit_staging;
+                jit_jobs.clear();
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (size_t j = 0; j < n; ++j) {
+                        jit_jobs.push_back({ staging + j*expert_size, (const uint8_t *) w->data + jit_pick[j]*expert_size, expert_size });
+                    }
+                    staging += n*expert_size;
+                }
+                jit_worker->post(jit_jobs);
+                jit_worker->wait();
+
+                staging = d.jit_staging;
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const size_t expert_size = l.experts[ip]->nb[2];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size);
+                    staging += n*expert_size;
+                    jit_st.bytes += n*expert_size;
+                }
+                for (size_t j = 0; j < n; ++j) {
+                    const int32_t e = jit_pick[j];
+                    jmiss[e] = -1;
+                    jslot[e] = g.n_slots + (int32_t) j;
+                    jhit[e]  = e;
+                    jit_st.moved += jit_count[e];
+                }
+                jit_st.uploaded += n;
+            }
+            jit_st.layers++;
+            const int64_t t_end_us = ggml_time_us();
+            jit_st.t_us      += t_end_us - t_start_us;
+            jit_st.t_sync_us += t_sync_us - t_start_us;
+            jit_st.t_copy_us += t_end_us - t_copy_start_us;
+        }
+
+        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        if (const auto it_jit = jit_of.find(src); it_jit != jit_of.end()) {
+            jit_copy(backend, it_jit->second, src, dst, graph);
+            return true;
+        }
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -2353,6 +2571,14 @@ struct llama_moe_cache::impl {
         };
         log_spare("ubatch <= 32", spare_small, true);
         log_spare("ubatch  > 32", spare_large, resize);
+        if (jit_st.layers > 0) {
+            // the uploaded experts count as misses above
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, ubatch  > 32: --moe-cache-jit %d uploaded %zu experts in %zu layer runs (%.1f a run, %zu over the slots), "
+                "%.2f%% of the selections of the misses, %.2f MiB; %.3f ms a run (waiting for the selected experts %.3f, staging copies and uploads %.3f)\n",
+                jit_min, jit_st.uploaded, jit_st.layers, (double) jit_st.uploaded/jit_st.layers, jit_st.capped,
+                spare_large.misses > 0 ? 100.0*jit_st.moved/spare_large.misses : 0.0, jit_st.bytes/1024.0/1024.0,
+                jit_st.t_us/1000.0/jit_st.layers, jit_st.t_sync_us/1000.0/jit_st.layers, jit_st.t_copy_us/1000.0/jit_st.layers);
+        }
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "
                 "%.1f ms per restore (waiting for the copies %.1f, for a half's uploads %.1f, allocating the banks %.1f, "
