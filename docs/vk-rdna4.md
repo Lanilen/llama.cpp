@@ -18,6 +18,8 @@ R9700). Other GPUs are unaffected: every change is behind a check for RDNA4.
    - `GGML_VK_DISABLE_COOPMAT_INT=1`: no int8 cooperative matrices at all (the experts and Q6_K back on the f16 path);
    - `GGML_VK_FORCE_MMID_TILE=0|1|2`: always the small, medium or large tile for MUL_MAT_ID (without coopmat2 it picks
      its tile like a dense matmul).
+   - `GGML_VK_FORCE_MM_TILE=0|1|2`: the same for MUL_MAT. On the R9700, in Flash-Next's small prompt batches (experts on
+     the CPU), the default choice, the small tile, was the fastest; the medium and large ones were slower.
 
 ## Measured
 

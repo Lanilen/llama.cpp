@@ -21,7 +21,7 @@ also tested on an NVIDIA RTX 4070 Ti with Vulkan. They are listed, with how to s
 | `polaris` | everything, the one to use | this file |
 | [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan support for the sparse-attention ops on GPUs without fp16 | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
 | [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | a GPU cache of the most used experts that runs beside the CPU, scheduler and Vulkan changes for models with experts on the CPU, trace tools | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
-| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus a learned predictor of the next experts and its training pipeline | [docs/moe-predictor.md](docs/moe-predictor.md) |
+| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus a learned predictor of the next experts and its training pipeline, and just-in-time uploads for medium prompts | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4, **work in progress, stable** | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
 | `master` | upstream, unchanged | |
 
@@ -52,6 +52,11 @@ added. The resident set follows the text with background uploads.
   background on the transfer queue with the copies on worker threads.
 - **`--moe-cache-resize`:** the cache gives its VRAM to the compute buffers of prompt batches and takes it back for
   generation, so prompts can run with a large `-ub` (also for an MTP draft context).
+- **`--moe-cache-jit N`** (on `moe-predictor`): a medium prompt batch, one that keeps the cache, uploads each layer's
+  missing experts that N of its tokens select just before the layer runs, in the background, so the GPU runs them. On
+  the R9700 with `--moe-cache-jit 8`, prompts of 33-1024 tokens ran 31% faster on Q4_K_XL and 25% on Q6_K_XL, for under
+  a point of generation's hit rate. Off by default:
+  [Medium prompts](docs/moe-hot-spare.md#medium-prompts---moe-cache-jit).
 - **Scheduler:** the GPU part of a layer runs while the CPU computes its experts (overlapping splits), and the copies of
   a split's inputs to the CPU are asynchronous, which also helps a model with its experts on the CPU and no cache.
 - **Vulkan:**
@@ -155,11 +160,15 @@ lab's file isn't published):
 ```bash
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
-    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 23500 --moe-cache-budget 10 --moe-cache-batch 0 \
-    --moe-cache-predictor flashnext-pred.gguf \
-    -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -cmoed -devd Vulkan0 \
+    --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
+    --moe-cache-predictor flashnext-pred.gguf --moe-cache-jit 8 \
+    -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -devd Vulkan0 \
     --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-n-ubatch 2048 --load-mode mmap+mlock
 ```
+
+The draft head's experts are on the GPU (no `-cmoed`), with the cache smaller by their 2550 MiB: against `-cmoed` and
+23500 MiB, usual answers ran at 32.6 tok/s instead of 31.5 and agent turns at 28.6 instead of 27.9, with 83.6% hits
+instead of 86.5% (2026-11-03). The same setup runs UD-Q6_K_XL.
 
 ## Still to measure
 
@@ -167,6 +176,8 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
   that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are back in the lab.
 - **Longer MTP drafts behind a gate,** on the usual requests and on real agent turns, where more of the text is copied
   from the context.
+- **`--moe-cache-jit` on the RX 480s** (PCIe x8, slower uploads, probably a higher N), and a stage of
+  `moe-cache-tune.py` that picks N, or leaves it off, for a machine.
 
 ## How it was made
 
