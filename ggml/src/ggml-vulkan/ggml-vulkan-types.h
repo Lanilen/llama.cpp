@@ -692,6 +692,7 @@ struct vk_device_struct {
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
+    bool bg_uploads = false; // a context of this device uploads in the background on the transfer queue
     bool has_internally_synchronized_queues = false;
     uint32_t subgroup_size;
     uint32_t subgroup_size_log2;
