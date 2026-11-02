@@ -5311,6 +5311,7 @@ void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    vk_perf_logger_nodes = getenv("GGML_VK_PERF_LOGGER_NODES") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -13143,7 +13144,8 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroySemaphore(ctx->bg_host.s);
     }
     if (vk_perf_logger_enabled) {
-        ctx->perf_logger->print_timings(true, ctx->name.c_str());
+        ctx->perf_logger->check_mark(ctx->name);
+        ctx->perf_logger->print_timings(true, (ctx->name + ctx->perf_logger->label()).c_str());
     }
 }
 
@@ -14994,6 +14996,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->device->device.resetFences({ ctx->device->fence });
         ctx->compute_ctx.reset();
 
+        ctx->perf_logger->check_mark(ctx->name);
+
         // Get the results and pass them to the logger
         std::vector<uint64_t> timestamps(cgraph->n_nodes + 1);
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, (cgraph->n_nodes + 1)*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
@@ -15023,7 +15027,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
             }
         }
-        ctx->perf_logger->print_timings(false, ctx->name.c_str());
+        ctx->perf_logger->print_timings(false, (ctx->name + ctx->perf_logger->label()).c_str());
     }
 
     if (!ctx->device->support_async) {
@@ -15670,6 +15674,14 @@ static void ggml_backend_vk_upload_bg_require(ggml_backend_t backend, uint64_t t
     if (ctx->bg_initialized) {
         ctx->bg_require = std::max(ctx->bg_require, ticket);
     }
+}
+
+// GGML_VK_PERF_LOGGER: the timings from now on belong to the phase label; each logger first prints what it has, under the old
+// one, at its next graph or when it is freed
+static void ggml_backend_vk_perf_mark(const char * label) {
+    std::lock_guard<std::mutex> lock(vk_perf_mark_mutex);
+    vk_perf_mark_label = label ? label : "";
+    vk_perf_mark_gen++;
 }
 
 // waits until the batch of a ticket is complete, from any thread (ggml_backend_vk_upload_bg_done does the bookkeeping)
@@ -16795,6 +16807,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_upload_bg_require") == 0) {
         return (void *) ggml_backend_vk_upload_bg_require;
     }
+    if (strcmp(name, "ggml_backend_vk_perf_mark") == 0) {
+        return (void *) ggml_backend_vk_perf_mark;
+    }
     if (strcmp(name, "ggml_backend_release_scratch") == 0) {
         return (void *) ggml_backend_vk_release_scratch;
     }
@@ -17051,6 +17066,16 @@ vk_device_struct::~vk_device_struct() {
     device.destroyDescriptorSetLayout(dsl);
 
     device.destroy();
+}
+
+void vk_perf_logger::check_mark(const std::string & ctx_name) {
+    std::lock_guard<std::mutex> lock(vk_perf_mark_mutex);
+    if (mark_gen == vk_perf_mark_gen) {
+        return;
+    }
+    print_timings(true, (ctx_name + mark_label).c_str());
+    mark_gen   = vk_perf_mark_gen;
+    mark_label = vk_perf_mark_label.empty() ? std::string() : " [" + vk_perf_mark_label + "]";
 }
 
 void vk_perf_logger::print_timings(bool force, const char * name) {

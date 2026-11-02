@@ -12,6 +12,9 @@
 //                     batches only after 64 of them)
 // LLAMA_DRIFT_PROMPT  S: only time a prompt's batches: up to 1024 tokens in one batch, 96 tokens as a generation in batches of 3 (the cache keeps larger batches only after 64
 //                     of them), then the rest of -f in batches of S tokens with only the last one output, at most LLAMA_DRIFT_PROMPT_BATCHES (default 64) of them
+// LLAMA_DRIFT_PROFILE N1,N2,...: only time verification batches: LLAMA_DRIFT_PROFILE_DEPTH (default 1024) tokens of -f as a prompt,
+//                     LLAMA_DRIFT_PROFILE_GEN (96) in batches of 1, then LLAMA_DRIFT_PROFILE_BATCHES (64) batches of each size with
+//                     every token output; each phase is a label of the Vulkan perf logger (ggml_backend_vk_perf_mark)
 
 #include "arg.h"
 #include "common.h"
@@ -210,6 +213,87 @@ int main(int argc, char ** argv) {
         }
         printf("prompt batches of %d tokens: %d batches, median %.1f ms a batch, %.2f ms a token\n", S, (int) t_batches.size(), pct(t_batches, .5), pct(t_batches, .5)/S);
         fflush(stdout);
+        llama_init.reset();
+        llama_backend_free();
+        return 0;
+    }
+
+    if (const char * env = getenv("LLAMA_DRIFT_PROFILE")) {
+        // verification batches of each size, the text of -f as their tokens, after a prefix and a generation; each phase is a
+        // label of the Vulkan perf logger (GGML_VK_PERF_LOGGER), so its timings come apart by batch size
+        std::vector<int> sizes;
+        for (const char * p = env; *p;) {
+            sizes.push_back(atoi(p));
+            while (*p && *p != ',') {
+                ++p;
+            }
+            if (*p == ',') {
+                ++p;
+            }
+        }
+        auto geti = [](const char * name, int def) { const char * v = getenv(name); return v ? atoi(v) : def; };
+        const int n_batches = geti("LLAMA_DRIFT_PROFILE_BATCHES", 64);
+        const int depth     = geti("LLAMA_DRIFT_PROFILE_DEPTH", 1024);
+        const int n_gen     = geti("LLAMA_DRIFT_PROFILE_GEN", 96);
+        typedef void (*perf_mark_t)(const char * label);
+        ggml_backend_reg_t reg_vk = ggml_backend_reg_by_name("Vulkan");
+        perf_mark_t perf_mark = reg_vk ? (perf_mark_t) ggml_backend_reg_get_proc_address(reg_vk, "ggml_backend_vk_perf_mark") : nullptr;
+        auto mark = [&](const std::string & label) {
+            llama_synchronize(ctx);
+            if (perf_mark) {
+                perf_mark(label.c_str());
+            }
+        };
+        int need = depth + n_gen;
+        for (int S : sizes) {
+            if (S < 1 || S > n_max_batch) {
+                LOG_ERR("%s: bad batch size %d in LLAMA_DRIFT_PROFILE\n", __func__, S);
+                return 1;
+            }
+            need += S*n_batches;
+        }
+        if ((int) prompt.size() < need) {
+            LOG_ERR("%s: -f has %d tokens, the profile needs %d\n", __func__, (int) prompt.size(), need);
+            return 1;
+        }
+        auto decode = [&](int i0, int i1, bool all) {
+            batch.clear();
+            for (int k = i0; k < i1; ++k) {
+                batch.add(prompt[k], k, 0, all || k + 1 == i1);
+            }
+            return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 && llama_get_logits_ith(ctx, -1) != nullptr;
+        };
+        mark("prefix");
+        for (int i = 0; i < depth; i += n_max_batch) {
+            if (!decode(i, std::min(depth, i + n_max_batch), false)) {
+                LOG_ERR("%s: decode failed\n", __func__);
+                return 1;
+            }
+        }
+        mark("generation");
+        int pos = depth;
+        for (; pos < depth + n_gen; ++pos) {
+            if (!decode(pos, pos + 1, true)) {
+                LOG_ERR("%s: decode failed\n", __func__);
+                return 1;
+            }
+        }
+        for (int S : sizes) {
+            mark("batch " + std::to_string(S));
+            std::vector<double> t_batches;
+            for (int k = 0; k < n_batches; ++k, pos += S) {
+                const int64_t t0 = ggml_time_us();
+                if (!decode(pos, pos + S, true)) {
+                    LOG_ERR("%s: decode failed\n", __func__);
+                    return 1;
+                }
+                t_batches.push_back((ggml_time_us() - t0) / 1e3);
+            }
+            printf("profile batches of %d tokens at depth %d: %d batches, median %.2f ms a batch, p10 %.2f, p90 %.2f\n",
+                    S, pos, n_batches, pct(t_batches, .5), pct(t_batches, .1), pct(t_batches, .9));
+            fflush(stdout);
+        }
+        mark("end");
         llama_init.reset();
         llama_backend_free();
         return 0;

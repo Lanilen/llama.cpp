@@ -12,6 +12,10 @@ extern bool vk_perf_logger_enabled;
 extern bool vk_perf_logger_concurrent;
 extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
+extern bool vk_perf_logger_nodes;          // GGML_VK_PERF_LOGGER_NODES: each timing also keyed by the node and its sources' names
+extern std::mutex vk_perf_mark_mutex;      // ggml_backend_vk_perf_mark: the loggers print what they have under the old label
+extern std::string vk_perf_mark_label;
+extern uint64_t vk_perf_mark_gen;
 extern std::string vk_pipeline_stats_filter;
 extern void * const vk_ptr_base;
 extern vk_instance_t vk_instance;

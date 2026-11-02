@@ -101,6 +101,14 @@ gave 0.015-1.1.
 | `LLAMA_DRIFT_RS=N` | allocate the recurrent-state snapshots of an MTP draft with `--spec-draft-n-max N`, as a server does |
 | `LLAMA_DRIFT_PROMPT=S` | only time a prompt: up to 1024 tokens of `-f` in one batch, 96 tokens in batches of 3 as a generation, then the rest in batches of S tokens with only the last one output; prints the median time per batch |
 | `LLAMA_DRIFT_PROMPT_BATCHES=N` | with `LLAMA_DRIFT_PROMPT`, at most N batches of S tokens (default 64) |
+| `LLAMA_DRIFT_PROFILE=N1,N2,...` | only time verification batches: `LLAMA_DRIFT_PROFILE_DEPTH` tokens of `-f` as a prompt (default 1024), `LLAMA_DRIFT_PROFILE_GEN` in batches of 1 (default 96), then `LLAMA_DRIFT_PROFILE_BATCHES` batches (default 64) of each size with every token output; prints the median time per batch, and labels each phase for the Vulkan perf logger (below) |
+
+With `GGML_VK_PERF_LOGGER=1` and a large `GGML_VK_PERF_LOGGER_FREQUENCY`, the profile mode's timings come out per phase
+(`Vulkan Timings Vulkan0 [batch 3]:`): it calls `ggml_backend_vk_perf_mark`, and each Vulkan context prints what it logged
+under the old label first. `GGML_VK_PERF_LOGGER_NODES=1` also keys each timing by the node and its first two sources
+(`MUL_MAT_VEC q8_0 m=640 n=3 k=2560 | Qcur-0 <- blk.0.attn_q.weight, attn_norm-0`), so the matrix products that read the
+same input can be found. `test-backend-ops perf -o MUL_MAT` has small mat-vecs at Flash-Next's widths (q8_0 and f32,
+k = 2560 and 10240, m = 4-10240), for what one product over concatenated weights would cost against several.
 
 ## Tuning a machine
 

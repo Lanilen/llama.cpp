@@ -1185,6 +1185,8 @@ private:
 
 inline std::mutex vk_memory_logger::log_mutex;
 
+extern bool vk_perf_logger_nodes; // GGML_VK_PERF_LOGGER_NODES, see ggml-vulkan-common.h
+
 class vk_perf_logger {
   public:
     void print_timings(bool force = false, const char * name = nullptr);
@@ -1193,9 +1195,16 @@ class vk_perf_logger {
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops);
 
 
+    // the phase the timings belong to (ggml_backend_vk_perf_mark): when it changed, prints what was logged under the old one
+    void check_mark(const std::string & ctx_name);
+    std::string label() const { return mark_label; }
+
     void log_timing(const ggml_tensor * node, const char *fusion_name, uint64_t time) {
         uint64_t n_flops;
         std::string name = get_node_fusion_name(node, fusion_name, &n_flops);
+        if (vk_perf_logger_nodes) {
+            name += node_names(node);
+        }
         if (n_flops) {
             flops[name].push_back(n_flops);
         }
@@ -1208,6 +1217,9 @@ class vk_perf_logger {
         for (size_t n = 0; n < nodes.size(); ++n) {
             uint64_t n_flops = 0;
             name += get_node_fusion_name(nodes[n], names[n], &n_flops);
+            if (vk_perf_logger_nodes) {
+                name += node_names(nodes[n]);
+            }
             total_flops += n_flops;
 
             if (n != nodes.size() - 1) {
@@ -1221,9 +1233,19 @@ class vk_perf_logger {
     }
 
   private:
+    static std::string node_names(const ggml_tensor * node) {
+        std::string s = std::string(" | ") + node->name;
+        for (int j = 0; j < 2 && node->src[j] != nullptr; ++j) {
+            s += (j == 0 ? " <- " : ", ") + std::string(node->src[j]->name);
+        }
+        return s;
+    }
+
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
     uint32_t print_count {};
+    uint64_t mark_gen {};
+    std::string mark_label;
 };
 
 struct ggml_backend_vk_context {
