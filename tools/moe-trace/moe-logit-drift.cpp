@@ -8,6 +8,8 @@
 // LLAMA_DRIFT_RS      recurrent-state snapshots to allocate, what --spec-draft-n-max gives a server with a draft-mtp head
 // LLAMA_DRIFT_SAVE    write the base to this file
 // LLAMA_DRIFT_BASE    read the base from this file instead of generating it: compares another placement or cache state
+// LLAMA_DRIFT_PROMPT  S: only time a prompt's batches: up to 1024 tokens in one batch, then the rest of -f in batches of S tokens with only the last one output, at most
+//                     LLAMA_DRIFT_PROMPT_BATCHES (default 64) of them
 
 #include "arg.h"
 #include "common.h"
@@ -167,6 +169,38 @@ int main(int argc, char ** argv) {
     const int n_max_batch = (int) llama_n_batch(ctx);
     common_batch batch(ctx);
     drift_run run{ctx, batch, prompt, n_vocab};
+
+    if (const char * env = getenv("LLAMA_DRIFT_PROMPT")) {
+        const int S = atoi(env);
+        const char * env_n = getenv("LLAMA_DRIFT_PROMPT_BATCHES");
+        const int n_batches = env_n ? atoi(env_n) : 64;
+        const int n_warm = std::min(1024, (int) prompt.size()/2);
+        auto decode = [&](int i0, int i1) {
+            batch.clear();
+            for (int k = i0; k < i1; ++k) {
+                batch.add(prompt[k], k, 0, k + 1 == i1);
+            }
+            return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 && llama_get_logits_ith(ctx, -1) != nullptr;
+        };
+        if (S < 1 || S > n_max_batch || !decode(0, n_warm)) {
+            LOG_ERR("%s: can't decode the prompt\n", __func__);
+            return 1;
+        }
+        std::vector<double> t_batches;
+        for (int i = n_warm; i + S <= (int) prompt.size() && (int) t_batches.size() < n_batches; i += S) {
+            const int64_t t0 = ggml_time_us();
+            if (!decode(i, i + S)) {
+                LOG_ERR("%s: decode failed\n", __func__);
+                return 1;
+            }
+            t_batches.push_back((ggml_time_us() - t0) / 1e3);
+        }
+        printf("prompt batches of %d tokens: %d batches, median %.1f ms a batch, %.2f ms a token\n", S, (int) t_batches.size(), pct(t_batches, .5), pct(t_batches, .5)/S);
+        fflush(stdout);
+        llama_init.reset();
+        llama_backend_free();
+        return 0;
+    }
 
     drift_base base;
     const char * base_path = getenv("LLAMA_DRIFT_BASE");
