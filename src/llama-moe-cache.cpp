@@ -526,6 +526,9 @@ struct llama_moe_cache::impl {
         int64_t t_us      = 0; // in the copy callback
         int64_t t_sync_us = 0; // of t_us, waiting for the selected experts
         int64_t t_copy_us = 0; // of t_us, copying the experts to the staging memory
+        size_t  checked   = 0; // LLAMA_MOE_CACHE_JIT_CHECK: experts read back
+        size_t  bad_data  = 0; //   whose slot differs from the host expert
+        size_t  bad_maps  = 0; //   map entries that run an expert in neither or both branches, or point past the slots
     };
 
     // hot spare mode statistics
@@ -627,6 +630,8 @@ struct llama_moe_cache::impl {
     int32_t  jit_min   = 0;  // tokens an expert needs, 0 = off
     int32_t  jit_slots = 0;  // LLAMA_MOE_CACHE_JIT_SLOTS: slots of each group, the most a layer uploads
     bool     jit_sync  = false; // LLAMA_MOE_CACHE_JIT_SYNC=1: wait for a layer's uploads before its cache branch, to test their ordering
+    bool     jit_check = false; // LLAMA_MOE_CACHE_JIT_CHECK=1: read the uploads back and check the maps
+    bool     jit_resident = false; // LLAMA_MOE_CACHE_JIT_MODE=resident: move resident experts to the jit slots instead, a test of the slots
     jit_stats jit_st;
     std::unique_ptr<copy_worker> jit_worker; // copies to the staging memory while the host waits
     std::unordered_map<const ggml_tensor *, int32_t> jit_of; // device maps of large ubatches -> layer
@@ -663,6 +668,8 @@ struct llama_moe_cache::impl {
             jit_min   = params.jit;
             jit_slots = getenv("LLAMA_MOE_CACHE_JIT_SLOTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_JIT_SLOTS"))) : 64;
             jit_sync  = getenv("LLAMA_MOE_CACHE_JIT_SYNC") && atoi(getenv("LLAMA_MOE_CACHE_JIT_SYNC")) != 0;
+            jit_check = getenv("LLAMA_MOE_CACHE_JIT_CHECK") && atoi(getenv("LLAMA_MOE_CACHE_JIT_CHECK")) != 0;
+            jit_resident = getenv("LLAMA_MOE_CACHE_JIT_MODE") && std::string(getenv("LLAMA_MOE_CACHE_JIT_MODE")) == "resident";
         } else if (params.jit > 0) {
             LLAMA_LOG_WARN("%s: --moe-cache-jit needs --moe-cache-mode hot-spare, ignored\n", __func__);
         }
@@ -2399,7 +2406,7 @@ struct llama_moe_cache::impl {
             const int32_t * miss = (const int32_t *) l.miss_map->data;
             jit_count.assign(n_expert, 0);
             for (int32_t e : ids) {
-                if (e >= 0 && e < n_expert && miss[e] >= 0) {
+                if (e >= 0 && e < n_expert && (jit_resident ? miss[e] < 0 : miss[e] >= 0)) {
                     jit_count[e]++;
                 }
             }
@@ -2461,6 +2468,39 @@ struct llama_moe_cache::impl {
                     jit_st.moved += jit_count[e];
                 }
                 jit_st.uploaded += n;
+
+                if (jit_check) {
+                    ggml_backend_synchronize(backend);
+                    std::vector<uint8_t> back;
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        const ggml_tensor * w = l.experts[ip];
+                        const size_t expert_size = w->nb[2];
+                        back.resize(n*expert_size);
+                        ggml_backend_tensor_get(g.banks[ip], back.data(), (size_t) g.n_slots*expert_size, n*expert_size);
+                        for (size_t j = 0; j < n; ++j) {
+                            jit_st.checked++;
+                            if (memcmp(back.data() + j*expert_size, (const uint8_t *) w->data + jit_pick[j]*expert_size, expert_size) != 0) {
+                                if (jit_st.bad_data++ < 8) {
+                                    LLAMA_LOG_WARN("%s: layer %d, expert %d, %s: slot %d differs from the host expert\n",
+                                        __func__, il, jit_pick[j], ggml_get_name(w), g.n_slots + (int32_t) j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (jit_check) {
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    const bool cpu = jmiss[e] >= 0;
+                    const bool dev = jhit[e] >= 0;
+                    const bool ok = cpu != dev && (jmiss[e] < 0 || jmiss[e] == e) && (!dev || (jhit[e] == e && jslot[e] >= 0 && jslot[e] < g.n_slots + g.n_jit)) &&
+                        (dev || jslot[e] < 0);
+                    if (!ok && jit_st.bad_maps++ < 8) {
+                        LLAMA_LOG_WARN("%s: layer %d, expert %d: miss %d, slot %d, hit %d (resident slot %d)\n",
+                            __func__, il, e, jmiss[e], jslot[e], jhit[e], l.slot_of[e]);
+                    }
+                }
             }
             jit_st.layers++;
             const int64_t t_end_us = ggml_time_us();
@@ -2583,6 +2623,10 @@ struct llama_moe_cache::impl {
                 jit_min, jit_st.uploaded, jit_st.layers, (double) jit_st.uploaded/jit_st.layers, jit_st.capped,
                 spare_large.misses > 0 ? 100.0*jit_st.moved/spare_large.misses : 0.0, jit_st.bytes/1024.0/1024.0,
                 jit_st.t_us/1000.0/jit_st.layers, jit_st.t_sync_us/1000.0/jit_st.layers, jit_st.t_copy_us/1000.0/jit_st.layers);
+            if (jit_check) {
+                LLAMA_LOG_INFO("llama_moe_cache: hot spare, ubatch  > 32: --moe-cache-jit check%s: %zu uploads read back, %zu differ; %zu bad map entries\n",
+                    jit_resident ? " (resident experts moved)" : "", jit_st.checked, jit_st.bad_data, jit_st.bad_maps);
+            }
         }
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "
