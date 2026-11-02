@@ -69,6 +69,39 @@ prompt and generation speed of each turn and the accepted drafts with speculativ
 python3 session-bench.py --url localhost:8080 --file src/llama-graph.cpp --chars 30000 --max-tokens 1024 --output session.json
 ```
 
+## Logits against batch size
+
+`llama-moe-logit-drift` checks that a change gives the same output up to rounding. It generates a greedy answer to `-p`
+or `-f` in batches of one token: its positions and their logits are the base. Each round then clears the memory and reads
+the same positions again in batches of N tokens, as a verification batch whose drafts all stand, and compares the logits
+with the base. It prints, for each round:
+
+- the flips: positions whose top token changed;
+- the mean KL divergence from the base;
+- the change of the top token's margin over the second: median, 90th percentile, largest;
+- the median time per batch.
+
+```bash
+LLAMA_DRIFT_ROUNDS=64,128,256,1 LLAMA_DRIFT_SAVE=base.bin llama-moe-logit-drift -m model.gguf <placement and cache flags> \
+    -n 384 -p "Write a C++ function that parses a CSV line with quoted fields."
+LLAMA_DRIFT_ROUNDS=64,128,256,1 LLAMA_DRIFT_BASE=base.bin llama-moe-logit-drift -m model.gguf <the changed flags> \
+    -p "Write a C++ function that parses a CSV line with quoted fields."
+```
+
+The rounds differ from the base only by rounding: different batch sizes pick different kernels, and the hot spare's GPU
+rounds differently from the CPU. With the cache on Flash-Next Q4_K_XL, rounds of 64-256 tokens were at a mean KL of about
+0.0011 and 3-6 flips in 384 positions, rounds of 1 at 0.0003. A bug shows as a jump: an upload of the wrong slots
+gave 0.015-1.1.
+
+| Variable | Effect |
+| --- | --- |
+| `LLAMA_DRIFT_ROUNDS` | the rounds, comma separated (default `1,2,3,4,8,9,1`): `N` is batches of N tokens; `rN` keeps 1 to N tokens of each batch (a fixed sequence) and fills the rest with wrong tokens, removed before the next batch, as a verification with rejected drafts |
+| `LLAMA_DRIFT_SAVE=FILE` | write the base to this file |
+| `LLAMA_DRIFT_BASE=FILE` | read the base instead of generating it, to compare another placement or cache setting on the same positions; its tokens are read again in batches of 1 before the rounds, as a generation, since the cache keeps larger batches only after 64 generated tokens |
+| `LLAMA_DRIFT_RS=N` | allocate the recurrent-state snapshots of an MTP draft with `--spec-draft-n-max N`, as a server does |
+| `LLAMA_DRIFT_PROMPT=S` | only time a prompt: up to 1024 tokens of `-f` in one batch, 96 tokens in batches of 3 as a generation, then the rest in batches of S tokens with only the last one output; prints the median time per batch |
+| `LLAMA_DRIFT_PROMPT_BATCHES=N` | with `LLAMA_DRIFT_PROMPT`, at most N batches of S tokens (default 64) |
+
 ## Tuning a machine
 
 `moe-cache-tune.py` finds the best cache settings for your machine and model, and writes a file you can share. The best settings depend on the hardware: on an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, the predictor without the refill won on Flash-Next, budget 10 was best on Q4 and 5 on Q6, and 3 drafts lost to 2 ([results](../../docs/moe-predictor.md#live-on-the-r9700)). A newer CPU or a faster link can change all of that.
