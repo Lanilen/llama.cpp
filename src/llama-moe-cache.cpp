@@ -513,7 +513,9 @@ struct llama_moe_cache::impl {
         ggml_tensor * jit_miss = nullptr;
         ggml_tensor * jit_slot = nullptr;
         ggml_tensor * jit_hit  = nullptr;
-        bool jit_second = false; // the next copy of a map is the second of the layer's run
+        int64_t jit_ubatch = -1; // the ubatch whose run of the layer filled the jit maps
+        int32_t jit_copies = 0;  // copies of the jit maps in that run
+        bool    jit_toggle = false; // the old pairing of the copies, a toggle, for the check
     };
 
     // --moe-cache-jit statistics
@@ -529,6 +531,8 @@ struct llama_moe_cache::impl {
         size_t  checked   = 0; // LLAMA_MOE_CACHE_JIT_CHECK: experts read back
         size_t  bad_data  = 0; //   whose slot differs from the host expert
         size_t  bad_maps  = 0; //   map entries that run an expert in neither or both branches, or point past the slots
+        size_t  copies[4] = {}; // layer runs by their copies of the jit maps: 0 (unused), 1, 2, 3 or more
+        size_t  toggle_off = 0; // copies the old toggle paired wrongly
     };
 
     // hot spare mode statistics
@@ -632,6 +636,7 @@ struct llama_moe_cache::impl {
     bool     jit_sync  = false; // LLAMA_MOE_CACHE_JIT_SYNC=1: wait for a layer's uploads before its cache branch, to test their ordering
     bool     jit_check = false; // LLAMA_MOE_CACHE_JIT_CHECK=1: read the uploads back and check the maps
     bool     jit_resident = false; // LLAMA_MOE_CACHE_JIT_MODE=resident: move resident experts to the jit slots instead, a test of the slots
+    int64_t  n_ubatch = 0;  // ubatches computed (before_ubatch), the jit fills the maps once per ubatch and layer
     jit_stats jit_st;
     std::unique_ptr<copy_worker> jit_worker; // copies to the staging memory while the host waits
     std::unordered_map<const ggml_tensor *, int32_t> jit_of; // device maps of large ubatches -> layer
@@ -1671,6 +1676,7 @@ struct llama_moe_cache::impl {
     // prompt computes: the copies are submitted now behind gates the installer thread opens as it fills each chunk
     // of the staging memory (each chunk waits for the uploads that last read its half)
     void before_ubatch(const llama_token * tokens, int64_t n_tokens, int64_t pos0, int gen) {
+        n_ubatch++;
         if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || !predictor || n_tokens <= 0) {
             return;
         }
@@ -2390,9 +2396,21 @@ struct llama_moe_cache::impl {
         device & d = devices[g.id];
         GGML_ASSERT(backend == d.backend);
 
-        // each run of the layer copies both maps, the first one fills them (the layers share the slots, so a layer never reuses its uploads)
-        l.jit_second = !l.jit_second;
-        if (l.jit_second) {
+        // each run of the layer copies both maps, the first one of the run fills them (the layers share the slots, so a layer
+        // never reuses its uploads); a run starts with a new ubatch, or after two copies if a ubatch computes another graph
+        const bool plan = l.jit_ubatch != n_ubatch || l.jit_copies >= 2;
+        if (plan) {
+            if (l.jit_ubatch >= 0) {
+                jit_st.copies[std::min(l.jit_copies, 3)]++;
+            }
+            l.jit_ubatch = n_ubatch;
+            l.jit_copies = 0;
+        }
+        l.jit_copies++;
+        // the old rule, a toggle per copy, for the check
+        l.jit_toggle = !l.jit_toggle;
+        jit_st.toggle_off += l.jit_toggle != plan;
+        if (plan) {
             const int64_t t_start_us = ggml_time_us();
             const int32_t n_expert = (int32_t) l.slot_of.size();
 
@@ -2627,6 +2645,8 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("llama_moe_cache: hot spare, ubatch  > 32: --moe-cache-jit check%s: %zu uploads read back, %zu differ; %zu bad map entries\n",
                     jit_resident ? " (resident experts moved)" : "", jit_st.checked, jit_st.bad_data, jit_st.bad_maps);
             }
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, ubatch  > 32: --moe-cache-jit layer runs by their map copies: 1: %zu, 2: %zu, 3+: %zu; "
+                "the old toggle paired %zu copies wrongly\n", jit_st.copies[1], jit_st.copies[2], jit_st.copies[3], jit_st.toggle_off);
         }
         if (resize) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, resize: released for large batches %zu times, %.2f MiB uploaded again, "
