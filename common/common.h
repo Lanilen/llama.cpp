@@ -614,6 +614,7 @@ struct common_params {
     std::string moe_cache_predictor;        // hot spare mode: predictor file that ranks the experts
     std::string moe_cache_predictor_device; // the device it runs on, empty = CPU
     std::string moe_cache_predictor_start;  // start predictor file: experts from the turn's text, before its prompt runs
+    int32_t moe_cache_jit = 0;              // hot spare mode: ubatches above 32 tokens upload the missing experts this many tokens select, per layer, 0 = none
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

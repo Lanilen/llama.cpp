@@ -2871,6 +2871,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_BUDGET"));
     add_opt(common_arg(
+        {"--moe-cache-jit"}, "N",
+        string_format("hot spare mode: in batches above 32 tokens (they do not swap), each layer uploads the experts that at least N of its tokens "
+            "select and are not resident, just before it runs, so the GPU runs them instead of the CPU; up to LLAMA_MOE_CACHE_JIT_SLOTS (64) "
+            "a layer, taken from the cache's slots (default: %d, 0 = off)", params.moe_cache_jit),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_jit = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_JIT"));
+    add_opt(common_arg(
         {"--moe-cache-save"}, "FNAME",
         "hot spare mode: write the resident experts to this file at exit, to start the next run from them with --moe-cache-hot",
         [](common_params & params, const std::string & value) {
