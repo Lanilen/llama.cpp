@@ -176,6 +176,9 @@ instead of 86.5% (2026-11-03). The same setup runs UD-Q6_K_XL.
   that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are back in the lab.
 - **Longer MTP drafts behind a gate,** on the usual requests and on real agent turns, where more of the text is copied
   from the context.
+- **The shared expert beside the MoE** (on `moe-predictor`, `LLAMA_MOE_SIDE=0` turns it off): Flash-Next's shared
+  expert now runs on the GPU while the CPU computes the missed experts, instead of after them; profiling put it at 4-5 ms
+  of a 62 ms verify pass. Logits should not change. Not yet run on a GPU.
 - **`--moe-cache-jit` on the RX 480s** (PCIe x8, slower uploads, probably a higher N), and a stage of
   `moe-cache-tune.py` that picks N, or leaves it off, for a machine.
 
