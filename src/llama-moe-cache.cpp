@@ -626,6 +626,7 @@ struct llama_moe_cache::impl {
     // many of its tokens select into slots of its own, when its cache branch starts (the copy callback of its maps)
     int32_t  jit_min   = 0;  // tokens an expert needs, 0 = off
     int32_t  jit_slots = 0;  // LLAMA_MOE_CACHE_JIT_SLOTS: slots of each group, the most a layer uploads
+    bool     jit_sync  = false; // LLAMA_MOE_CACHE_JIT_SYNC=1: wait for a layer's uploads before its cache branch, to test their ordering
     jit_stats jit_st;
     std::unique_ptr<copy_worker> jit_worker; // copies to the staging memory while the host waits
     std::unordered_map<const ggml_tensor *, int32_t> jit_of; // device maps of large ubatches -> layer
@@ -661,6 +662,7 @@ struct llama_moe_cache::impl {
             // the slots count with no_alloc too, for the memory breakdown
             jit_min   = params.jit;
             jit_slots = getenv("LLAMA_MOE_CACHE_JIT_SLOTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_JIT_SLOTS"))) : 64;
+            jit_sync  = getenv("LLAMA_MOE_CACHE_JIT_SYNC") && atoi(getenv("LLAMA_MOE_CACHE_JIT_SYNC")) != 0;
         } else if (params.jit > 0) {
             LLAMA_LOG_WARN("%s: --moe-cache-jit needs --moe-cache-mode hot-spare, ignored\n", __func__);
         }
@@ -2447,6 +2449,9 @@ struct llama_moe_cache::impl {
                     ggml_backend_tensor_set_async(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size);
                     staging += n*expert_size;
                     jit_st.bytes += n*expert_size;
+                }
+                if (jit_sync) {
+                    ggml_backend_synchronize(backend);
                 }
                 for (size_t j = 0; j < n; ++j) {
                     const int32_t e = jit_pick[j];
