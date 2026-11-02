@@ -7,7 +7,9 @@
 //                     fixed sequence with the rest wrong tokens that are removed before the next batch
 // LLAMA_DRIFT_RS      recurrent-state snapshots to allocate, what --spec-draft-n-max gives a server with a draft-mtp head
 // LLAMA_DRIFT_SAVE    write the base to this file
-// LLAMA_DRIFT_BASE    read the base from this file instead of generating it: compares another placement or cache state
+// LLAMA_DRIFT_BASE    read the base from this file instead of generating it: compares another placement or cache state; its
+//                     tokens are read again in batches of 1 before the rounds, as a generation (the cache keeps larger
+//                     batches only after 64 of them)
 // LLAMA_DRIFT_PROMPT  S: only time a prompt's batches: up to 1024 tokens in one batch, 96 tokens as a generation in batches of 3 (the cache keeps larger batches only after 64
 //                     of them), then the rest of -f in batches of S tokens with only the last one output, at most LLAMA_DRIFT_PROMPT_BATCHES (default 64) of them
 
@@ -219,6 +221,18 @@ int main(int argc, char ** argv) {
         if (!base_load(base, base_path) || base.n_vocab != n_vocab) {
             LOG_ERR("%s: can't read a base for this model from %s\n", __func__, base_path);
             return 1;
+        }
+        if (!run.start()) {
+            LOG_ERR("%s: decode failed\n", __func__);
+            return 1;
+        }
+        for (int i = 0; i < (int) base.tokens.size(); ++i) {
+            batch.clear();
+            batch.add(base.tokens[i], (llama_pos) prompt.size() + i, 0, true);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                LOG_ERR("%s: decode failed\n", __func__);
+                return 1;
+            }
         }
     } else {
         base.n_vocab = n_vocab;
