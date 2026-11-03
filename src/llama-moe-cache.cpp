@@ -615,7 +615,7 @@ struct llama_moe_cache::impl {
     int32_t n_embd = 0;
     size_t  start_swaps = 1600;  // LLAMA_MOE_PREDICTOR_START_SWAPS: experts the text start uploads at most
     size_t  topup_swaps = 1000;  // LLAMA_MOE_PREDICTOR_TOPUP: swaps of the answer's start after a text start
-    size_t  answer_cap  = 0;     // LLAMA_MOE_PREDICTOR_ANSWER_CAP: swaps of the answer's start without one (0: all)
+    size_t  answer_cap  = 0;     // --moe-cache-predictor-answer-cap: swaps of the answer's start without one (0: all)
     bool    turn_seen   = false; // the turn's first prompt ubatch came (the text start ran or was skipped)
     bool    text_started = false; // the text start ran for this turn
     size_t  full_left   = SIZE_MAX; // swaps left to the running full rebalance
@@ -704,7 +704,11 @@ struct llama_moe_cache::impl {
                 hidden_layers = predictor->hidden_layers();
                 hidden.assign(hidden_layers.size(), std::vector<float>(model.hparams.n_embd, 0.0f));
                 hidden_prompt = hidden;
-                if (const char * env = getenv("LLAMA_MOE_PREDICTOR_ANSWER_CAP")) { answer_cap = (size_t) std::max(0, atoi(env)); }
+                if (params.answer_cap >= 0) {
+                    answer_cap = (size_t) params.answer_cap;
+                } else if (const char * env = getenv("LLAMA_MOE_PREDICTOR_ANSWER_CAP")) {
+                    answer_cap = (size_t) std::max(0, atoi(env));
+                }
                 if (!params.predictor_start.empty()) {
                     predictor_start = llama_moe_predictor::load(params.predictor_start, params.predictor_device, (int32_t) model.hparams.n_layer(),
                                                                 (int32_t) model.hparams.n_expert, (int32_t) model.hparams.n_embd);
@@ -2073,7 +2077,7 @@ struct llama_moe_cache::impl {
         if (gen && !in_answer) {
             // an answer starts: predict from the context's maps and the input of the prompt's last token; after a
             // text start, only the best of the prediction's swaps are made (and without one, with
-            // LLAMA_MOE_PREDICTOR_ANSWER_CAP)
+            // --moe-cache-predictor-answer-cap)
             in_answer = true;
             t_answer  = 0;
             next_pred = predictor->every();

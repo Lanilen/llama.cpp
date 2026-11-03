@@ -22,6 +22,7 @@ struct llama_moe_cache_params {
     std::string predictor;        // hot spare mode: predictor file (see llama-moe-predictor.h), empty = none
     std::string predictor_device; // the device it runs on, empty = CPU
     std::string predictor_start;  // hot spare mode with a predictor: start predictor file (role start), empty = none
+    int32_t answer_cap = -1;      // without a start predictor: most swaps at an answer's start, 0 = all, < 0 = LLAMA_MOE_PREDICTOR_ANSWER_CAP or 0
     int32_t jit = 0; // hot spare mode: in ubatches above 32 tokens, each layer uploads the experts that at least this many of its tokens select and are not resident, before it runs, 0 = none
 
     // hot spare mode: refresh of the resident experts between ubatches

@@ -417,6 +417,7 @@ extern "C" {
         const char * moe_cache_predictor;        // hot spare mode: predictor file that ranks the experts, nullptr = none [EXPERIMENTAL]
         const char * moe_cache_predictor_device; // the device the predictor runs on, nullptr = CPU [EXPERIMENTAL]
         const char * moe_cache_predictor_start;  // hot spare mode with a predictor: start predictor file (from the turn's text), nullptr = none [EXPERIMENTAL]
+        int32_t moe_cache_predictor_answer_cap;  // hot spare mode with a predictor and no start predictor: most swaps at an answer's start, 0 = all, < 0 = LLAMA_MOE_PREDICTOR_ANSWER_CAP or 0 [EXPERIMENTAL]
         int32_t moe_cache_jit;         // hot spare mode: in ubatches above 32 tokens, each layer uploads the non-resident experts that at least this many tokens select, before it runs, 0 = none [EXPERIMENTAL]
 
         // Abort callback

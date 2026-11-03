@@ -102,6 +102,12 @@ The text start uploads at most 1600 experts (`LLAMA_MOE_PREDICTOR_START_SWAPS`).
 the main predictor's set as before. Offline, on Flash-Next's held-out conversations, after short turns: 85.7% of the
 selections hit with 4.9 uploads per generated token, against 86.1% with 13.7 for the main predictor alone.
 
+**Capping the answer's start: `--moe-cache-predictor-answer-cap N`.** Without a text start, the answer's start rebalances
+in full from the main predictor (0, the default). With N it makes at most the N best of those swaps, and the budgeted
+refresh does the rest. On perseus (Flash-Next Q4 and Q6, 2026-11-04) 1000 sped agent turns up by 8–12% and cost the
+usual answers up to 2.6%, because the uploads of a full rebalance cost more than the point of hits it buys. The flag
+overrides `LLAMA_MOE_PREDICTOR_ANSWER_CAP`.
+
 ### The two branches at the same time
 
 On its own, the scheduler would run the cache branch together with the layer's attention, and the CPU's input copy would
@@ -322,7 +328,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
 | `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
 | `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
-| `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them), to compare |
+| `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them); `--moe-cache-predictor-answer-cap` overrides it |
 | `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_CACHE_JIT_SLOTS=N` | `--moe-cache-jit`: the most experts a layer uploads, and the slots each group takes from the cache (default 64) |
