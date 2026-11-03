@@ -198,6 +198,20 @@ echo 5 | sudo tee /sys/bus/pci/devices/0000:45:00.0/pp_power_profile_mode
 survives the card's runtime suspend (checked 2026-11-04). The `high`
 performance level is not the same thing: it gained 10% on one Q4 pass and nothing on the others.
 
+Things that went wrong on perseus (2026-11-04, kernel 7.0.0-42):
+- **Keep the card awake while a model is loaded.** An idle server lost to the out-of-memory killer when the card
+  runtime-suspended: the driver moves VRAM into system memory first (~22 GB here), and the server had 106 GB of the
+  model pinned. `power/control` = `on` stops it; a udev rule on the PCI device doesn't hold (the driver turns runtime
+  PM back on when it binds), one on the DRM card does:
+  `ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{vendor}=="0x1002", ATTRS{device}=="0x7551", ATTR{device/power/control}="on"`.
+- **After that failed suspend, COMPUTE read back but stopped boosting** (1.6–1.7 GHz, Q4 answers 34–36 tok/s), and a
+  reboot didn't fix it. Powering off did.
+- **Don't set the profile from udev at boot.** With `manual` and 5 written as the card came up, its power firmware
+  hung on the next level change (`SMU: No response`, `Failed to disable UCLK DS!` in the kernel log), which leaves
+  clocks and the fan uncontrolled until the next power-off. Set it by hand after boot.
+- After a clean power-off with only the keep-awake rule, COMPUTE boosts again (2.67 GHz averaged while awake, mostly
+  2.75–3.0; Q4 answers 39.07 tok/s).
+
 Holding the clock higher doesn't pay. A second process that keeps one sleeping wave on the GPU, like the wait kernels in
 Strata, kept the card 100% busy at about 3.28 GHz. That's higher than Strata's own 3.03–3.09 GHz, at the same 1258 MHz
 memory clock. Against COMPUTE alone, Q4 answers gained 1.3% and Q6 nothing, while prompts lost 16–17% and whole runs took
