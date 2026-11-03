@@ -118,6 +118,21 @@ in the split that waits for the CPU, about 4-5 ms of a 62 ms verify pass. They j
 cache's device; otherwise, and without the hot spare, they are computed where they are first used, as before. The kernels
 and their inputs don't change, so neither do the logits (`LLAMA_MOE_SIDE=0` turns it off, to compare).
 
+On the R9700 with the setup in [FORK.md](../FORK.md) (`llama-server`, MTP with 2 drafts, temperature 0, four runs each,
+2026-11-03), a pass of the model took 3.2 ms less with both quants:
+
+| | answers | agent turns | a pass of the model |
+| --- | --- | --- | --- |
+| Q4_K_XL, `LLAMA_MOE_SIDE=0` | 32.88 ± 0.38 tok/s | 28.67 tok/s | 61.8 ms |
+| Q4_K_XL, beside the MoE | 34.40 ± 0.24 tok/s (+4.6%) | 29.63 tok/s (+3.4%) | 58.6 ms |
+| Q6_K_XL, `LLAMA_MOE_SIDE=0` | 27.06 ± 0.48 tok/s | 24.22 tok/s | 75.9 ms |
+| Q6_K_XL, beside the MoE | 28.01 ± 0.11 tok/s (+3.5%) | 25.17 tok/s (+3.9%) | 72.7 ms |
+
+In a single-token verify, the CPU's wait for the GPU fell from 11.9 to 8.7 ms (Q4). Q4 wrote the same text in all eight
+runs. Q6 matched across all eight in 7 of 18 requests; with the background refill, its runs vary with it off too. With the refill in the foreground, so that a run repeats exactly, Q6's positions read again in batches of 1, 3, 8
+and 64 tokens gave the same flips and the same KL in batches of 1 and 3. In batches of 8 and 64 the KL differed in the
+fourth digit, as the background expert uploads landed at other times (635 against 637).
+
 ### Faster copies to the CPU
 
 Every split that runs on the CPU first reads its inputs from the GPUs. These reads were synchronous, a submission and a

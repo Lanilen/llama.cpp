@@ -170,15 +170,17 @@ The draft head's experts are on the GPU (no `-cmoed`), with the cache smaller by
 23500 MiB, usual answers ran at 32.6 tok/s instead of 31.5 and agent turns at 28.6 instead of 27.9, with 83.6% hits
 instead of 86.5% (2026-11-03). The same setup runs UD-Q6_K_XL.
 
+Flash-Next's shared expert now runs on the GPU while the CPU computes the missed experts, instead of after them
+(`LLAMA_MOE_SIDE=0` turns it off). That's 3.2 ms off each pass. With the setup above, answers went from 32.9 to
+34.4 tok/s on Q4 (+4.6%) and from 27.1 to 28.0 on Q6 (+3.5%), and agent turns gained about 1 tok/s on both
+([docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-two-branches-at-the-same-time)).
+
 ## Still to measure
 
 - **The RX 480 tables above** used UD-IQ4_XS and predate the predictor. They'll be run again with it (after checking
   that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are back in the lab.
 - **Longer MTP drafts behind a gate,** on the usual requests and on real agent turns, where more of the text is copied
   from the context.
-- **The shared expert beside the MoE** (on `moe-predictor`, `LLAMA_MOE_SIDE=0` turns it off): Flash-Next's shared
-  expert now runs on the GPU while the CPU computes the missed experts, instead of after them; profiling put it at 4-5 ms
-  of a 62 ms verify pass. Logits should not change. Not yet run on a GPU.
 - **`--moe-cache-jit` on the RX 480s** (PCIe x8, slower uploads, probably a higher N), and a stage of
   `moe-cache-tune.py` that picks N, or leaves it off, for a machine.
 
