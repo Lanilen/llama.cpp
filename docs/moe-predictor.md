@@ -204,7 +204,9 @@ The two passes of a configuration differ by about 0.2 tok/s.
   q2k) still gain from it. These runs came after two Strata servers had sat loaded and idle for hours (a test-queue bug: they never got the
   signal to stop). The R9700 read back COMPUTE, yet the
   full rebalance's pass took 58.6 ms to process, against 53.1 on COMPUTE and 61.3 on the default profile, at the same
-  hits. Its clock was lower than COMPUTE's for an unknown reason, the same for every arm.
+  hits. Its clock was lower than COMPUTE's for an unknown reason, the same for every arm. Strata's runs themselves
+  leave nothing behind: on 2026-11-04 the same Q4 pass took 53.59 ms to process before 70 minutes of Strata runs and
+  53.44 ms after them (`~/traces/fn-strata-rerun`).
 - **A third draft is slower,** by 0.4–1.3 tok/s; on Q6 the short answers lose over 4.
 - **Fewer copy threads don't help:** 2 instead of 4 changed nothing on Q6 and cost 0.3 tok/s on Q4.
 
