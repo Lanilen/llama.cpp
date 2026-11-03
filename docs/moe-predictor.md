@@ -201,8 +201,9 @@ The two passes of a configuration differ by about 0.2 tok/s.
   Cap 1000 sped up 9 of 10 agent turns on Q4 and all 10 on Q6. Its prompts and whole-run times matched the full
   rebalance's, while the text start's prompts were 4% slower and its run took 10 s longer. The full rebalance buys about
   a point of hits, and the uploads behind it cost more than that point saves. Only the long, new-topic answers (the story,
-  q2k) still gain from it. The R9700's power profile on this night is uncertain (see FORK.md), but all of these arms ran
-  in the same state.
+  q2k) still gain from it. These runs came after two Strata engines hung on exit. The R9700 read back COMPUTE, yet the
+  full rebalance's pass took 58.6 ms to process, against 53.1 on COMPUTE and 61.3 on the default profile, at the same
+  hits. Its clock was lower than COMPUTE's for an unknown reason, the same for every arm.
 - **A third draft is slower,** by 0.4–1.3 tok/s; on Q6 the short answers lose over 4.
 - **Fewer copy threads don't help:** 2 instead of 4 changed nothing on Q6 and cost 0.3 tok/s on Q4.
 
