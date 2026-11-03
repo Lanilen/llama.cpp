@@ -615,6 +615,7 @@ struct llama_moe_cache::impl {
     int32_t n_embd = 0;
     size_t  start_swaps = 1600;  // LLAMA_MOE_PREDICTOR_START_SWAPS: experts the text start uploads at most
     size_t  topup_swaps = 1000;  // LLAMA_MOE_PREDICTOR_TOPUP: swaps of the answer's start after a text start
+    size_t  answer_cap  = 0;     // LLAMA_MOE_PREDICTOR_ANSWER_CAP: swaps of the answer's start without one (0: all)
     bool    turn_seen   = false; // the turn's first prompt ubatch came (the text start ran or was skipped)
     bool    text_started = false; // the text start ran for this turn
     size_t  full_left   = SIZE_MAX; // swaps left to the running full rebalance
@@ -703,6 +704,7 @@ struct llama_moe_cache::impl {
                 hidden_layers = predictor->hidden_layers();
                 hidden.assign(hidden_layers.size(), std::vector<float>(model.hparams.n_embd, 0.0f));
                 hidden_prompt = hidden;
+                if (const char * env = getenv("LLAMA_MOE_PREDICTOR_ANSWER_CAP")) { answer_cap = (size_t) std::max(0, atoi(env)); }
                 if (!params.predictor_start.empty()) {
                     predictor_start = llama_moe_predictor::load(params.predictor_start, params.predictor_device, (int32_t) model.hparams.n_layer(),
                                                                 (int32_t) model.hparams.n_expert, (int32_t) model.hparams.n_embd);
@@ -2070,13 +2072,14 @@ struct llama_moe_cache::impl {
         }
         if (gen && !in_answer) {
             // an answer starts: predict from the context's maps and the input of the prompt's last token; after a
-            // text start, only the best of the prediction's swaps are made
+            // text start, only the best of the prediction's swaps are made (and without one, with
+            // LLAMA_MOE_PREDICTOR_ANSWER_CAP)
             in_answer = true;
             t_answer  = 0;
             next_pred = predictor->every();
             if (have_prompt_hidden && predict(0, hidden_prompt)) {
                 pred_start = true;
-                full_cap   = text_started ? topup_swaps : SIZE_MAX;
+                full_cap   = text_started ? topup_swaps : answer_cap > 0 ? answer_cap : SIZE_MAX;
             }
             turn_seen    = false;
             text_started = false;
@@ -2715,8 +2718,9 @@ struct llama_moe_cache::impl {
                     - spare_restore.t_sync_us)/1000.0/n_restores : 0.0);
         }
         if (predictor) {
-            LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu predictions, %.2f ms each\n",
-                n_pred, n_pred > 0 ? t_pred_us/1000.0/n_pred : 0.0);
+            LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu predictions, %.2f ms each%s\n",
+                n_pred, n_pred > 0 ? t_pred_us/1000.0/n_pred : 0.0,
+                answer_cap > 0 ? format(" (an answer's start without a text start: at most %zu swaps)", answer_cap).c_str() : "");
         }
         if (predictor_start) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, text starts: %zu, %.0f swaps each, %.2f ms each on the generation thread "
