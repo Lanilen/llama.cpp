@@ -197,6 +197,11 @@ echo 5 | sudo tee /sys/bus/pci/devices/0000:45:00.0/pp_power_profile_mode
 (Use your card's PCI address; `pp_power_profile_mode` lists the profiles, and 5 is COMPUTE on this card.) The `high`
 performance level is not the same thing: it gained 10% on one Q4 pass and nothing on the others.
 
+Holding the clock higher doesn't pay. A second process that keeps one sleeping wave on the GPU, like the wait kernels in
+Strata, kept the card 100% busy at about 3.28 GHz. That's higher than Strata's own 3.03–3.09 GHz, at the same 1258 MHz
+memory clock. Against COMPUTE alone, Q4 answers gained 1.3% and Q6 nothing, while prompts lost 16–17% and whole runs took
+7–8% longer (two passes each).
+
 ## Still to measure
 
 - **The RX 480 tables above** used UD-IQ4_XS and predate the predictor. They'll be run again with it (after checking
