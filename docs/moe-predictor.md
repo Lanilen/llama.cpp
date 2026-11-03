@@ -185,6 +185,24 @@ The two passes of a configuration differ by about 0.2 tok/s.
   Using the text start only for prompts of 64 tokens or more would have given +1.8% (Q4) and +1.4% (Q6), from these
   runs' per-request numbers, but the run would still take 3–5 s longer. About 4 GiB of uploads (1375 experts on Q4)
   take about 0.3 s on the R9700's PCIe 3.0 x16 link. That's more than a short prompt takes, so the answer starts later.
+- **Capping the answer's start does better than the text start** (fn-cap, 2026-11-04, two passes each). Without a text
+  start, the answer's start normally rebalances the whole cache from the main predictor. `LLAMA_MOE_PREDICTOR_ANSWER_CAP`
+  limits that rebalance to N swaps:
+
+  | | usual answers | follow-up turns | agent turns | hits | MiB/token |
+  |---|---|---|---|---|---|
+  | Q4, full rebalance | 36.07 | 37.27 | 30.81 | 83.17% | 40.8 |
+  | Q4, cap 300 | 34.03 (−5.7%) | 35.93 | 35.36 (+14.8%) | 79.12% | 14.1 |
+  | Q4, cap 1000 | 35.13 (−2.6%) | 37.24 | 34.41 (+11.7%) | 82.25% | 22.7 |
+  | Q4, text start | 34.88 (−3.3%) | 35.52 | 33.36 (+8.3%) | 82.47% | 24.6 |
+  | Q6, full rebalance | 29.28 | 28.65 | 26.28 | 72.39% | 51.2 |
+  | Q6, cap 1000 | 29.06 (−0.8%) | 29.70 (+3.7%) | 28.42 (+8.1%) | 71.33% | 28.7 |
+
+  Cap 1000 sped up 9 of 10 agent turns on Q4 and all 10 on Q6. Its prompts and whole-run times matched the full
+  rebalance's, while the text start's prompts were 4% slower and its run took 10 s longer. The full rebalance buys about
+  a point of hits, and the uploads behind it cost more than that point saves. Only the long, new-topic answers (the story,
+  q2k) still gain from it. The R9700's power profile on this night is uncertain (see FORK.md), but all of these arms ran
+  in the same state.
 - **A third draft is slower,** by 0.4–1.3 tok/s; on Q6 the short answers lose over 4.
 - **Fewer copy threads don't help:** 2 instead of 4 changed nothing on Q6 and cost 0.3 tok/s on Q4.
 

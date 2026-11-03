@@ -194,7 +194,10 @@ echo manual | sudo tee /sys/bus/pci/devices/0000:45:00.0/power_dpm_force_perform
 echo 5 | sudo tee /sys/bus/pci/devices/0000:45:00.0/pp_power_profile_mode
 ```
 
-(Use your card's PCI address; `pp_power_profile_mode` lists the profiles, and 5 is COMPUTE on this card.) The `high`
+(Use your card's PCI address; `pp_power_profile_mode` lists the profiles, and 5 is COMPUTE on this card.) The setting
+may not survive the card's runtime suspend, after 5 s idle with power control `auto`. On 2026-11-04 a queue set it a few
+seconds before each step, and Q4 then ran at 36.1 tok/s instead of 39.6, with the same hits and uploads. That isn't
+confirmed directly yet. The `high`
 performance level is not the same thing: it gained 10% on one Q4 pass and nothing on the others.
 
 Holding the clock higher doesn't pay. A second process that keeps one sleeping wave on the GPU, like the wait kernels in
