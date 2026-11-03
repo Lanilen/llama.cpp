@@ -175,6 +175,28 @@ Flash-Next's shared expert now runs on the GPU while the CPU computes the missed
 34.4 tok/s on Q4 (+4.6%) and from 27.1 to 28.0 on Q6 (+3.5%), and agent turns gained about 1 tok/s on both
 ([docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-two-branches-at-the-same-time)).
 
+**Set the R9700's power profile to COMPUTE.** With the hot spare, the GPU works in bursts and waits for the CPU's experts
+in between, about a third of the time. The default profile then clocks it down, to about 1.55 GHz while it's awake. The
+COMPUTE profile keeps it near 2.55 GHz. Same text, same hits and same uploads; only the clock changes (two passes each,
+2026-11-04):
+
+| | answers | agent turns | whole run | GPU clock | power |
+|---|---|---|---|---|---|
+| Q4, default profile | 34.55 tok/s | 29.82 tok/s | 284.9 s | 1568 MHz | 68 W |
+| Q4, COMPUTE | 39.63 tok/s (+14.7%) | 32.59 tok/s (+9.3%) | 255.1 s | 2545 MHz | 109 W |
+| Q6, default profile | 28.06 tok/s | 25.36 tok/s | 347.9 s | 1536 MHz | 65 W |
+| Q6, COMPUTE | 31.47 tok/s (+12.2%) | 27.00 tok/s (+6.5%) | 316.2 s | 2617 MHz | 101 W |
+
+The profile needs root, and it resets at reboot:
+
+```bash
+echo manual | sudo tee /sys/bus/pci/devices/0000:45:00.0/power_dpm_force_performance_level
+echo 5 | sudo tee /sys/bus/pci/devices/0000:45:00.0/pp_power_profile_mode
+```
+
+(Use your card's PCI address; `pp_power_profile_mode` lists the profiles, and 5 is COMPUTE on this card.) The `high`
+performance level is not the same thing: it gained 10% on one Q4 pass and nothing on the others.
+
 ## Still to measure
 
 - **The RX 480 tables above** used UD-IQ4_XS and predate the predictor. They'll be run again with it (after checking
