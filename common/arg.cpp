@@ -2913,6 +2913,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_START"));
     add_opt(common_arg(
+        {"--moe-cache-predictor-answer-cap"}, "N",
+        "with --moe-cache-predictor and no start predictor: the most swaps the rebalance at an answer's start makes, "
+        "0 = all of them (default: LLAMA_MOE_PREDICTOR_ANSWER_CAP, else 0)",
+        [](common_params & params, int value) {
+            params.moe_cache_predictor_answer_cap = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_CAP"));
+    add_opt(common_arg(
         {"--moe-cache-refill"}, "N",
         "hot spare mode: after a prompt, rebalance the resident experts once from the selections of the first N generated tokens, 0 = never (default: 128, or 0 with --moe-cache-predictor)",
         [](common_params & params, int value) {
