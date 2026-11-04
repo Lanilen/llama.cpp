@@ -3117,6 +3117,115 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// GGML_CPU_OP_STATS=1: per batch size (the token count of the graph's first MUL_MAT_ID; graphs without one are not
+// counted) and op, the op's wall time as thread 0 sees it (its barrier included), its threads' own work, and for
+// MUL_MAT_ID the distinct experts it computes and the bytes of their weights; a table on stderr at exit
+#define GGML_CPU_OPS_KEYS 17   // batches of 1..16 tokens, then 17 or more
+struct ggml_cpu_op_stat {
+    uint64_t calls, threads, wall, work_max, work_sum, experts, bytes;
+};
+static struct {
+    int     on;         // -1: not read yet
+    int     key;        // the current graph's batch size key, -1: not counted
+    int64_t t_call;     // when the current graph was handed to the threads
+    uint64_t graphs[GGML_CPU_OPS_KEYS], graph_wall[GGML_CPU_OPS_KEYS], wake[GGML_CPU_OPS_KEYS];
+    struct ggml_cpu_op_stat op[GGML_CPU_OPS_KEYS][GGML_OP_COUNT];
+    int64_t start[2][GGML_MAX_N_THREADS], work[2][GGML_MAX_N_THREADS];   // by node parity, so a node's values survive
+    uint8_t seen[1 << 14];                                               // until thread 0 reads them after the barrier
+} g_cpu_ops = { -1 };
+
+static void ggml_cpu_op_stats_print(void) {
+    for (int k = 0; k < GGML_CPU_OPS_KEYS; ++k) {
+        const uint64_t g = g_cpu_ops.graphs[k];
+        if (g == 0) {
+            continue;
+        }
+        fprintf(stderr, "cpu op stats, batches of %d%s tokens: %" PRIu64 " graphs, %.1f us a graph, of which %.1f us before the threads start\n",
+                k + 1, k + 1 == GGML_CPU_OPS_KEYS ? "+" : "", g, (double) g_cpu_ops.graph_wall[k] / g, (double) g_cpu_ops.wake[k] / g);
+        fprintf(stderr, "  %-14s %6s %9s %9s %9s %9s | %8s %8s %8s %8s\n", "op (us a graph)", "calls", "wall", "work max",
+                "work mean", "wait", "experts", "MiB", "GB/s wall", "GB/s max");
+        for (int o = 0; o < GGML_OP_COUNT; ++o) {
+            const struct ggml_cpu_op_stat * st = &g_cpu_ops.op[k][o];
+            if (st->calls == 0) {
+                continue;
+            }
+            const double nth = (double) st->threads / st->calls;
+            fprintf(stderr, "  %-14s %6.1f %9.1f %9.1f %9.1f %9.1f", ggml_op_name((enum ggml_op) o), (double) st->calls / g,
+                    (double) st->wall / g, (double) st->work_max / g, (double) st->work_sum / g / nth,
+                    (double) (st->wall - st->work_max) / g);
+            if (st->bytes) {
+                fprintf(stderr, " | %8.2f %8.2f %8.1f %8.1f", (double) st->experts / st->calls, (double) st->bytes / g / (1024.0*1024.0),
+                        (double) st->bytes / (st->wall ? st->wall : 1) / 1e3, (double) st->bytes / (st->work_max ? st->work_max : 1) / 1e3);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
+static bool ggml_cpu_op_stats_on(void) {
+    if (g_cpu_ops.on < 0) {
+        g_cpu_ops.on = getenv("GGML_CPU_OP_STATS") != NULL;
+        if (g_cpu_ops.on) {
+            atexit(ggml_cpu_op_stats_print);
+        }
+    }
+    return g_cpu_ops.on;
+}
+
+// the batch size key of a graph, from its first MUL_MAT_ID (ids are [n_expert_used, n_tokens]), -1 without one
+static int ggml_cpu_op_stats_key(const struct ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[2]) {
+            const int64_t n = node->src[2]->ne[1];
+            return (int) (n < GGML_CPU_OPS_KEYS ? n - 1 : GGML_CPU_OPS_KEYS - 1);
+        }
+    }
+    return -1;
+}
+
+// thread 0, before a MUL_MAT_ID: its distinct experts and their bytes
+static void ggml_cpu_op_stats_mmid(const struct ggml_tensor * node, struct ggml_cpu_op_stat * st) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * ids  = node->src[2];
+    const int64_t n_as = src0->ne[2];
+    if (ids == NULL || ids->type != GGML_TYPE_I32 || n_as > (int64_t) sizeof(g_cpu_ops.seen)) {
+        return;
+    }
+    memset(g_cpu_ops.seen, 0, n_as);
+    uint64_t n = 0;
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int64_t e = 0; e < ids->ne[0]; ++e) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + e*ids->nb[0]);
+            if (id >= 0 && id < n_as && !g_cpu_ops.seen[id]) {
+                g_cpu_ops.seen[id] = 1;
+                n++;
+            }
+        }
+    }
+    st->experts += n;
+    st->bytes   += n * src0->nb[2];
+}
+
+// thread 0, after the barrier that ends a node: every thread has written its times for it
+static void ggml_cpu_op_stats_node(const struct ggml_tensor * node, int par, int64_t t0, int nth, bool first) {
+    struct ggml_cpu_op_stat * st = &g_cpu_ops.op[g_cpu_ops.key][node->op];
+    int64_t wmax = 0, wsum = 0, smax = 0;
+    for (int t = 0; t < nth; ++t) {
+        wmax = MAX(wmax, g_cpu_ops.work[par][t]);
+        wsum += g_cpu_ops.work[par][t];
+        smax = MAX(smax, g_cpu_ops.start[par][t]);
+    }
+    st->calls++;
+    st->threads  += nth;
+    st->wall     += ggml_time_us() - t0;
+    st->work_max += wmax;
+    st->work_sum += wsum;
+    if (first) {
+        g_cpu_ops.wake[g_cpu_ops.key] += smax - g_cpu_ops.t_call;
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3145,6 +3254,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool stats = g_cpu_ops.on > 0 && g_cpu_ops.key >= 0;
+    bool first = true;
+    const struct ggml_tensor * last_node = NULL;   // the last node has no barrier in the loop: counted after the final one
+    int     last_par   = 0;
+    int64_t last_t0    = 0;
+    bool    last_first = false;
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3157,6 +3272,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const int par = node_n & 1;
+        int64_t t0 = 0;
+        if (stats) {
+            t0 = ggml_time_us();
+            g_cpu_ops.start[par][state->ith] = t0;
+            if (state->ith == 0 && node->op == GGML_OP_MUL_MAT_ID) {
+                ggml_cpu_op_stats_mmid(node, &g_cpu_ops.op[g_cpu_ops.key][node->op]);
+            }
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3164,6 +3289,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+        if (stats) {
+            g_cpu_ops.work[par][state->ith] = ggml_time_us() - t0;
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3175,6 +3303,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+        if (stats && state->ith == 0) {
+            if (node_n + 1 < cgraph->n_nodes) {
+                ggml_cpu_op_stats_node(node, par, t0, params.nth, first);
+            } else {
+                last_node = node; last_par = par; last_t0 = t0; last_first = first;
+            }
+        }
+        first = false;
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3184,6 +3320,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+    if (stats && state->ith == 0) {
+        if (last_node) {
+            ggml_cpu_op_stats_node(last_node, last_par, last_t0, params.nth, last_first);
+        }
+        g_cpu_ops.graphs[g_cpu_ops.key]++;
+        g_cpu_ops.graph_wall[g_cpu_ops.key] += ggml_time_us() - g_cpu_ops.t_call;
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -3416,6 +3559,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
+
+    if (ggml_cpu_op_stats_on()) {
+        g_cpu_ops.key    = ggml_cpu_op_stats_key(cgraph);
+        g_cpu_ops.t_call = ggml_time_us();
+    }
 
     bool disposable_threadpool = false;
 
