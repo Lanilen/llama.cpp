@@ -174,6 +174,13 @@ With it, turning the MUL_MAT_SCALE_UNARY fusion off costs another 1.5–2.7%, so
 GPU's tail shows. The chain a pass waits on is the GPU's per-layer work (~26 ms, ~40 dependent small groups a layer)
 and the CPU's experts (~21 ms); each fused dependent step saves about 0.5%.
 
+Fewer submits, but more than one, do help. The default cuts a split's command buffer at 1/40 of the previous graph's
+flops, and since layer splits alternate big and small, the cut is often far too fine. A fixed target
+(`GGML_VK_FLOPS_PER_SUBMIT=N`) at 3-token verify batches: 25M Q4 +3.2%, Q6 +2.6%; 100M Q4 +5.2%, Q6 +1.5%. End to end
+with Local Coder's flags (fn-e2e-sub, two runs each), 100M wins on both: Q4 usual answers 40.25 → 41.07 tok/s (+2.0%),
+agent turns 39.09 → 39.78 (+1.8%); Q6 32.62 → 33.01 (+1.2%), 31.33 → 31.85 (+1.7%), with hit rates and text
+unchanged. 25M fell between (Q4 +1.4%, Q6 +0.5%). Perseus's `config/env` sets 100M.
+
 ## Build
 
 ```bash
