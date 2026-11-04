@@ -10,8 +10,11 @@ larger than the noise measured between the passes, and a last stage compares the
         --predictor pred.gguf --draft-model mtp.gguf --hours 4 \\
         -- -c 65536 -ngl 99 --cpu-moe -t 12 -ub 8192 -b 8192 --moe-cache-resize
 
-The arguments after -- are your placement and they go to the server unchanged. Only settings that do not change what the
-model computes are swept: no routed expert is skipped, and no precision or sampling option is touched.
+The arguments after -- are your placement and they go to the server unchanged (but -t, when the cpu-threads stage picks
+another count). Only settings that do not change what the model computes are swept: no routed expert is skipped, and no
+precision or sampling option is touched. Besides the cache's own settings that includes the CPU's and the GPU's: how long
+OpenMP's threads spin, the chunks of the CPU's experts, how often Vulkan submits; a stage the build or the machine cannot
+act on is skipped.
 OUT/results.json is the file to share: it has the hardware and the measurements, but no prompt text and no answers.
 OUT/logs and OUT/history.json can contain prompt text, keep them local. Guide: tools/moe-trace/README.md
 """
@@ -42,25 +45,33 @@ try:
 except (ImportError, OSError):
     LIBC = None
 
-SCHEMA = 1
+SCHEMA = 2
 DEFAULT_BUDGET = 10.0     # --moe-cache-budget
 DEFAULT_REFILL = 128      # --moe-cache-refill, without a predictor; 0 with one
 DEFAULT_COPY_THREADS = 4  # LLAMA_MOE_CACHE_COPY_THREADS
 DEFAULT_N_MAX = 3         # --spec-draft-n-max
-ALL_STAGES = ["predictor", "refill", "drafts", "gate", "budget", "mib", "threads"]
+ALL_STAGES = ["omp-spin", "cpu-chunks", "submits", "predictor", "refill", "answer-cap", "drafts", "gate", "budget", "mib", "jit", "threads", "cpu-threads"]
+DEFAULT_STAGES = [s for s in ALL_STAGES if s != "gate"]  # gates lose to the graph rebuild of each new verify length
+# the stages that a speed of the whole turn judges, not the objective: they change prompts more than generation
+STAGE_METRIC = {"jit": "agent_turn"}
 
 # the tool sets these, or they would make the runs differ from each other
 RESERVED_ARGS = {
     "-m", "--model", "--host", "--port", "-np", "--parallel", "-v", "--verbose", "--log-verbose", "-lv", "--verbosity",
     "--log-verbosity", "--log-file", "--log-disable", "--no-log-timestamps", "--moe-cache-mib", "--moe-cache-mode", "--moe-cache-budget",
     "--moe-cache-refill", "--moe-cache-predictor", "--moe-cache-predictor-start", "--moe-cache-save", "--spec-draft-n-max",
-    "--spec-draft-p-min", "--draft-p-min", "-md", "--model-draft", "--spec-draft-model",
+    "--spec-draft-p-min", "--draft-p-min", "-md", "--model-draft", "--spec-draft-model", "--moe-cache-jit", "--moe-cache-predictor-answer-cap",
 }
 RESERVED_ENV = [
     "LLAMA_ARG_MOE_CACHE_MIB", "LLAMA_ARG_MOE_CACHE_MODE", "LLAMA_ARG_MOE_CACHE_BUDGET", "LLAMA_ARG_MOE_CACHE_REFILL",
     "LLAMA_ARG_MOE_CACHE_PREDICTOR", "LLAMA_ARG_MOE_CACHE_PREDICTOR_START", "LLAMA_ARG_MOE_CACHE_SAVE", "LLAMA_ARG_SPEC_DRAFT_MODEL",
-    "LLAMA_ARG_SPEC_DRAFT_N_MAX", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_MOE_CACHE_COPY_THREADS",
+    "LLAMA_ARG_SPEC_DRAFT_N_MAX", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_MOE_CACHE_COPY_THREADS", "LLAMA_ARG_MOE_CACHE_JIT",
+    "LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_CAP", "LLAMA_MOE_PREDICTOR_ANSWER_CAP", "LLAMA_ARG_THREADS",
+    "GOMP_SPINCOUNT", "OMP_WAIT_POLICY", "GGML_CPU_MMID_FLAT", "GGML_VK_FLOPS_PER_SUBMIT",
 ]
+# what each stage needs from the server's build: a string of its binary or libraries
+FEATURES = {"libgomp": b"libgomp", "cpu_chunks": b"GGML_CPU_MMID_FLAT", "submits": b"GGML_VK_FLOPS_PER_SUBMIT",
+            "jit": b"--moe-cache-jit", "answer_cap": b"--moe-cache-predictor-answer-cap"}
 # allowed in your placement, but they change the answers: reported in the results
 ACCURACY_ARGS = {
     "-ctk", "--cache-type-k", "-ctv", "--cache-type-v", "--override-kv", "--repeat-penalty", "--presence-penalty",
@@ -80,7 +91,11 @@ FOLLOW_UPS = [
     "Now write unit tests for that function.",
     "Explain to a new contributor how this part fits into the rest of the code base.",
 ]
-CORPUS_CHARS = 88000
+# an agent's loop: each turn adds a tool's output of some hundred tokens to the conversation, as coding agents do
+AGENT_FIRST = "I am tracking down a bug in this code base. Here is the file we start from:\n\n```\n{}\n```\n\nWhat would you look at first? Answer in a few sentences."
+AGENT_NEXT = "I ran that. The output:\n\n```\n{}\n```\n\nWhat next? Answer in a few sentences."
+AGENT_TURNS = [(6000, 256), (600, 128), (3200, 160), (1600, 96), (3600, 192), (1000, 128)]  # (characters of the tool's output, answer tokens)
+CORPUS_CHARS = 88000 + sum(c for c, _ in AGENT_TURNS)
 
 
 class Fatal(Exception):
@@ -158,19 +173,32 @@ def load_corpus(path, chars):
     return text, {"source": source, "chars": chars, "sha256": hashlib.sha256(text.encode()).hexdigest()}
 
 
-def build_requests(text, scale):
-    """Long answers to short prompts (kind long) and short answers after large prompts (kind short): their gains differ a lot."""
+def build_requests(text, scale, agent_file=None):
+    """Long answers to short prompts (kind long), short answers after large prompts (kind short) and an agent's turns
+    (kind agent: some hundred new tokens of prompt in a growing conversation, then a short answer): their gains differ a lot."""
     cut = lambda n: int(n * scale)
     tok = lambda n: max(16, int(n * scale))
     reqs = [
-        dict(label="story", kind="long", user=STORY, max_tokens=tok(512), session=False),
-        dict(label="ask-a", kind="short", user=ASK.format(text[:cut(8000)]), max_tokens=tok(256), session=False),
-        dict(label="fill", kind="short", user=FILL.format(text[cut(22000):cut(88000)]), max_tokens=tok(128), session=False),
-        dict(label="ask-b", kind="short", user=ASK.format(text[cut(8000):cut(16000)]), max_tokens=tok(256), session=False),
-        dict(label="turn1", kind="short", user=ASK.format(text[cut(16000):cut(22000)]), max_tokens=tok(300), session=True),
+        dict(label="story", kind="long", user=STORY, max_tokens=tok(512), session=None),
+        dict(label="ask-a", kind="short", user=ASK.format(text[:cut(8000)]), max_tokens=tok(256), session=None),
+        dict(label="fill", kind="short", user=FILL.format(text[cut(22000):cut(88000)]), max_tokens=tok(128), session=None),
+        dict(label="ask-b", kind="short", user=ASK.format(text[cut(8000):cut(16000)]), max_tokens=tok(256), session=None),
+        dict(label="turn1", kind="short", user=ASK.format(text[cut(16000):cut(22000)]), max_tokens=tok(300), session="chat"),
     ]
     for i, f in enumerate(FOLLOW_UPS):
-        reqs.append(dict(label=f"turn{i + 2}", kind="long", user=f, max_tokens=tok(300), session=True))
+        reqs.append(dict(label=f"turn{i + 2}", kind="long", user=f, max_tokens=tok(300), session="chat"))
+    if agent_file:
+        # recorded turns of a real agent, as token ids of the whole prompt: [{"prompt": [...], "n": answer tokens}, ...]
+        with open(agent_file) as f:
+            turns = json.load(f)
+        for i, a in enumerate(turns):
+            reqs.append(dict(label=f"agent{i + 1}", kind="agent", tokens=a["prompt"], max_tokens=int(a["n"]), session=None))
+        return reqs
+    at = 88000
+    for i, (chars, n) in enumerate(AGENT_TURNS):
+        part = text[cut(at):cut(at + chars)]
+        at += chars
+        reqs.append(dict(label=f"agent{i + 1}", kind="agent", user=(AGENT_NEXT if i else AGENT_FIRST).format(part), max_tokens=tok(n), session="agent"))
     return reqs
 
 
@@ -296,6 +324,22 @@ def server_version(server):
     return m[0] if m else "unknown"
 
 
+def server_features(server):
+    """What the build can do, from the strings of the server and the libraries next to it: a stage that the build cannot
+    act on would measure the starting point again."""
+    d = os.path.dirname(os.path.realpath(server))
+    files = [os.path.realpath(server)] + sorted(glob.glob(os.path.join(d, "*.so*")) + glob.glob(os.path.join(d, "*.dll")) + glob.glob(os.path.join(d, "*.dylib")))
+    found = set()
+    for fn in dict.fromkeys(files):
+        try:
+            with open(fn, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        found.update(k for k, s in FEATURES.items() if s in data)
+    return {k: k in found for k in FEATURES}
+
+
 #
 # the server's log
 #
@@ -308,6 +352,7 @@ RE_RESIZE = re.compile(r"released for large batches (\d+) times, ([\d.]+) MiB up
 RE_PRED = re.compile(r"hot spare, predictor: (\d+) predictions, ([\d.]+) ms each")
 RE_TEXT = re.compile(r"hot spare, text starts: (\d+), (\d+) swaps each")
 RE_COPY = re.compile(r"copy worker: (\d+) threads.*?([\d.]+) GB/s per thread")
+RE_JIT = re.compile(r"--moe-cache-jit \d+ uploaded (\d+) experts in (\d+) layer runs")
 RE_CACHE = re.compile(r"(\S+) MoE cache size = +([\d.]+) MiB for ([\d.]+) MiB of host experts")
 RE_BREAK = re.compile(r"\|\s+- (.+?)\s+\|\s+(\d+) = (\d+) \+ \(\s*\d+ =.*\)\s*\+\s*(-?\d+) \|")
 RE_INFO = {k: re.compile(p) for k, p in dict(
@@ -382,6 +427,10 @@ def parse_log(path):
                 m = RE_COPY.search(line)
                 if m:
                     st.update(copy_threads=int(m[1]), copy_gbps=float(m[2]))
+                    continue
+                m = RE_JIT.search(line)
+                if m:
+                    st.update(jit_uploads=int(m[1]), jit_layer_runs=int(m[2]))
                     continue
                 m = RE_CACHE.search(line)
                 if m:
@@ -488,10 +537,28 @@ class Config:
     n_max: object = None               # None without speculative decoding
     p_min: object = None
     copy_threads: int = DEFAULT_COPY_THREADS
+    jit: int = 0                       # --moe-cache-jit
+    answer_cap: int = 0                # --moe-cache-predictor-answer-cap, 0 = all of the swaps
+    threads: int = 0                   # -t, 0 = as the placement says
+    spin: int = 0                      # GOMP_SPINCOUNT, 0 = not set
+    chunks: int = 0                    # GGML_CPU_MMID_FLAT, 0 = not set
+    submit_mflops: int = 0             # GGML_VK_FLOPS_PER_SUBMIT in millions, 0 = not set
 
     def name(self):
         draft = f"-d{self.n_max}-g{self.p_min:g}" if self.n_max is not None else ""
-        return f"p{self.predictor}-r{self.refill}-b{self.budget:g}{draft}-m{self.mib.replace(',', '_')}-ct{self.copy_threads}"
+        return (f"p{self.predictor}-r{self.refill}-b{self.budget:g}{draft}-m{self.mib.replace(',', '_')}-ct{self.copy_threads}"
+                f"-j{self.jit}-a{self.answer_cap}-t{self.threads}-s{self.spin / 1e6:g}M-f{self.chunks}-v{self.submit_mflops}M")
+
+    def env(self):
+        """The environment of a configuration, next to the placement's."""
+        e = {"LLAMA_MOE_CACHE_COPY_THREADS": str(self.copy_threads)}
+        if self.spin:
+            e["GOMP_SPINCOUNT"] = str(self.spin)
+        if self.chunks:
+            e["GGML_CPU_MMID_FLAT"] = str(self.chunks)
+        if self.submit_mflops:
+            e["GGML_VK_FLOPS_PER_SUBMIT"] = str(self.submit_mflops * 1000000)
+        return e
 
 
 class Tuner:
@@ -517,7 +584,15 @@ class Tuner:
             if k in os.environ:
                 log(f"warning: {k} is set in the environment, ignored: this tool sets it")
         text, self.corpus = load_corpus(o.corpus, int(CORPUS_CHARS * o.scale))
-        self.requests = build_requests(text, o.scale)
+        self.requests = build_requests(text, o.scale, o.agent)
+        self.features = server_features(o.server)
+        self.placement_threads = None
+        for i, a in enumerate(extra):
+            if a in ("-t", "--threads") and i + 1 < len(extra):
+                self.placement_threads = int(extra[i + 1])
+            elif a.startswith("--threads="):
+                self.placement_threads = int(a.split("=", 1)[1])
+        self.skipped = {}  # stage: why it cannot run on this machine or build
 
     #
     # what is on disk
@@ -526,7 +601,7 @@ class Tuner:
     def fingerprint(self, version):
         o = self.o
         return dict(schema=SCHEMA, server=version, model=file_info(o.model), predictor=file_info(o.predictor), predictor_start=file_info(o.predictor_start),
-                    draft_model=file_info(o.draft_model), placement=[base_name(a) for a in self.extra], env=self.user_env(), corpus=self.corpus, scale=o.scale,
+                    draft_model=file_info(o.draft_model), agent=file_info(o.agent), placement=[base_name(a) for a in self.extra], env=self.user_env(), corpus=self.corpus, scale=o.scale,
                     cpu=(self.hw or {}).get("cpu"), devices=[d["description"] for d in (self.hw or {}).get("devices", [])])
 
     def user_env(self):
@@ -576,7 +651,22 @@ class Tuner:
     def command(self, cfg):
         o = self.o
         cmd = [o.server, "-m", o.model, "--host", "127.0.0.1", "--port", str(o.port), "-np", "1", "-v"] + self.settings(cfg, o.predictor, o.predictor_start, o.draft_model)
-        return cmd + self.extra
+        return cmd + self.placement(cfg, self.extra)
+
+    @staticmethod
+    def placement(cfg, extra):
+        """The placement, with the configuration's -t in place of its own."""
+        if not cfg.threads:
+            return list(extra)
+        out, skip = [], False
+        for a in extra:
+            if skip:
+                skip = False
+            elif a in ("-t", "--threads"):
+                skip = True
+            elif not a.startswith("--threads="):
+                out.append(a)
+        return out + ["-t", str(cfg.threads)]
 
     def settings(self, cfg, predictor, start, draft):
         """The arguments of a configuration, without the placement."""
@@ -591,6 +681,10 @@ class Tuner:
                 a += ["--spec-type", "draft-mtp"]
         if cfg.n_max is not None:
             a += ["--spec-draft-n-max", str(cfg.n_max), "--spec-draft-p-min", f"{cfg.p_min:g}"]
+        if cfg.jit:
+            a += ["--moe-cache-jit", str(cfg.jit)]
+        if cfg.answer_cap:
+            a += ["--moe-cache-predictor-answer-cap", str(cfg.answer_cap)]
         return a
 
     def check_fits(self, srv):
@@ -598,9 +692,10 @@ class Tuner:
         n_ctx = srv.call("/props")["default_generation_settings"]["n_ctx"]
         count = lambda s: len(srv.call("/tokenize", {"content": s})["tokens"])
         fill = next(r for r in self.requests if r["label"] == "fill")
-        need_fill = count(fill["user"]) + fill["max_tokens"] + 128
-        need_session = sum(count(r["user"]) + r["max_tokens"] + 32 for r in self.requests if r["session"])
-        need = max(need_fill, need_session)
+        need = count(fill["user"]) + fill["max_tokens"] + 128
+        for s in {r["session"] for r in self.requests if r["session"]}:
+            need = max(need, sum(count(r["user"]) + r["max_tokens"] + 32 for r in self.requests if r["session"] == s))
+        need = max([need] + [len(r["tokens"]) + r["max_tokens"] for r in self.requests if "tokens" in r])
         if need > n_ctx:
             raise Fatal(f"the requests need a context of {need} tokens and the server has {n_ctx}: raise -c or use --scale {self.o.scale * n_ctx / need * 0.9:.3f}")
 
@@ -612,15 +707,22 @@ class Tuner:
             raise RunFailed('a predictor was asked for and made no predictions: look for "predictor" in the log')
         if cfg.predictor == 2 and "text_starts" not in st:
             raise RunFailed('a start predictor was asked for and is not in the statistics: look for "predictor" in the log')
+        if cfg.jit and not st.get("jit_layer_runs"):
+            raise RunFailed("--moe-cache-jit was asked for and uploaded nothing: it acts on prompts of 33 tokens and more that keep the cache "
+                            "(--moe-cache-resize with --moe-cache-batch, or no --moe-cache-resize)")
 
     def ask(self, srv):
-        recs, msgs = [], []
+        recs, sessions = [], {}
         for r in self.requests:
-            user = {"role": "user", "content": r["user"]}
-            body = {"messages": msgs + [user] if r["session"] else [user], "max_tokens": r["max_tokens"], "temperature": 0}
+            if "tokens" in r:
+                path, body = "/completion", {"prompt": r["tokens"], "n_predict": r["max_tokens"], "temperature": 0, "cache_prompt": True}
+            else:
+                user = {"role": "user", "content": r["user"]}
+                msgs = sessions.setdefault(r["session"], []) if r["session"] else []
+                path, body = "/v1/chat/completions", {"messages": msgs + [user], "max_tokens": r["max_tokens"], "temperature": 0}
             t0 = time.time()
             try:
-                res = srv.call("/v1/chat/completions", body, timeout=self.o.request_timeout)
+                res = srv.call(path, body, timeout=self.o.request_timeout)
             except urllib.error.HTTPError as e:
                 detail = e.read().decode(errors="replace")[:300]
                 if 400 <= e.code < 500:
@@ -629,18 +731,22 @@ class Tuner:
             except (OSError, ValueError, http.client.HTTPException) as e:
                 raise RunFailed(f"request {r['label']}: {e}")
             wall = time.time() - t0
-            choice = res["choices"][0]
-            msg = choice["message"]
-            content = msg.get("content") or ""
-            if not content:
-                log(f"  note: {r['label']} has no answer text: with a reasoning model, turn reasoning off in the placement")
             t = res.get("timings") or {}
-            if not t.get("predicted_n") or choice.get("finish_reason") not in ("stop", "length", "tool_calls"):
-                raise RunFailed(f"request {r['label']} was not answered: finish_reason {choice.get('finish_reason')}, {t.get('predicted_n')} tokens")
-            digest = hashlib.sha256((content + "\0" + (msg.get("reasoning_content") or "")).encode()).hexdigest()[:12]
+            if "tokens" in r:
+                content, reasoning = res.get("content") or "", ""
+                finish = "stop" if res.get("stop_type") in ("eos", "word") else "length" if res.get("stop_type") == "limit" else res.get("stop_type")
+            else:
+                choice = res["choices"][0]
+                msg = choice["message"]
+                content, reasoning, finish = msg.get("content") or "", msg.get("reasoning_content") or "", choice.get("finish_reason")
+                if not content:
+                    log(f"  note: {r['label']} has no answer text: with a reasoning model, turn reasoning off in the placement")
+            if not t.get("predicted_n") or finish not in ("stop", "length", "tool_calls"):
+                raise RunFailed(f"request {r['label']} was not answered: finish {finish}, {t.get('predicted_n')} tokens")
+            digest = hashlib.sha256((content + "\0" + reasoning).encode()).hexdigest()[:12]
             recs.append(dict(label=r["label"], kind=r["kind"], max_tokens=r["max_tokens"], prompt_n=t.get("prompt_n", 0), cache_n=t.get("cache_n", 0), prompt_ms=t.get("prompt_ms", 0),
                              predicted_n=t["predicted_n"], predicted_ms=t.get("predicted_ms", 0), draft_n=t.get("draft_n", 0), draft_n_accepted=t.get("draft_n_accepted", 0),
-                             finish=choice.get("finish_reason"), wall_s=round(wall, 2), hash=digest))
+                             finish=finish, wall_s=round(wall, 2), hash=digest))
             log(f"  {r['label']:6s} prompt {t.get('prompt_n') or 0:6d} tok {t.get('prompt_per_second') or 0:7.1f} t/s | gen {t['predicted_n']:4d} tok {t.get('predicted_per_second') or 0:6.2f} t/s | wall {wall:6.1f} s | {digest}")
             if r["session"]:
                 # the first complete run's answers are every run's history, so all the requests stay the same bytes
@@ -653,7 +759,7 @@ class Tuner:
         left = self.o.hours * 3600 - (time.time() - self.t_start)
         log(f"=== {stage}: {name}, pass {pid} ({time.strftime('%H:%M:%S')}, {fmt_time(max(left, 0))} of the time budget left)")
         log_path = os.path.join(self.logs_dir, f"{name}.{pid}.log")
-        env = dict(self.env, LLAMA_MOE_CACHE_COPY_THREADS=str(cfg.copy_threads))
+        env = dict(self.env, **cfg.env())
         t0 = time.time()
         load1 = round(os.getloadavg()[0], 2) if hasattr(os, "getloadavg") else None
         mon = Monitor(self.links)
@@ -691,7 +797,8 @@ class Tuner:
         self.runs[(name, pid)] = rec
         self.failed.pop((name, pid), None)
         m = metrics(rec)
-        log(f"  all {m['all']:.2f} tok/s, short {m['short']:.2f}, long {m['long']:.2f}, hits {st['hits']:.1f}%, uploads {m['mib_gen']:.2f} MiB per generated token, {rec['wall_s']:.0f} s")
+        log(f"  all {m['all']:.2f} tok/s, short {m['short']:.2f}, long {m['long']:.2f}, agent {m['agent']:.2f} (whole turns {m['agent_turn']:.2f}, prompts {fmt_num(m['agent_prompt'], 1, 1)} t/s), "
+            f"hits {st['hits']:.1f}%, uploads {m['mib_gen']:.2f} MiB per generated token, {rec['wall_s']:.0f} s")
 
     def fail_run(self, cfg, pid, reason, log_path):
         name = cfg.name()
@@ -734,9 +841,62 @@ class Tuner:
     # the search
     #
 
+    def applies(self, stage, cur):
+        """Why a stage cannot change anything here, or None."""
+        f = self.features
+        if stage == "omp-spin" and not f["libgomp"]:
+            return "the build does not use GNU OpenMP (libgomp), whose threads GOMP_SPINCOUNT keeps awake"
+        if stage == "cpu-chunks" and not f["cpu_chunks"]:
+            return "the build has no GGML_CPU_MMID_FLAT"
+        if stage == "submits":
+            if not f["submits"]:
+                return "the build has no GGML_VK_FLOPS_PER_SUBMIT"
+            if not any(d["name"].startswith("Vulkan") for d in (self.hw or {}).get("devices", [])):
+                return "no Vulkan device"
+        if stage == "jit" and not f["jit"]:
+            return "the build has no --moe-cache-jit"
+        if stage == "answer-cap":
+            if not f["answer_cap"]:
+                return "the build has no --moe-cache-predictor-answer-cap"
+            if cur.predictor != 1:
+                return "it acts only with the predictor and no start predictor"
+        if stage == "cpu-threads" and not self.cpu_thread_counts(cur):
+            return "no other thread count to try"
+        if stage in ("drafts", "gate") and not self.draft_on:
+            return "no speculative decoding"
+        if stage == "predictor" and not self.o.predictor:
+            return "no --predictor"
+        return None
+
+    def cpu_thread_counts(self, cur):
+        if self.o.cpu_threads is not None:
+            counts = self.o.cpu_threads
+        else:
+            # the physical cores, and a quarter fewer: one thread per core does the CPU's expert maths, a second one shares its units
+            n = (self.hw or {}).get("physical_cores") or 0
+            counts = [n, n - n // 4] if n >= 4 else []
+        now = cur.threads or self.placement_threads
+        return [t for t in dict.fromkeys(counts) if t > 0 and t != now]
+
     def candidates(self, stage, cur):
         o = self.o
-        if stage == "predictor" and o.predictor:
+        why = self.applies(stage, cur)
+        if why:
+            self.skipped.setdefault(stage, why)
+            return [cur]
+        if stage == "omp-spin":
+            c = [cur] + [replace(cur, spin=s) for s in o.spin_counts]
+        elif stage == "cpu-chunks":
+            c = [cur] + [replace(cur, chunks=n) for n in o.cpu_chunks]
+        elif stage == "submits":
+            c = [cur] + [replace(cur, submit_mflops=n) for n in o.submit_mflops]
+        elif stage == "answer-cap":
+            c = [cur] + [replace(cur, answer_cap=n) for n in o.answer_caps]
+        elif stage == "jit":
+            c = [cur] + [replace(cur, jit=n) for n in o.jits]
+        elif stage == "cpu-threads":
+            c = [cur] + [replace(cur, threads=n) for n in self.cpu_thread_counts(cur)]
+        elif stage == "predictor" and o.predictor:
             c = [cur, replace(cur, predictor=0, refill=DEFAULT_REFILL), replace(cur, predictor=1, refill=0)]
             if o.predictor_start:
                 c.append(replace(cur, predictor=2, refill=0))
@@ -760,7 +920,7 @@ class Tuner:
         """The whole search. With execute it runs what is missing, without it only reads the results. It decides from the
         same runs in the same order both ways, so a restart takes the path the interrupted search took."""
         o = self.o
-        self.visited, self.decisions, self.not_searched = {}, [], []
+        self.visited, self.decisions, self.not_searched, self.skipped = {}, [], [], {}
         self.final = self.confirm = None
         if execute:
             self.ensure(self.base, 0, "warm-up")
@@ -825,13 +985,14 @@ class Tuner:
         return max(self.o.noise_k * sigma * (1 / n_a + 1 / n_b) ** 0.5, self.o.min_gain / 100 * level)
 
     def decide(self, stage, cands, cur, pids):
-        d = dict(stage=stage, incumbent=cur.name(), tried={}, status="not run", winner=cur.name())
+        metric = STAGE_METRIC.get(stage, self.o.objective)
+        d = dict(stage=stage, metric=metric, incumbent=cur.name(), tried={}, status="not run", winner=cur.name())
         done = []
         for c in cands:
             n = len(self.values(c, pids))
             row = dict(passes=n)
             if n:
-                row.update({k: round(self.mean(c, pids, k), 3) for k in ("all", "short", "long")})
+                row.update({k: round(self.mean(c, pids, k), 3) for k in ("all", "short", "long", "agent", "agent_turn")})
             if n == len(pids):
                 done.append(c)
             elif any((c.name(), p) in self.failed for p in pids):
@@ -843,10 +1004,10 @@ class Tuner:
             if stage not in self.not_searched:
                 self.not_searched.append(stage)
             return cur
-        sigma = self.noise(self.o.objective)
-        base = self.mean(cur, pids)
-        best = max(done, key=lambda c: self.mean(c, pids))
-        gain = self.mean(best, pids) - base
+        sigma = self.noise(metric)
+        base = self.mean(cur, pids, metric)
+        best = max(done, key=lambda c: self.mean(c, pids, metric))
+        gain = self.mean(best, pids, metric) - base
         d.update(status="decided", noise_sd=round(sigma, 3) if sigma is not None else None, best=best.name(), gain=round(gain, 3))
         if best == cur or sigma is None:
             self.decisions.append(d)
@@ -895,12 +1056,12 @@ class Tuner:
         o = self.o
         if local:
             a = self.settings(cfg, o.predictor, o.predictor_start, o.draft_model)
-            head, extra = ["llama-server", "-m", o.model], self.extra
+            head, extra = ["llama-server", "-m", o.model], self.placement(cfg, self.extra)
         else:
             f = lambda p: os.path.basename(p) if p else p
             a = self.settings(cfg, f(o.predictor), f(o.predictor_start), f(o.draft_model))
-            head, extra = ["llama-server", "-m", os.path.basename(o.model)], [base_name(x) for x in self.extra]
-        env = [f"LLAMA_MOE_CACHE_COPY_THREADS={cfg.copy_threads}"] if cfg.copy_threads != DEFAULT_COPY_THREADS else []
+            head, extra = ["llama-server", "-m", os.path.basename(o.model)], [base_name(x) for x in self.placement(cfg, self.extra)]
+        env = [f"{k}={v}" for k, v in cfg.env().items() if not (k == "LLAMA_MOE_CACHE_COPY_THREADS" and cfg.copy_threads == DEFAULT_COPY_THREADS)]
         return " ".join(env + [shlex.join(head + extra + ["-np", "1"] + a)])
 
     def config_row(self, c, pids):
@@ -910,7 +1071,8 @@ class Tuner:
         ms = [metrics(r) for r in rs]
         avg = lambda k: (lambda v: sum(v) / len(v) if v else None)([m[k] for m in ms if m.get(k) is not None])
         row = dict(name=c.name(), config=asdict(c), passes=len(rs), all_passes=[round(m["all"], 3) for m in ms])
-        for k in ("all", "short", "long", "hits", "mib_batch_token", "mib_gen", "accept", "fill_prompt", "update_ms", "restore_ms", "drafted", "got", "rejected", "ms_pass"):
+        for k in ("all", "short", "long", "agent", "agent_turn", "agent_prompt", "hits", "mib_batch_token", "mib_gen", "accept", "fill_prompt", "update_ms", "restore_ms",
+                  "drafted", "got", "rejected", "ms_pass"):
             v = avg(k)
             row[k] = round(v, 3) if v is not None else None
         row["pass_hash_diffs"], row["base_hash_diffs"] = self.hash_diffs(rs)
@@ -940,48 +1102,61 @@ class Tuner:
         L.append(f"model:   {os.path.basename(o.model)}, {info.get('arch')}, {info.get('n_layer')} layers, {info.get('n_expert')} experts, {info.get('n_expert_used')} used, {info.get('file_type')}")
         L.append(f"run:     {len(self.runs)} complete runs, {o.passes} passes per configuration, objective {o.objective}, scale {o.scale:g}")
         L.append("")
-        L.append("tok/s of generation, weighted by tokens: all = every request, short = answers after a large prompt, long = long answers to short prompts.")
+        L.append("tok/s of generation, weighted by tokens: all = every request, short = answers after a large prompt, long = long answers to short prompts,")
+        L.append("agent = an agent's turns (some hundred new tokens of prompt each, then a short answer); turn = the agent's answer tokens per second of its")
+        L.append("whole turns, prompts included; a.pp = the prompt tok/s of its turns.")
         L.append("hits and MiB/batch count every token of a small batch, rejected drafts and short prompts too; MiB/gen is the uploads per generated token.")
         L.append("answers: requests whose answer differs between the passes / from the warm-up (speed follows the text, near ties can differ at temperature 0).")
         L.append("")
-        L.append(f"{'config':38s} {'n':>1s} {'hits':>6s} {'MiB/batch':>9s} {'MiB/gen':>7s} {'all':>6s} {'(passes)':17s} {'short':>6s} {'long':>6s} {'fill t/s':>8s} {'answers':>7s}")
+        w = max([len(r["name"]) for r in rows] + [24])
+        L.append(f"{'config':{w}s} {'n':>1s} {'hits':>6s} {'MiB/batch':>9s} {'MiB/gen':>7s} {'all':>6s} {'(passes)':17s} {'short':>6s} {'long':>6s} {'agent':>6s} {'turn':>6s} {'a.pp':>6s} {'fill t/s':>8s} {'answers':>7s}")
         for r in rows:
             passes = " ".join(f"{x:.2f}" for x in r["all_passes"])
             base_d = "-" if r["base_hash_diffs"] is None else r["base_hash_diffs"]
-            L.append(f"{r['name']:38s} {r['passes']:1d} {fmt_num(r['hits'], 5, 1)}% {fmt_num(r['mib_batch_token'], 9, 2)} {fmt_num(r['mib_gen'], 7, 2)} {fmt_num(r['all'], 6, 2)} ({passes:15s}) "
-                     f"{fmt_num(r['short'], 6, 2)} {fmt_num(r['long'], 6, 2)} {fmt_num(r['fill_prompt'], 8, 1)} {r['pass_hash_diffs']}/{base_d}".rstrip())
+            L.append(f"{r['name']:{w}s} {r['passes']:1d} {fmt_num(r['hits'], 5, 1)}% {fmt_num(r['mib_batch_token'], 9, 2)} {fmt_num(r['mib_gen'], 7, 2)} {fmt_num(r['all'], 6, 2)} ({passes:15s}) "
+                     f"{fmt_num(r['short'], 6, 2)} {fmt_num(r['long'], 6, 2)} {fmt_num(r['agent'], 6, 2)} {fmt_num(r['agent_turn'], 6, 2)} {fmt_num(r['agent_prompt'], 6, 1)} "
+                     f"{fmt_num(r['fill_prompt'], 8, 1)} {r['pass_hash_diffs']}/{base_d}".rstrip())
         if self.draft_on and any(r["drafted"] for r in rows):
             L.append("")
-            L.append(f"{'drafts, per verify pass':38s} {'accept':>6s} {'drafted':>7s} {'got':>5s} {'rejected':>8s} {'ms':>6s}  stands if reached, by position")
+            L.append(f"{'drafts, per verify pass':{w}s} {'accept':>6s} {'drafted':>7s} {'got':>5s} {'rejected':>8s} {'ms':>6s}  stands if reached, by position")
             for r in rows:
                 last = self.runs.get((r["name"], numbered[0]))
                 dp = (last or {}).get("log", {}).get("draft_passes") or {}
-                L.append(f"{r['name']:38s} {fmt_num(r['accept'], 6, 3)} {fmt_num(r['drafted'], 7, 2)} {fmt_num(r['got'], 5, 2)} {fmt_num(r['rejected'], 8, 3)} {fmt_num(r['ms_pass'], 6, 1)}  " + " ".join(f"{x:.2f}" for x in dp.get("stands_by_position", [])))
-        sig = {k: self.noise(k) for k in ("all", "short", "long")}
+                L.append(f"{r['name']:{w}s} {fmt_num(r['accept'], 6, 3)} {fmt_num(r['drafted'], 7, 2)} {fmt_num(r['got'], 5, 2)} {fmt_num(r['rejected'], 8, 3)} {fmt_num(r['ms_pass'], 6, 1)}  " + " ".join(f"{x:.2f}" for x in dp.get("stands_by_position", [])))
+        sig = {k: self.noise(k) for k in ("all", "short", "long", "agent", "agent_turn")}
         if sig["all"] is not None:
             L.append("")
-            L.append(f"noise: the standard deviation of one run is {sig['all']:.2f} tok/s for all, {sig['short']:.2f} for short, {sig['long']:.2f} for long, pooled over {len(rows)} configurations")
+            L.append(f"noise: the standard deviation of one run is {sig['all']:.2f} tok/s for all, {sig['short']:.2f} for short, {sig['long']:.2f} for long, "
+                     f"{sig['agent']:.2f} for agent, {sig['agent_turn']:.2f} for turn, pooled over {len(rows)} configurations")
         L.append("")
-        L.append("stages:")
+        L.append(f"stages (judged by {o.objective}, unless they say otherwise):")
         for d in self.decisions:
+            by = f" (by {d['metric']})" if d.get("metric", o.objective) != o.objective else ""
             if d["status"] == "not run":
-                L.append(f"  {d['stage']:10s} not run ({len(d['tried'])} configurations)")
+                L.append(f"  {d['stage']:11s} not run ({len(d['tried'])} configurations)")
             else:
                 best = d.get("best", d["winner"])
                 if d["winner"] != d["incumbent"]:
-                    L.append(f"  {d['stage']:10s} {change(d['incumbent'], d['winner'])}: {d['gain']:+.2f} tok/s, needed {d['threshold']:.2f}")
+                    L.append(f"  {d['stage']:11s} {change(d['incumbent'], d['winner'])}: {d['gain']:+.2f} tok/s{by}, needed {d['threshold']:.2f}")
                 elif best != d["incumbent"]:
-                    L.append(f"  {d['stage']:10s} kept {d['incumbent']}: best was {change(d['incumbent'], best)} at {d['gain']:+.2f} tok/s, needed {d.get('threshold', 0):.2f}")
+                    L.append(f"  {d['stage']:11s} kept {d['incumbent']}: best was {change(d['incumbent'], best)} at {d['gain']:+.2f} tok/s{by}, needed {d.get('threshold', 0):.2f}")
                 else:
-                    L.append(f"  {d['stage']:10s} kept {d['incumbent']}: the fastest")
+                    L.append(f"  {d['stage']:11s} kept {d['incumbent']}: the fastest{by}")
                 for name, t in d["tried"].items():
                     if t.get("failed"):
-                        L.append(f"             {name} failed: {t['failed']}")
+                        L.append(f"              {name} failed: {t['failed']}")
+        for stage, why in self.skipped.items():
+            if stage in o.stages:
+                L.append(f"  {stage:11s} skipped: {why}")
         if self.confirm and self.confirm.get("status") == "decided":
             c = self.confirm
-            L.append(f"  {'confirm':10s} {c['final']}: {c['final_speed']:.2f} against {c['base_speed']:.2f} for {c['base']}, {c['gain']:+.2f} tok/s, needed {c['threshold']:.2f}")
+            L.append(f"  {'confirm':11s} {c['final']}: {c['final_speed']:.2f} against {c['base_speed']:.2f} for {c['base']}, {c['gain']:+.2f} tok/s, needed {c['threshold']:.2f}")
+            for k, label in (("agent", "agent"), ("agent_turn", "turn")):
+                a, b = self.mean(self.base, [f"c{i}" for i in numbered], k), self.mean(self.final, [f"c{i}" for i in numbered], k)
+                if a and b:
+                    L.append(f"              {label}: {b:.2f} against {a:.2f} ({100 * (b / a - 1):+.1f}%)")
         elif self.final is not None and self.final != self.base:
-            L.append(f"  {'confirm':10s} not run")
+            L.append(f"  {'confirm':11s} not run")
         cfg, why = self.recommended()
         L.append("")
         L.append(f"recommended: {cfg.name()}")
@@ -1014,9 +1189,10 @@ class Tuner:
             schema=SCHEMA, tool="moe-cache-tune", created=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             hardware=self.hw, software=dict(server=version, python=platform.python_version()),
             model=dict(file_info(o.model), **info, host_expert_mib=expert), predictor=file_info(o.predictor), predictor_start=file_info(o.predictor_start), draft_model=file_info(o.draft_model),
+            agent=file_info(o.agent), features=self.features, skipped=self.skipped,
             placement=[base_name(a) for a in self.extra], env=self.user_env(), accuracy_warnings=self.warnings, corpus=self.corpus, scale=o.scale, objective=o.objective,
             passes=o.passes, noise_sd={k: self.noise(k) for k in ("all", "short", "long")},
-            requests=[{k: r[k] for k in ("label", "kind", "max_tokens", "session")} for r in self.requests],
+            requests=[{k: r[k] for k in ("label", "kind", "max_tokens", "session")} for r in self.requests], stage_metrics=STAGE_METRIC,
             starting_point=self.base.name(), decisions=self.decisions, confirm=self.confirm, not_searched=self.not_searched,
             recommended=dict(name=cfg.name(), config=asdict(cfg), reason=why, args=self.recommended_line(cfg, False)),
             configs=[r for r in (self.config_row(c, numbered) for c in self.visited.values()) if r],
@@ -1046,9 +1222,11 @@ class Tuner:
             todo = sum((n, p) not in self.runs for n in d["tried"] if n not in seen for p in numbered)
             seen.update(d["tried"])
             total += todo
-            log(f"{d['stage']:10s} {todo:3d} runs: " + ", ".join(d["tried"]))
+            log(f"{d['stage']:11s} {todo:3d} runs: " + ", ".join(d["tried"]))
+        for stage, why in self.skipped.items():
+            log(f"{stage:11s}   0 runs: skipped, {why}")
         if self.final != self.base or self.decisions:
-            log(f"confirm    {2 * self.o.passes:3d} runs if the search changes anything: {self.base.name()} against the result")
+            log(f"confirm     {2 * self.o.passes:3d} runs if the search changes anything: {self.base.name()} against the result")
             total += 2 * self.o.passes
         est = self.est_run_s()
         log(f"at most {total} runs, {fmt_time(total * est)} at {est / 60:.1f} minutes per run; time budget {self.o.hours:g} h. The stages that do not fit are skipped, last ones first.")
@@ -1078,7 +1256,12 @@ def metrics(rec):
     drafted = sum(r["draft_n"] for r in reqs)
     fill = next((r for r in reqs if r["label"] == "fill"), None)
     dp = st.get("draft_passes") or {}
-    return dict(all=speed(("short", "long")), short=speed(("short",)), long=speed(("long",)), hits=st.get("hits"), mib_batch_token=st.get("mib_batch_token"),
+    agent = [r for r in reqs if r["kind"] == "agent"]
+    turn_ms = sum(r["prompt_ms"] + r["predicted_ms"] for r in agent)
+    agent_pp = sum(r["prompt_ms"] for r in agent)
+    return dict(all=speed(("short", "long", "agent")), short=speed(("short",)), long=speed(("long",)), agent=speed(("agent",)),
+                agent_turn=sum(r["predicted_n"] for r in agent) * 1000.0 / turn_ms if turn_ms > 0 else 0.0,
+                agent_prompt=sum(r["prompt_n"] for r in agent) * 1000.0 / agent_pp if agent_pp > 0 else None, hits=st.get("hits"), mib_batch_token=st.get("mib_batch_token"),
                 mib_gen=st.get("small_mib", 0.0) / max(n_gen, 1), accept=sum(r["draft_n_accepted"] for r in reqs) / drafted if drafted else None,
                 fill_prompt=fill["prompt_n"] * 1000.0 / fill["prompt_ms"] if fill and fill["prompt_ms"] > 0 else None, update_ms=st.get("update_ms"), restore_ms=st.get("restore_ms"),
                 drafted=dp.get("drafted"), got=dp.get("got"), rejected=dp.get("rejected"), ms_pass=dp.get("ms"))
@@ -1109,20 +1292,31 @@ def parse_args(argv):
     ap.add_argument("--predictor", help="--moe-cache-predictor file: compared with no predictor")
     ap.add_argument("--predictor-start", help="--moe-cache-predictor-start file: compared too, needs --predictor")
     ap.add_argument("--draft-model", help="draft model for speculative decoding (-md), by default of type draft-mtp; --spec-type after -- changes it")
+    ap.add_argument("--agent", help="a JSON list of an agent's recorded turns, [{\"prompt\": [token ids of the whole prompt], \"n\": answer tokens}, ...], "
+                    "sent to /completion in place of the made-up agent turns (default: an agent's loop over the corpus)")
     ap.add_argument("--corpus", help="directory of text files for the prompts, read in sorted order (default: part of Python's standard library, which differs between Python versions: use a corpus to compare machines)")
     ap.add_argument("--scale", type=float, default=1.0, help="scale the prompts and the answers, to fit a small context or to test the setup (default: %(default)s)")
     ap.add_argument("--hours", type=float, default=4, help="time budget of this start: stages that do not fit are skipped, later starts can continue them (default: %(default)s)")
     ap.add_argument("--run-minutes", type=float, default=5, help="minutes per run to plan with until a run has been timed (default: %(default)s)")
     ap.add_argument("--passes", type=int, default=2, help="passes per configuration, at least 2 (default: %(default)s)")
     ap.add_argument("--rounds", type=int, default=1, help="times through the stages: a second one revisits the early choices with the later ones in place (default: %(default)s)")
-    ap.add_argument("--stages", type=list_of(str), default=ALL_STAGES, help=f"the stages and their order (default: {','.join(ALL_STAGES)})")
-    ap.add_argument("--objective", choices=["all", "short", "long"], default="all", help="the speed to optimize: all requests, answers after large prompts, or long answers (default: %(default)s)")
+    ap.add_argument("--stages", type=list_of(str), default=DEFAULT_STAGES, help=f"the stages and their order (default: {','.join(DEFAULT_STAGES)}; also gate)")
+    ap.add_argument("--objective", choices=["all", "short", "long", "agent", "agent_turn"], default="all",
+                    help="the speed to optimize: all requests, answers after large prompts, long answers, an agent's answers, or an agent's whole turns; "
+                         "the jit stage always goes by agent_turn (default: %(default)s)")
     ap.add_argument("--budgets", type=list_of(float), default=[5.0, 20.0], help="--moe-cache-budget values to try, next to the current one (default: 5,20; the search starts at 10)")
     ap.add_argument("--refills", type=list_of(int), default=[0, 64, 128], help="--moe-cache-refill values to try (default: 0,64,128)")
     ap.add_argument("--draft-n", type=list_of(int), default=[1, 2], help="--spec-draft-n-max values to try without a gate (default: 1,2; the search starts at 3)")
     ap.add_argument("--draft-gates", type=list_of(gate_pair), default=[(3, 0.6), (5, 0.8), (8, 0.9)], help="N:P pairs of --spec-draft-n-max and --spec-draft-p-min to try (default: 3:0.6,5:0.8,8:0.9)")
     ap.add_argument("--mibs", nargs="+", help="--moe-cache-mib values to try, N or N1,N2 (default: 85%% of --mib)")
     ap.add_argument("--copy-threads", type=list_of(int), default=[2, 8], help="LLAMA_MOE_CACHE_COPY_THREADS values to try (default: 2,8; the search starts at 4)")
+    ap.add_argument("--spin-counts", type=list_of(int), default=[30000000], help="GOMP_SPINCOUNT values to try: GNU OpenMP's threads spin this long before they sleep, "
+                    "~1 ms by default, about the gap between two layers' CPU work (default: 30000000, ~32 ms on a Threadripper 1920X)")
+    ap.add_argument("--cpu-chunks", type=list_of(int), default=[64, 128, 256], help="GGML_CPU_MMID_FLAT values to try: the CPU's experts in chunks of this many rows (default: 64,128,256)")
+    ap.add_argument("--submit-mflops", type=list_of(int), default=[25, 100], help="GGML_VK_FLOPS_PER_SUBMIT values to try, in millions (default: 25,100)")
+    ap.add_argument("--answer-caps", type=list_of(int), default=[500, 1000, 2000], help="--moe-cache-predictor-answer-cap values to try (default: 500,1000,2000; the search starts at 0, all)")
+    ap.add_argument("--jits", type=list_of(int), default=[4, 8, 16], help="--moe-cache-jit values to try (default: 4,8,16; the search starts at 0, off)")
+    ap.add_argument("--cpu-threads", type=list_of(int), help="-t values to try (default: the physical cores and a quarter fewer, if the placement has another)")
     ap.add_argument("--noise-k", type=float, default=2.0, help="a gain must exceed this many standard errors of the difference (default: %(default)s)")
     ap.add_argument("--min-gain", type=float, default=0.5, help="and this many percent (default: %(default)s)")
     ap.add_argument("--port", type=int, default=8095, help="the server's port on 127.0.0.1; a busy port stops the search (default: %(default)s)")
@@ -1147,7 +1341,7 @@ def parse_args(argv):
             ap.error(f"--mib must be N or N1,N2, not {o.mib}")
     if o.mibs is None:
         o.mibs = [",".join(str(int(int(n) * 0.85)) for n in o.mib.split(","))]
-    for f in (o.model, o.predictor, o.predictor_start, o.draft_model):
+    for f in (o.model, o.predictor, o.predictor_start, o.draft_model, o.agent):
         if f and not os.path.isfile(f):
             ap.error(f"no such file: {f}")
     if o.corpus and not os.path.isdir(o.corpus):
