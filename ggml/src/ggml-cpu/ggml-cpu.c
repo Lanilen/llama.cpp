@@ -3130,6 +3130,7 @@ static struct {
     int64_t t_call;     // when the current graph was handed to the threads
     uint64_t graphs[GGML_CPU_OPS_KEYS], graph_wall[GGML_CPU_OPS_KEYS], wake[GGML_CPU_OPS_KEYS];
     struct ggml_cpu_op_stat op[GGML_CPU_OPS_KEYS][GGML_OP_COUNT];
+    struct ggml_cpu_op_stat mmid[GGML_CPU_OPS_KEYS][GGML_TYPE_COUNT];   // MUL_MAT_ID by the type of its weights
     int64_t start[2][GGML_MAX_N_THREADS], work[2][GGML_MAX_N_THREADS];   // by node parity, so a node's values survive
     uint8_t seen[1 << 14];                                               // until thread 0 reads them after the barrier
 } g_cpu_ops = { -1 };
@@ -3142,15 +3143,21 @@ static void ggml_cpu_op_stats_print(void) {
         }
         fprintf(stderr, "cpu op stats, batches of %d%s tokens: %" PRIu64 " graphs, %.1f us a graph, of which %.1f us before the threads start\n",
                 k + 1, k + 1 == GGML_CPU_OPS_KEYS ? "+" : "", g, (double) g_cpu_ops.graph_wall[k] / g, (double) g_cpu_ops.wake[k] / g);
-        fprintf(stderr, "  %-14s %6s %9s %9s %9s %9s | %8s %8s %8s %8s\n", "op (us a graph)", "calls", "wall", "work max",
+        fprintf(stderr, "  %-16s %6s %9s %9s %9s %9s | %8s %8s %8s %8s\n", "op (us a graph)", "calls", "wall", "work max",
                 "work mean", "wait", "experts", "MiB", "GB/s wall", "GB/s max");
-        for (int o = 0; o < GGML_OP_COUNT; ++o) {
-            const struct ggml_cpu_op_stat * st = &g_cpu_ops.op[k][o];
+        for (int o = 0; o < GGML_OP_COUNT + GGML_TYPE_COUNT; ++o) {
+            const struct ggml_cpu_op_stat * st = o < GGML_OP_COUNT ? &g_cpu_ops.op[k][o] : &g_cpu_ops.mmid[k][o - GGML_OP_COUNT];
             if (st->calls == 0) {
                 continue;
             }
+            char name[64];
+            if (o < GGML_OP_COUNT) {
+                snprintf(name, sizeof(name), "%s", ggml_op_name((enum ggml_op) o));
+            } else {
+                snprintf(name, sizeof(name), "MUL_MAT_ID %s", ggml_type_name((enum ggml_type) (o - GGML_OP_COUNT)));
+            }
             const double nth = (double) st->threads / st->calls;
-            fprintf(stderr, "  %-14s %6.1f %9.1f %9.1f %9.1f %9.1f", ggml_op_name((enum ggml_op) o), (double) st->calls / g,
+            fprintf(stderr, "  %-16s %6.1f %9.1f %9.1f %9.1f %9.1f", name, (double) st->calls / g,
                     (double) st->wall / g, (double) st->work_max / g, (double) st->work_sum / g / nth,
                     (double) (st->wall - st->work_max) / g);
             if (st->bytes) {
@@ -3207,9 +3214,13 @@ static void ggml_cpu_op_stats_mmid(const struct ggml_tensor * node, struct ggml_
     st->bytes   += n * src0->nb[2];
 }
 
+static struct ggml_cpu_op_stat * ggml_cpu_op_stats_slot(const struct ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT_ID ? &g_cpu_ops.mmid[g_cpu_ops.key][node->src[0]->type] : &g_cpu_ops.op[g_cpu_ops.key][node->op];
+}
+
 // thread 0, after the barrier that ends a node: every thread has written its times for it
 static void ggml_cpu_op_stats_node(const struct ggml_tensor * node, int par, int64_t t0, int nth, bool first) {
-    struct ggml_cpu_op_stat * st = &g_cpu_ops.op[g_cpu_ops.key][node->op];
+    struct ggml_cpu_op_stat * st = ggml_cpu_op_stats_slot(node);
     int64_t wmax = 0, wsum = 0, smax = 0;
     for (int t = 0; t < nth; ++t) {
         wmax = MAX(wmax, g_cpu_ops.work[par][t]);
@@ -3278,7 +3289,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             t0 = ggml_time_us();
             g_cpu_ops.start[par][state->ith] = t0;
             if (state->ith == 0 && node->op == GGML_OP_MUL_MAT_ID) {
-                ggml_cpu_op_stats_mmid(node, &g_cpu_ops.op[g_cpu_ops.key][node->op]);
+                ggml_cpu_op_stats_mmid(node, ggml_cpu_op_stats_slot(node));
             }
         }
 
