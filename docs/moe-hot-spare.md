@@ -21,7 +21,7 @@ llama-server -m model.gguf -ngl 99 --n-cpu-moe 48 \
 On the 2x RX 480 machine generation went from 11.7 to 14.5 tok/s with MTP, and a 9.6k-token prompt from 36.5 to 86
 tok/s with `--moe-cache-resize` ([Measured](#measured)). On the R9700, Flash-Next UD-Q4_K_XL went from 16.8 to 25.9 tok/s
 with the cache alone, and to 41 tok/s with everything in this guide and the [predictor](moe-predictor.md)
-([FORK.md](../FORK.md#setups)).
+([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups)).
 
 ## Contents
 
@@ -121,7 +121,7 @@ computes them in that wait rather than after the CPU's experts.
   where they are first used, as before.
 - The kernels and their inputs don't change, so neither do the logits (`LLAMA_MOE_SIDE=0` turns it off, to compare).
 
-On the R9700 with the setup in [FORK.md](../FORK.md#setups) at the time (`llama-server`, MTP with 2 drafts, temperature 0,
+On the R9700 with the setup in [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) at the time (`llama-server`, MTP with 2 drafts, temperature 0,
 four runs each), a pass of the model took 3.2 ms less with both quants:
 
 | | answers | agent turns | a pass of the model |
@@ -234,7 +234,7 @@ slots, the share of the misses' selections they took from the CPU, and its time 
 
 ### The CPU's experts
 
-*On `polaris` only, for now.*
+*On the `moe-tuning` branch.*
 
 With the cache, the CPU's experts are the largest part of a pass that the GPU waits for. On a Threadripper 1920X with
 73.5 GB/s of RAM at 12 threads, they read their weights at 39 GB/s (Q4) and 46 (Q6), while the same kernels with the
@@ -248,7 +248,7 @@ things held them back:
   `GGML_CPU_MMID_FLAT=C` lines up the rows of all active experts and hands them out in chunks of C rows, taken
   dynamically, for up to 8 tokens per expert. The logits don't change.
 
-On the R9700 setup of [FORK.md](../FORK.md#setups), with both against without (two passes each):
+On the R9700 setup of [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups), with both against without (two passes each):
 
 | | usual answers | follow-up turns | agent turns | whole run |
 | --- | --- | --- | --- | --- |
@@ -270,7 +270,7 @@ submits of ~20 µs each per split. `GGML_VK_FLOPS_PER_SUBMIT=N` sets a fixed tar
 On the R9700, a 3-token verify pass of Q4 was 21.1 ms of recording and submitting, 2.1 ms of copies, 5.1 ms waiting for
 the GPU and 20.9 ms of CPU experts (`GGML_SCHED_TIMING=1`, `GGML_VK_HOST_TIMING=1`). One submit per split saved 8 ms of
 recording but the GPU started 10 ms later, 2–3% slower. A fixed target, end to end with the setup of
-[FORK.md](../FORK.md#setups) (two passes each):
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) (two passes each):
 
 | | usual answers | agent turns |
 | --- | --- | --- |
@@ -295,7 +295,7 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: the matrix-vector MUL_MAT_ID shaders skip slots with id -1 | all Vulkan GPUs, one check per workgroup | none |
 | Vulkan: fused f32 adds no longer need `shaderRoundingModeRTEFloat16` | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
 | Vulkan: split_k also for a matrix multiplication with fewer columns than a tile (9-31 tokens), not only from a whole tile | all Vulkan GPUs | `GGML_VK_SPLIT_K_SMALL_N=0` |
-| Vulkan: a mat-vec MUL_MAT followed by SCALE and SiLU or sigmoid runs as one dispatch, the two in its store (`polaris`) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1` |
+| Vulkan: a mat-vec MUL_MAT followed by SCALE and SiLU or sigmoid runs as one dispatch, the two in its store (`moe-tuning`) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1` |
 
 On the RTX 4070 Ti, a model with its experts on the CPU and no cache generated 29.2 instead of 26.6 tok/s with the first
 four.
@@ -376,7 +376,7 @@ depend on the CPU, the link and the model. `tools/moe-trace/moe-cache-tune.py` s
 within a time budget, and writes a results file you can share. It covers the cache's settings (predictor, refill,
 answer cap, budget, size, `--moe-cache-jit`, copy threads), the MTP drafts, and the CPU and Vulkan settings above
 (`GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `GGML_VK_FLOPS_PER_SUBMIT`, `-t`). What each stage does:
-[FORK.md](../FORK.md#tuning-a-machine); the method and options:
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine); the method and options:
 [tools/moe-trace](../tools/moe-trace/README.md#tuning-a-machine).
 
 **The refresh, offline.** `tools/moe-trace/hot_spare_sim.py` replays a recorded session through the refresh logic. On the
@@ -593,7 +593,7 @@ The switches and timing tools are in [Environment variables](#environment-variab
 
 ### The mat-vec store
 
-*On `polaris` only, for now.*
+*On the `moe-tuning` branch.*
 
 A mat-vec MUL_MAT followed by a SCALE and a SiLU or sigmoid runs as one dispatch, the scale and the activation in the
 mat-vec's store (`mm_post` in the shaders). Flash-Next has 97 of them a pass, the down projections of its
@@ -621,7 +621,7 @@ here), and the matmul+add patterns do not occur in this model's graph.
 ## Measured
 
 On the 2x RX 480 machine and the RTX 4070 Ti. The R9700's numbers are in the sections above and in
-[FORK.md](../FORK.md). Greedy decoding of one coding prompt, 256 tokens, and a 5-turn coding session with `session-bench.py` (a 9.6k-token
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md). Greedy decoding of one coding prompt, 256 tokens, and a 5-turn coding session with `session-bench.py` (a 9.6k-token
 paste of a source file, then four turns of up to 1024 tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes (overlapping
 splits, asynchronous reads), which also speed up a model with its experts on the CPU and no cache.
 
