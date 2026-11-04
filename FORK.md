@@ -158,6 +158,13 @@ passes each:
 Every agent turn got faster (Q4 +5.9 to +10.6%, Q6 +2.0 to +8.7%). `GGML_CPU_OP_STATS=1` prints the CPU's ops per batch
 size (wall, the threads' work, and the experts' GB/s by weight type) at exit.
 
+What didn't help, on the same machine: software prefetch of the expert rows (`GGML_CPU_MMID_PREFETCH`, 2–16 rows
+ahead: 1–14% slower), 16 or 23 threads instead of 12 (4–20% slower: two threads per core share its arithmetic), and
+ggml's repacked q4_K layout (Qwen3-30B-A3B on the CPU: 9–17% slower at 1–3 tokens, faster only from 8). Loading the
+weights into memory instead of mapping them gave 2–3%. At ~45 GB/s cold against a ~96 GB/s ceiling in cache, Zen 1
+can't keep enough reads in flight for a kernel this heavy. Against Strata (~51 GB/s by its own counts), the kernel
+is about 15% of the CPU gap; the rest is bytes: at 3 tokens we compute 5.1 missed experts a layer, it about 2.3.
+
 ## Build
 
 ```bash
