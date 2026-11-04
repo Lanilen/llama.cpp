@@ -112,7 +112,7 @@ k = 2560 and 10240, m = 4-10240), for what one product over concatenated weights
 
 ## Tuning a machine
 
-`moe-cache-tune.py` finds the best cache settings for your machine and model, and writes a file you can share. The best settings depend on the hardware: on an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, the predictor without the refill won on Flash-Next, budget 10 was best on Q4 and 5 on Q6, and 3 drafts lost to 2 ([results](../../docs/moe-predictor.md#live-on-the-r9700)). A newer CPU or a faster link can change all of that.
+`moe-cache-tune.py` finds the best hot spare settings for your machine and model, the CPU's and Vulkan's included, and writes a file you can share. The best settings depend on the hardware. On an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, Flash-Next ran best with the predictor and no refill, an answer cap of 1000, 2 drafts, budget 10 and `--moe-cache-jit 8`, with `GOMP_SPINCOUNT=30000000`, `GGML_CPU_MMID_FLAT=128` and `GGML_VK_FLOPS_PER_SUBMIT=100000000` ([FORK.md](../../FORK.md#tuning-a-machine)). A newer CPU or a faster link can change all of that.
 
 It needs Python 3.8+ and nothing else, so you can copy the one file to another machine. It has been run on Linux only. Elsewhere the hardware details will be sparser, and the rest is untested.
 
@@ -125,6 +125,8 @@ python3 moe-cache-tune.py --server build/bin/llama-server -m model.gguf --mib 80
 - **After `--`:** your placement, passed to the server unchanged. The tool sets the model, port, `-np 1`, `-v` and the options it sweeps, and refuses them here. Environment variables such as `LLAMA_MOE_CACHE_REFILL_BG=1` (the lab's runs set it) carry through and are recorded.
 - **`--mib`:** a size you know fits ([Sizing the cache](../../docs/moe-hot-spare.md#sizing-the-cache)), one number or one per GPU. The search only tries a larger one if you list it in `--mibs`, because a cache that doesn't fit fails on NVIDIA and silently runs at half speed on amdgpu.
 - **`--predictor`, `--predictor-start`, `--draft-model`:** optional. Each is compared with running without it. A draft model is of type `draft-mtp` unless `--spec-type` follows `--`.
+- **`--agent FILE`:** optional, an agent's recorded turns to replay instead of the made-up ones: a JSON list of `{"prompt": [token ids of the whole prompt], "n": answer tokens}`, sent to `/completion`. Token ids belong to one model's vocabulary.
+- **The environment** the tool sweeps (`GOMP_SPINCOUNT`, `OMP_WAIT_POLICY`, `GGML_CPU_MMID_FLAT`, `GGML_VK_FLOPS_PER_SUBMIT` and the `LLAMA_ARG_` variables of the options it sets) is ignored with a warning. Anything else carries through.
 - **`--dry-run`** prints the plan and what's missing. **`--summary`** rewrites the reports from the runs on disk.
 
 Before you start, close what uses the GPU: other programs make the speeds noisy, and a large cache can push them out of VRAM. The tool prints the free memory and warns about another `llama-server` or a high load.
@@ -133,20 +135,26 @@ Before you start, close what uses the GPU: other programs make the speeds noisy,
 
 ### The search
 
-A run takes about 5 minutes and each configuration runs at least twice, so the roughly 1000 combinations of the default values would take a week. The search instead changes one setting per stage and carries the best one forward. A configuration that a stage carries over isn't run again, so with a predictor and a draft model the plan is at most 35 runs, about 3 hours.
+A run takes about 5 minutes and each configuration runs at least twice, so all the combinations of the default values would take months. The search instead changes one setting per stage and carries the best one forward. A configuration that a stage carries over isn't run again, so with a predictor and a draft model the plan is about 50 runs, 5–6 hours. The starting point sets none of the CPU and Vulkan variables and none of the newer options, so the confirm stage measures everything the search found.
 
 | Stage | Tries | Why it's there |
 | --- | --- | --- |
-| `predictor` | none, `--moe-cache-predictor`, also `--moe-cache-predictor-start` | First because it's the largest effect. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
+| `omp-spin` | `--spin-counts 30000000` against not set (`GOMP_SPINCOUNT`) | GCC's OpenMP spins ~1 ms before its threads sleep, about the gap between two layers' CPU work. Only with a build that links libgomp. |
+| `cpu-chunks` | `--cpu-chunks 64,128,256` against not set (`GGML_CPU_MMID_FLAT`) | How the CPU's experts are cut between its threads; depends on the memory system. |
+| `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan device. |
+| `predictor` | none, `--moe-cache-predictor`, also `--moe-cache-predictor-start` | The largest effect of the cache's settings. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
 | `refill` | `--refills 0,64,128` | Tested at the predictor setting just chosen. |
+| `answer-cap` | `--answer-caps 500,1000,2000` against 0, all (`--moe-cache-predictor-answer-cap`) | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. |
 | `drafts` | `--draft-n 1,2` and the start, 3 | Sets how much each pass verifies, which the budget and the hit rate then count. |
-| `gate` | `--draft-gates 3:0.6,5:0.8,8:0.9` (`--spec-draft-n-max`:`--spec-draft-p-min`) | Longer drafts that stop when the draft head is unsure. Drafts are always verified, so this doesn't change the output. |
+| `gate` | `--draft-gates 3:0.6,5:0.8,8:0.9` (`--spec-draft-n-max`:`--spec-draft-p-min`) | Not in the defaults: gates lose to the graph rebuild that each new verify length costs. `--stages` adds it. |
 | `budget` | `--budgets 5,20` and the start, 10 | After the drafts, because the budget counts every token of a verify batch. |
 | `mib` | `--mibs`, by default 85% of `--mib` | A smaller cache can win if uploads are slow or the card is short of memory. |
-| `threads` | `--copy-threads 2,8` and the start, 4 (`LLAMA_MOE_CACHE_COPY_THREADS`) | Last because it's the smallest effect so far. |
+| `jit` | `--jits 4,8,16` against 0, off (`--moe-cache-jit`) | Judged by the agent's whole turns, prompts included, since it speeds up prompts and costs a little generation. Needs prompts of 33 tokens and more that keep the cache (`--moe-cache-batch`). |
+| `threads` | `--copy-threads 2,8` and the start, 4 (`LLAMA_MOE_CACHE_COPY_THREADS`) | A small effect. |
+| `cpu-threads` | `--cpu-threads`, by default the physical cores and a quarter fewer, against the placement's `-t` | Replaces `-t` in the placement. A second thread on a core shares its arithmetic. |
 | confirm | the result against the starting point | See below. |
 
-A stage is skipped if it doesn't fit `--hours`, keeping enough time for the confirm stage. Skipped stages are listed as not searched, and a later start with more hours picks them up. Decisions are recomputed from the stored runs in the same order, so a restart takes the same path. `--stages` chooses the stages and their order, `--objective short` or `long` optimizes for one kind of answer, and `--rounds 2` goes through the stages again.
+A stage is also skipped when it can't change anything here: the build lacks the setting (the tool looks for its name in the server and the libraries beside it), the machine can't use it, or a stage before it ruled it out. The summary says why. A stage is skipped if it doesn't fit `--hours`, keeping enough time for the confirm stage. Skipped stages are listed as not searched, and a later start with more hours picks them up. Decisions are recomputed from the stored runs in the same order, so a restart takes the same path. `--stages` chooses the stages and their order, `--objective short`, `long`, `agent` or `agent_turn` optimizes for one kind of request, and `--rounds 2` goes through the stages again.
 
 This can miss a combination that only pays when two settings change together, unless the stages happen to reach it. The predictor and refill interaction is handled by the first stage; `--rounds 2` covers the rest if you have the time.
 
@@ -155,11 +163,12 @@ This can miss a combination that only pays when two settings change together, un
 - **The requests** are the lab's, the same for every configuration at temperature 0:
   - `story`, a 512-token answer to a short prompt (kind `long`);
   - `ask-a`, `ask-b` and `fill`, short answers after about 2k, 2k and 18k tokens of text (kind `short`);
-  - a 4-turn session on a 1.6k-token paste. `turn1` is kind `short` and the later turns are kind `long`.
+  - a 4-turn session on a 1.6k-token paste. `turn1` is kind `short` and the later turns are kind `long`;
+  - an agent's loop of six turns (kind `agent`): a file, then tool outputs of about 150–1000 tokens each in the same conversation, each with a short answer. `--agent` replaces them with recorded turns.
 
-  The gains differ sharply between the two kinds, so the summary shows both. The text comes from `--corpus DIR` (sorted files), by default part of Python's standard library. That part differs between Python versions, so use the same corpus to compare machines; `corpus.sha256` in the results tells you whether they match. `--scale` shrinks the prompts and answers, to fit a small context or to test a setup.
+  The gains differ sharply between the kinds, so the summary shows each. `all` is generation over every request, weighted by tokens. `turn` is the agent's answer tokens per second of its whole turns, prompts included, and `a.pp` its prompts' speed. The text comes from `--corpus DIR` (sorted files), by default part of Python's standard library. That part differs between Python versions, so use the same corpus to compare machines; `corpus.sha256` in the results tells you whether they match. `--scale` shrinks the prompts and answers, to fit a small context or to test a setup.
 - **A warm-up run** comes first and isn't measured. It fills the page cache, which would otherwise count against the first configuration, and checks that the requests fit the context. Its answers become every run's session history, so all the requests stay the same bytes even if an answer drifts.
-- **A run must do what it was asked to.** The server goes on without a draft model or a predictor it can't use, for example one whose vocabulary or shape doesn't match. A run that drafted nothing or predicted nothing therefore counts as failed. If that's the warm-up, the search stops with the reason. A later configuration that fails, such as a cache that doesn't fit, is left out of the comparison and tried again on the next start.
+- **A run must do what it was asked to.** The server goes on without a draft model or a predictor it can't use, for example one whose vocabulary or shape doesn't match. A run that drafted nothing or predicted nothing therefore counts as failed, as does one with `--moe-cache-jit` that uploaded nothing. If that's the warm-up, the search stops with the reason. A later configuration that fails, such as a cache that doesn't fit, is left out of the comparison and tried again on the next start.
 - **Passes** run in order, then in reverse, so that a slow drift of the machine favours neither end. Speeds are weighted by tokens. One server runs at a time, and a busy port stops the search.
 - **The noise** is the standard deviation of one run, pooled over the configurations so far. A setting replaces the current one only if its gain is above `--noise-k` (2) standard errors of the difference and above `--min-gain` (0.5%). Otherwise the current one stays, so the starting point wins ties.
 - **The confirm stage** runs the result and the starting point again, in one block, because the search's winners were picked from several noisy candidates and measured hours apart. If the gain doesn't hold, the recommendation is the starting point.
@@ -178,6 +187,6 @@ It has no prompts and no answers. Keep `OUT/logs` and `OUT/history.json` local: 
 
 ### What it never changes
 
-It sweeps only settings that move experts and speculative work around. It doesn't skip routed experts, change their number, lower KV or tensor precision, or add sampling options. Options in your placement that do change the answers (`-ctk`, `-ctv`, `--override-kv`, sampling penalties) run as given, with a warning that's also recorded in the results.
+It sweeps only settings that move experts and speculative work around, or change how the CPU and the GPU schedule the same work. It doesn't skip routed experts, change their number, lower KV or tensor precision, or add sampling options. Options in your placement that do change the answers (`-ctk`, `-ctv`, `--override-kv`, sampling penalties) run as given, with a warning that's also recorded in the results.
 
 Answers can still differ between configurations in near ties, even at temperature 0: the GPU and CPU kernels round differently, and which expert runs where depends on the timing of the uploads ([How it works](../../docs/moe-hot-spare.md#the-hot-spare)). The `answers` column counts the requests that differ between a configuration's passes and from the warm-up, and the hashes are in the results. Speed follows the text, so treat a small gain with care when the answers differ.

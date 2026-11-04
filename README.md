@@ -8,12 +8,14 @@
 > - sparse-attention ops that used to fall back to the CPU on GPUs without fp16;
 > - a GPU cache of the most used experts that runs beside the CPU, with the scheduler and Vulkan changes around it;
 > - a small learned model that predicts which experts the next tokens need;
-> - kernel tuning for RDNA4.
+> - faster CPU experts and Vulkan submits for models split between the GPU and the CPU;
+> - kernel tuning for RDNA4;
+> - a script that finds the best of these settings for another machine.
 >
 > With Qwen3.8-Flash-Next on the two RX 480s, a 9.6k-token prompt reads at 86 tok/s instead of 36.5, and generation runs
 > at 14.5 tok/s instead of 11.7. On the R9700, the cache took generation from 16.8 to 25.9 tok/s with the same
-> settings, and with the predictor and two MTP drafts it now runs at about 31. The results and how they were measured
-> are in [FORK.md](FORK.md).
+> settings, and with everything since it runs at 41 tok/s on Q4_K_XL and 33 on Q6_K_XL. The results and how they were
+> measured are in [FORK.md](FORK.md).
 >
 > **It is tuned for one home lab.** Some changes work around the RX 480's Vulkan driver and could make other GPUs slower
 > where they collide with features that modern GPUs use. We try to avoid that: the changes that apply to every GPU were
@@ -30,7 +32,7 @@ useful beyond Polaris.
 | [`polaris`](https://github.com/Lanilen/llama.cpp/tree/polaris) | everything below, and this README | the lab's setup: the one to use | [FORK.md](FORK.md) |
 | [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan support for the sparse-attention ops on GPUs without fp16 | any Vulkan GPU without fp16 (Polaris, older GCN) with Qwen3.8-Flash-Next or DeepSeek-style indexers | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
 | [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | a GPU cache of the most used experts that runs beside the CPU; scheduler and Vulkan changes for models with experts on the CPU; trace tools | any MoE model whose experts don't fit in VRAM, on Vulkan GPUs (tested on AMD and NVIDIA) | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
-| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus a learned predictor of the next experts, and its training pipeline | the same; trained so far for Qwen3.8-Flash-Next | [docs/moe-predictor.md](docs/moe-predictor.md) |
+| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus a learned predictor of the next experts and its training pipeline, just-in-time uploads for medium prompts, the tuning script | the same; trained so far for Qwen3.8-Flash-Next | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4 (**work in progress, stable**) | AMD RDNA4 GPUs (RX 9060/9070, AI PRO R9700) | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
 | `master` | upstream, unchanged | | |
 
