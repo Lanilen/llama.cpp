@@ -40,6 +40,8 @@ ap.add_argument("--init", default="", help="a saved model to start from (fine-tu
 ap.add_argument("--switch-weight", type=float, default=0.0, help="weight samples by 1 + this x their switch size (the "
                 "distance of the target from the live score), normalised to mean 1: training for large swaps")
 ap.add_argument("--by-source", action="store_true", help="hit rates of the model and the live rule per source of the held-out traces")
+ap.add_argument("--source-input", action="store_true", help="also the answer's source as a one-hot input to the MLP (an "
+                "oracle selector: how much would knowing the kind of conversation add?)")
 ap.add_argument("--sim", default="", help="swap budgets per token for replays of the held-out answers, e.g. 1.7,8.4")
 args = ap.parse_args()
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,6 +78,15 @@ def load(names):
     return D
 
 LAYER = torch.arange(NL, device=dev).view(1, NL, 1) * NE
+SRCS = []   # with --source-input: the sources, in the order of their one-hot input
+
+def src_of(D, a):
+    """[B] the index in SRCS of each answer's source (None without --source-input)"""
+    if not SRCS:
+        return None
+    if "src_idx" not in D:
+        D["src_idx"] = torch.tensor([SRCS.index(x) for x in D["src"]], device=dev)
+    return D["src_idx"][a]
 
 def scatter(D, a, t0, t1, w_fn):
     """[B, 48*512] sum over the tokens [t0, t1) of answer a (per sample) of w_fn(k, n) * one-hot, k = token index"""
@@ -156,10 +167,10 @@ class Model(nn.Module):
                 self.w[str(H)][0] = 1.0   # start from the live rule
         self.n_slots = 1 if args.hid_last_only else 3
         self.norm = nn.LayerNorm(self.n_slots * NH * N_EMBD)
-        self.mlp = nn.Sequential(nn.Linear(self.n_slots * NH * N_EMBD + nb, 512), nn.GELU(), nn.Linear(512, args.rank))
+        self.mlp = nn.Sequential(nn.Linear(self.n_slots * NH * N_EMBD + nb + len(SRCS), 512), nn.GELU(), nn.Linear(512, args.rank))
         self.V = nn.ParameterDict({str(H): nn.Parameter(torch.zeros(NL * NE, args.rank)) for H in HS})
 
-    def forward(self, logp, hid, bucket, H):
+    def forward(self, logp, hid, bucket, H, src=None):
         B = logp.shape[0]
         out = self.bias[str(H)].view(1, NL, NE).expand(B, -1, -1)
         if not args.no_counts:
@@ -167,7 +178,8 @@ class Model(nn.Module):
             out = out + (w.unsqueeze(-1) * logp).sum(1)
         if not args.no_hidden:
             oh = F.one_hot(bucket, len(BUCKETS)).float()
-            z = self.mlp(torch.cat([self.norm(hid.view(B, -1)), oh], 1))
+            parts = [self.norm(hid.view(B, -1)), oh] + ([F.one_hot(src, len(SRCS)).float()] if SRCS else [])
+            z = self.mlp(torch.cat(parts, 1))
             out = out + (z @ self.V[str(H)].t()).view(B, NL, NE)
         return out
 
@@ -199,6 +211,8 @@ if __name__ == "__main__":
             prior = (prior.view(NL, NE) / prior.view(NL, NE).sum(1, keepdim=True)).view(-1)
     print(f"loaded {0 if args.load else len(TR['lens'])} train / {len(TE['lens'])} test answers in {time.time() - t0:.0f} s, "
           f"{dev.type}, reading the records from disk", flush=True)
+    if args.source_input:
+        SRCS.extend(ck["sources"] if ck is not None and "sources" in ck else sorted(set(TE["src"]) | set(TR["src"])))
     model = Model(prior.view(NL, NE)).to(dev)
     if ck is not None:
         model.load_state_dict(ck["state"] if "state" in ck else ck)
@@ -221,7 +235,7 @@ if __name__ == "__main__":
             for H in HS:
                 tgt = target(TR, a, t, H)
                 q = tgt / tgt.sum(-1, keepdim=True).clamp(min=1)
-                ce = -(q * F.log_softmax(model(logp, hid, bucket, H), -1)).sum(-1).mean(-1)     # [B]
+                ce = -(q * F.log_softmax(model(logp, hid, bucket, H, src_of(TR, a)), -1)).sum(-1).mean(-1)     # [B]
                 if args.switch_weight:
                     live = maps[:, 0] / maps[:, 0].sum(-1, keepdim=True).clamp(min=1e-9)
                     tv = 0.5 * (q - live).abs().sum(-1).mean(-1)                               # 0..1 per sample
@@ -247,7 +261,7 @@ if __name__ == "__main__":
                     hid = hidden(TE, a, t) if not args.no_hidden else None
                     bucket = torch.tensor([bidx[int(x)] for x in t.tolist()], device=dev)
                     tgt = target(TE, a, t, H)
-                    sc = {"model": model(logp, hid, bucket, H), "oracle": tgt}
+                    sc = {"model": model(logp, hid, bucket, H, src_of(TE, a)), "oracle": tgt}
                     tie = prior.view(1, NL, NE) * 1e-6
                     for r, f in rules.items():
                         m = maps[:, f] if p > 0 or r == "live" else maps[:, 0]
@@ -285,7 +299,8 @@ if __name__ == "__main__":
         # with what an exporter needs (export_predictor.py)
         torch.save({"state": model.state_dict(), "prior": prior.view(NL, NE).cpu(), "buckets": BUCKETS, "horizons": HS,
                     "slots": ["last"] if args.hid_last_only else ["last", "prompt_mean", "answer_mean"],
-                    "rank": args.rank, "hid_layers": HID_LAYERS, "n_embd": N_EMBD, "n_expert_used": K, "maps": MAPS, "no_hidden": args.no_hidden}, args.save)
+                    "rank": args.rank, "hid_layers": HID_LAYERS, "n_embd": N_EMBD, "n_expert_used": K, "maps": MAPS, "no_hidden": args.no_hidden,
+                    **({"sources": SRCS} if SRCS else {})}, args.save)
 
     if args.sim:
         # swap-limited replays of a third of the held-out answers (their first 512 tokens): the live rule with the
@@ -308,7 +323,7 @@ if __name__ == "__main__":
                 logp, maps = features(TE, aa, tt, prior)
                 hid = hidden(TE, aa, tt) if not args.no_hidden else None
                 b = torch.tensor([bidx[min(BUCKETS, key=lambda x: abs(x - t))] for t in grid], device=dev)
-                p = {H: F.softmax(model(logp, hid, b, H), -1) for H in HS}
+                p = {H: F.softmax(model(logp, hid, b, H, src_of(TE, aa)), -1) for H in HS}
                 live = maps[:, 0] + tie
                 gen = maps[:, MAPS.index("answer")] + tie
                 mix = 0.5 * p[HS[0]] + 0.5 * p[HS[-1]]
