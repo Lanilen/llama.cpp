@@ -125,6 +125,18 @@ upstream there. With Qwen3-Coder-30B-A3B UD-Q4_K_XL on the GPU:
 
 The details and the switches to measure them: [docs/vk-rdna4.md](docs/vk-rdna4.md).
 
+**Flash-Next's GPU pass (2026-11-04, R9700 on COMPUTE).** A Q4 verify batch of 3 tokens is about 2000 dispatch groups
+between barriers, and a group of one small op costs about 6 µs. Three attempts at that overhead, measured at equal text:
+- Stacking the mat-vecs that read the same input into one weight saves 1.1–1.4 ms a pass in isolation
+  (`llama-mv-merge-bench`): mat-vecs issued back to back already read ~500–560 GB/s. Not built into the model.
+- A wider look-ahead for the graph optimizer (`GGML_VK_GRAPH_OPT_WINDOW`, default 20) cuts the groups by 7–9% at 40–320
+  nodes, with no change in speed.
+- Fusing MUL_MAT → SCALE → SiLU/sigmoid into the mat-vec's store (the hyper-connection down projection, 97 times a
+  pass; `GGML_VK_DISABLE_MM_POST` turns it off) gives the same logits as the unfused path and 194 fewer groups, for
+  +0.2–1.5% (noise). It stays on.
+
+The GPU's small ops are mostly not what a pass waits for: the main thread's CPU experts and the waits between them are.
+
 ## Build
 
 ```bash
