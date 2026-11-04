@@ -174,6 +174,35 @@ The two passes of a configuration differ by about 0.2 tok/s.
 - **The budget is a small effect, and it differs by quant:** 10 is best on Q4 (+0.35 tok/s) and 5 on Q6 (+0.43).
 - **The text start was usually slower here,** and always on the short answers it's meant for, though it cuts the
   uploads by 24–44%. It might still pay on a slower link; that isn't measured yet.
+- **The text start, retested** with the shared expert beside the MoE and the draft head's experts on the GPU, on the
+  usual answers plus 10 agent turns (two passes each), still loses overall: generation at
+  33.27 → 32.63 tok/s on Q4 and 27.04 → 27.02 on Q6, with the whole run 8 s and 11 s longer. It splits by prompt
+  length:
+  - agent turns with prompts of 150–950 tokens generate 7–20% faster;
+  - the story and the follow-up turns, with prompts of 23–36 tokens, lose up to 13% (turn 4 on Q4: 36.6 → 32.0);
+  - with the top-up cap raised from 1000 to 3000 the hits come back, but the speed doesn't.
+
+  Using the text start only for prompts of 64 tokens or more would have given +1.8% (Q4) and +1.4% (Q6), from these
+  runs' per-request numbers, but the run would still take 3–5 s longer. About 4 GiB of uploads (1375 experts on Q4)
+  take about 0.3 s on the R9700's PCIe 3.0 x16 link. That's more than a short prompt takes, so the answer starts later.
+- **Capping the answer's start does better than the text start** (two passes each). Without a text start, the answer's
+  start rebalances the whole cache from the main predictor. `--moe-cache-predictor-answer-cap N` limits that
+  rebalance to N swaps, and the budget does the rest:
+
+  | | usual answers | follow-up turns | agent turns | hits | MiB/token |
+  |---|---|---|---|---|---|
+  | Q4, full rebalance | 36.07 | 37.27 | 30.81 | 83.17% | 40.8 |
+  | Q4, cap 300 | 34.03 (−5.7%) | 35.93 | 35.36 (+14.8%) | 79.12% | 14.1 |
+  | Q4, cap 1000 | 35.13 (−2.6%) | 37.24 | 34.41 (+11.7%) | 82.25% | 22.7 |
+  | Q4, text start | 34.88 (−3.3%) | 35.52 | 33.36 (+8.3%) | 82.47% | 24.6 |
+  | Q6, full rebalance | 29.28 | 28.65 | 26.28 | 72.39% | 51.2 |
+  | Q6, cap 1000 | 29.06 (−0.8%) | 29.70 (+3.7%) | 28.42 (+8.1%) | 71.33% | 28.7 |
+
+  Cap 1000 sped up 9 of 10 agent turns on Q4 and all 10 on Q6. Its prompts and whole-run times matched the full
+  rebalance's, while the text start's prompts were 4% slower and its run took 10 s longer. The full rebalance buys about
+  a point of hits, and the uploads behind it cost more than that point saves. Only the long, new-topic answers (the story,
+  the first code question) still gain from it. The card's clock was below COMPUTE's in these runs, the same for every
+  arm, so the speeds are lower than in [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) but compare with each other.
 - **A third draft is slower,** by 0.4–1.3 tok/s; on Q6 the short answers lose over 4.
 - **Fewer copy threads don't help:** 2 instead of 4 changed nothing on Q6 and cost 0.3 tok/s on Q4.
 
