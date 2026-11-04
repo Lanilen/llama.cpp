@@ -1682,6 +1682,67 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // GGML_CPU_MMID_FLAT=C: with up to 8 tokens per expert, the rows of all active experts are one list, cut into chunks
+    // of C rows that the threads take in turn, instead of every thread taking a slice of each expert: longer runs
+    // through cold weights, still balanced between threads of unequal speed
+    static int64_t mmid_flat = -1;
+    if (mmid_flat < 0) {
+        const char * env = getenv("GGML_CPU_MMID_FLAT");
+        mmid_flat = env ? MAX(1, atoll(env)) : 0;
+    }
+    if (mmid_flat > 0) {
+        int64_t total = 0, max_cne1 = 0;
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (matrix_row_counts[cur_a] > 0) {
+                total   += ne01;
+                max_cne1 = MAX(max_cne1, matrix_row_counts[cur_a]);
+            }
+        }
+        if (total > 0 && max_cne1 <= 8) {
+            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+            const int64_t n_chunks = (total + mmid_flat - 1)/mmid_flat;
+            // expert 0's counter, set to nth before the barrier above: the first nth chunks go one to each thread
+            atomic_int * chunk_ctr = (atomic_int *)(atomic_current_chunk + 0);
+            int64_t chunk = ith;
+            int cur_a = 0;
+            int64_t base = 0;   // the first row of cur_a in the list
+            while (chunk < n_chunks) {
+                const int64_t r0 = chunk*mmid_flat;
+                const int64_t r1 = MIN(total, r0 + mmid_flat);
+                // chunks come in increasing order to each thread, so the walk over the experts only moves forward
+                for (; cur_a < n_as; ++cur_a) {
+                    if (matrix_row_counts[cur_a] == 0) {
+                        continue;
+                    }
+                    if (base + ne01 > r0) {
+                        break;
+                    }
+                    base += ne01;
+                }
+                int64_t b = base;
+                for (int a = cur_a; a < n_as && b < r1; ++a) {
+                    const int64_t cne1 = matrix_row_counts[a];
+                    if (cne1 == 0) {
+                        continue;
+                    }
+                    const int64_t lo = MAX(r0, b);
+                    const int64_t hi = MIN(r1, b + ne01);
+                    if (lo < hi) {
+                        ggml_compute_forward_mul_mat_id_one_chunk(
+                            dst, src0, src1, ids, a,
+                            lo - b, hi - b, 0, cne1,
+                            (const char *) src0->data + a * nb02, matrix_rows, row_size, src1_cont, wdata
+                        );
+                    }
+                    b += ne01;
+                }
+                chunk = atomic_fetch_add_explicit(chunk_ctr, 1, memory_order_relaxed);
+            }
+            return;
+        }
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
