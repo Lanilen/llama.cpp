@@ -165,6 +165,15 @@ weights into memory instead of mapping them gave 2–3%. At ~45 GB/s cold agains
 can't keep enough reads in flight for a kernel this heavy. Against Strata (~51 GB/s by its own counts), the kernel
 is about 15% of the CPU gap; the rest is bytes: at 3 tokens we compute 5.1 missed experts a layer, it about 2.3.
 
+**The main thread's wait for the GPU** (3-token verify, with the settings above): the scheduler splits a Q4 pass into
+21.1 ms recording and submitting Vulkan work, 2.1 ms of copies, 5.1 ms waiting for the GPU and 20.9 ms of CPU experts
+(Q6: 22.3, 3.0, 5.0, 35.3). The many submits (5.4 per split, ~20 µs each) are not waste: they let the GPU start on a
+split while the rest is still being recorded. One submit per split (`GGML_VK_FLOPS_PER_SUBMIT=0`,
+`GGML_VK_MAX_NODES_PER_SUBMIT=1000`, +4% in October) now saves 8 ms of recording but adds 10 ms of waiting: 2–3% slower.
+With it, turning the MUL_MAT_SCALE_UNARY fusion off costs another 1.5–2.7%, so the fusion is worth that much where the
+GPU's tail shows. The chain a pass waits on is the GPU's per-layer work (~26 ms, ~40 dependent small groups a layer)
+and the CPU's experts (~21 ms); each fused dependent step saves about 0.5%.
+
 ## Build
 
 ```bash
