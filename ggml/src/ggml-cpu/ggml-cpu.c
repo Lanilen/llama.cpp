@@ -1515,6 +1515,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
+    // GGML_CPU_MMID_PREFETCH=R: while the first token of a block runs over row r, prefetch row r + R of the expert's
+    // weights: the hardware prefetcher stops at every 4 KiB page of the cold, memory-mapped weights
+    static int64_t pf = -1;
+    if (pf < 0) {
+        const char * env = getenv("GGML_CPU_MMID_PREFETCH");
+        pf = env ? MAX(0, atoll(env)) : 0;
+    }
+
     float tmp[16];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
@@ -1543,6 +1551,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                    if (pf && ir1 == iir1 && ir0 + pf < ne01) {
+                        const char * p = src0_cur + (ir0 + pf)*nb01;
+                        for (size_t off = 0; off < nb01; off += 64) {
+                            __builtin_prefetch(p + off, 0, 2);
+                        }
+                    }
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
