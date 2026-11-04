@@ -256,7 +256,10 @@ On the R9700 setup of [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polari
 | Q6_K_XL | 30.27 → 32.66 (+7.9%) | 30.77 → 33.46 (+8.7%) | 29.15 → 31.24 (+7.2%) | 321.2 → 312.8 s |
 
 By verify batch size (`llama-moe-logit-drift`, 1/3/8 tokens), `GGML_CPU_MMID_FLAT` 128 was the best of 64–512 (512 was
-7–16% slower), and the spin was worth as much as `OMP_WAIT_POLICY=active`, which spins forever. `GGML_CPU_OP_STATS=1`
+7–16% slower), and the spin was worth as much as `OMP_WAIT_POLICY=active`, which spins forever. The chunks don't suit every
+CPU: on an i5-14600KF (6 performance and 8 efficiency cores, 10 threads), Qwen3-Coder-30B-A3B entirely on the CPU wrote
+the same text at 6.36 tok/s with 128 against 7.07 without (one run each). `moe-cache-tune.py`'s `cpu-chunks` stage
+keeps them off where they lose. `GGML_CPU_OP_STATS=1`
 prints, per batch size at exit, each CPU op's wall time, its threads' work and the time before they start, and
 MUL_MAT_ID's experts and GB/s by weight type.
 
