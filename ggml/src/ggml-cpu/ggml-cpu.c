@@ -3208,7 +3208,7 @@ static struct {
     struct ggml_cpu_op_stat mmid[GGML_CPU_OPS_KEYS][GGML_TYPE_COUNT];   // MUL_MAT_ID by the type of its weights
     int64_t start[2][GGML_MAX_N_THREADS], work[2][GGML_MAX_N_THREADS];   // by node parity, so a node's values survive
     uint8_t seen[1 << 14];                                               // until thread 0 reads them after the barrier
-} g_cpu_ops = { -1 };
+} g_cpu_ops = { .on = -1 };
 
 static void ggml_cpu_op_stats_print(void) {
     for (int k = 0; k < GGML_CPU_OPS_KEYS; ++k) {
