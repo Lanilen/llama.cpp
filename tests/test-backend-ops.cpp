@@ -12944,6 +12944,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // Qwen3.8-Flash-Next's experts as the hot spare leaves them to the CPU: 640 x 2560 gate/up and 2560 x 640 down, about
+    // 2 misses a token, verify batches of 1-8 tokens (the used experts stay in cache between runs: a compute ceiling)
+    for (int bs : {1, 3, 8}) {
+        // gate/up: q4_K (Q4_K_XL), q5_K, q6_K (Q6_K_XL); down rows are 640 long, so 32-wide blocks: q5_1 (Q4_K_XL), q8_0 (Q6_K_XL)
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 2, false, 640, bs, 2560));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 2, false, 2560, bs, 640));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
