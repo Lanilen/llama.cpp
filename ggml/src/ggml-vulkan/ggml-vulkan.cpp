@@ -15217,7 +15217,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        // GGML_VK_GRAPH_OPT_WINDOW: how many nodes ahead to look for independent ones (default 20)
+        static const int NUM_TO_CHECK = [] {
+            const char * env = getenv("GGML_VK_GRAPH_OPT_WINDOW");
+            return env ? std::max(2, atoi(env)) : 20;
+        }();
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
