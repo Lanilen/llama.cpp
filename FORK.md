@@ -48,12 +48,12 @@ draft, in October).
 | [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan support for the sparse-attention ops on GPUs without fp16 | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
 | [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | the hot spare cache, `--moe-cache-resize`, the scheduler and Vulkan changes for models with experts on the CPU, trace tools | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
 | [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus the expert predictor and its training pipeline, `--moe-cache-jit`, the work beside the MoE, split_k for small batches, the tuning script | [docs/moe-predictor.md](docs/moe-predictor.md) |
+| [`moe-tuning`](https://github.com/Lanilen/llama.cpp/tree/moe-tuning) | `moe-predictor` plus the CPU's expert chunks and op counters, the mat-vec store fusion, and the tuning script with its CPU and Vulkan stages | [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts), [tools/moe-trace](tools/moe-trace/README.md#tuning-a-machine) |
 | [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4, **work in progress, stable** | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
 | `master` | upstream, unchanged | |
 
 Each branch is upstream llama.cpp plus that part, kept up to date with upstream by merges, so a part can be used
-without the others. `moe-predictor` builds on `moe-hot-spare`. The newest work is on `polaris` only, for now: the
-CPU's expert chunks and op counters, the mat-vec store fusion, and the tuning script's newer stages.
+without the others. `moe-predictor` builds on `moe-hot-spare`, and `moe-tuning` on `moe-predictor`.
 
 ## What the fork adds
 
@@ -131,7 +131,7 @@ the GPU once), but large batches need large compute buffers, which the cache wou
 
 ### Scheduler and Vulkan changes for split models
 
-*Branches `moe-hot-spare` and `moe-predictor`, the newest on `polaris`; guide
+*Branches `moe-hot-spare` and `moe-predictor`, the store fusion on `moe-tuning`; guide
 [docs/moe-hot-spare.md](docs/moe-hot-spare.md#changes-that-apply-without-any-option).*
 
 A model split between GPUs and the CPU runs as many small graphs (splits), with copies between them. These changes
@@ -143,7 +143,7 @@ apply to any such model, with or without the cache:
 - **MUL_MAT_ID skips unused slots** (id -1), which both cache branches rely on.
 - **Fused f32 adds without fp16 rounding modes**, so GPUs such as the RX 480 get them.
 - **split_k for 9–31 columns**, not only from a whole tile.
-- **A fused MUL_MAT → SCALE → SiLU/sigmoid** in the mat-vec's store (*`polaris`*): Flash-Next's hyper-connection
+- **A fused MUL_MAT → SCALE → SiLU/sigmoid** in the mat-vec's store (`moe-tuning`): Flash-Next's hyper-connection
   products, 97 a pass.
 - **A fixed Vulkan submit size** (`GGML_VK_FLOPS_PER_SUBMIT`, opt-in). The default cuts a split's work at 1/40 of the
   previous graph's flops. Layer splits alternate large and small, so the cut lands far too fine: 5.4 submits of about
@@ -188,7 +188,7 @@ layers at the newest token.
 
 ### The CPU's experts
 
-*`polaris` only; guide [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts).*
+*Branch `moe-tuning`, guide [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts).*
 
 With the cache, the CPU's experts are the largest part of a pass the GPU waits for. They read their weights at 39 GB/s
 (Q4) and 46 (Q6) on a Threadripper 1920X with 73.5 GB/s of RAM. With the same experts in the CPU's cache, the kernels
@@ -240,7 +240,8 @@ In `tools/moe-trace` ([README](tools/moe-trace/README.md)) and `tools/moe-predic
 The settings in [Setups](#setups) were found on one machine, and most of them depend on the hardware: how fast the
 link uploads, how fast the CPU reads its experts, how the GPU keeps up with the recording.
 [`tools/moe-trace/moe-cache-tune.py`](tools/moe-trace/README.md#tuning-a-machine) searches them for yours, and writes a
-results file you can share:
+results file you can share. It's on `moe-tuning` with all its stages (on `moe-predictor` with the cache's and the
+drafts' only):
 
 ```bash
 python3 tools/moe-trace/moe-cache-tune.py --server build-vk/bin/llama-server -m model.gguf --mib 8000 --out tune \
