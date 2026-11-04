@@ -37,8 +37,29 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    float post_scale;
+    float post_bias;
 #endif
 } p;
+
+#ifdef MUL_MAT_ID
+#define MV_STORE(v) D_TYPE(v)
+#else
+// the fused SCALE and UNARY after the product, with the formulas of scale.comp and unary.comp
+D_TYPE mv_post(const FLOAT_TYPE v) {
+    float x = float(v);
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_POST_SCALE) != 0) {
+        x = x * p.post_scale + p.post_bias;
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_POST_SILU) != 0) {
+        x = x / (1.0f + exp(-x));
+    } else if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_POST_SIGMOID) != 0) {
+        x = 1.0f / (1.0f + exp(-x));
+    }
+    return D_TYPE(x);
+}
+#define MV_STORE(v) mv_post(v)
+#endif
 
 #ifdef MUL_MAT_ID
 uint expert_id;
@@ -149,7 +170,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = MV_STORE(temp[j][n]);
             }
         }
     }
@@ -207,7 +228,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = MV_STORE(temp[j][n]);
             }
         }
     }
@@ -255,7 +276,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = MV_STORE(tmpsh[j][n][0]);
             }
         }
     }
