@@ -29,6 +29,8 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    float post_scale;   // MAT_VEC_FUSION_FLAGS_POST_SCALE: a fused SCALE node's scale and bias
+    float post_bias;
 };
 
 struct vk_mat_vec_p021_push_constants {

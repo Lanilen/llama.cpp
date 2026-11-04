@@ -7808,6 +7808,44 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
+// MUL_MAT -> SCALE (with a bias) -> SiLU or sigmoid, which the Vulkan backend does in the mat-vec's store
+struct test_mul_mat_scale_unary : public test_case {
+    const ggml_type type;
+    const ggml_unary_op op;
+    const int64_t m, n, k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SCALE_UNARY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, op, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_scale_unary(ggml_type type = GGML_TYPE_Q8_0, ggml_unary_op op = GGML_UNARY_OP_SILU,
+            int64_t m = 320, int64_t n = 3, int64_t k = 1024)
+        : type(type), op(op), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        out = ggml_scale_bias(ctx, out, 0.125f, 0.25f);
+        out = op == GGML_UNARY_OP_SILU ? ggml_silu(ctx, out) : ggml_sigmoid(ctx, out);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12392,6 +12430,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
+            for (int64_t n : { 1, 3, 8 }) {
+                test_cases.emplace_back(new test_mul_mat_scale_unary(type, op, 320, n, 1024));
+                test_cases.emplace_back(new test_mul_mat_scale_unary(type, op, 64, n, 256));
+            }
+        }
+    }
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {

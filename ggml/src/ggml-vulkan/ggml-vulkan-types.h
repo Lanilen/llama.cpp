@@ -539,6 +539,8 @@ static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern {
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
+// a mat-vec whose SCALE and SiLU/sigmoid are folded into its store (Flash-Next's hyper-connection down projection)
+static constexpr std::initializer_list<ggml_op> mm_scale_unary_pattern { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY };
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
 static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
@@ -1105,6 +1107,12 @@ typedef std::vector<vk_submission> vk_sequence;
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 
+#define MAT_VEC_FUSION_FLAGS_POST_SCALE   0x10
+
+#define MAT_VEC_FUSION_FLAGS_POST_SILU    0x20
+
+#define MAT_VEC_FUSION_FLAGS_POST_SIGMOID 0x40
+
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
 
@@ -1338,6 +1346,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_mm_post {};      // MUL_MAT + SCALE + UNARY in the mat-vec's store
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

@@ -4,6 +4,10 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// after the bias adds: x*post_scale + post_bias (a SCALE node), then SiLU or sigmoid (a UNARY node), in f32
+#define MAT_VEC_FUSION_FLAGS_POST_SCALE   0x10
+#define MAT_VEC_FUSION_FLAGS_POST_SILU    0x20
+#define MAT_VEC_FUSION_FLAGS_POST_SIGMOID 0x40
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
