@@ -137,6 +137,27 @@ between barriers, and a group of one small op costs about 6 µs. Three attempts 
 
 The GPU's small ops are mostly not what a pass waits for: the main thread's CPU experts and the waits between them are.
 
+**The CPU's experts (2026-11-04, Threadripper 1920X, 12 threads).** They were a third of a 3-token pass (22 ms of 55
+on Q4) and read their weights at 39 GB/s (Q4) and 46 (Q6), against 73.5 GB/s of RAM. With the experts in cache the
+same kernels reach 96–150 GB/s, so the cold reads were the problem, and the threads slept between layers: libgomp
+spins ~1 ms before sleeping, about the gap between two layers' CPU work, and woke ~30 µs late every layer. Two
+settings, both environment variables:
+- `GOMP_SPINCOUNT=30000000`: the threads spin ~32 ms, then sleep (libgomp reads it at start, so it goes in the
+  launcher's environment; ggml-cpu's `KMP_BLOCKTIME` is for LLVM/Intel OpenMP only).
+- `GGML_CPU_MMID_FLAT=128`: MUL_MAT_ID hands out the rows of all active experts in 128-row chunks, instead of every
+  thread taking a slice of each expert in turn (up to 8 tokens per expert; the logits don't change).
+
+Local Coder's flashnext presets with both (perseus's `config/env`), against without, on fn-side2's requests, two
+passes each:
+
+| | usual answers | follow-up turns | agent turns | whole run |
+|---|---|---|---|---|
+| Q4 | 38.35 → 40.16 tok/s (+4.7%) | 40.89 → 41.96 (+2.6%) | 36.09 → 39.18 (+8.6%) | 257.5 → 252.6 s |
+| Q6 | 30.27 → 32.66 (+7.9%) | 30.77 → 33.46 (+8.7%) | 29.15 → 31.24 (+7.2%) | 321.2 → 312.8 s |
+
+Every agent turn got faster (Q4 +5.9 to +10.6%, Q6 +2.0 to +8.7%). `GGML_CPU_OP_STATS=1` prints the CPU's ops per batch
+size (wall, the threads' work, and the experts' GB/s by weight type) at exit.
+
 ## Build
 
 ```bash

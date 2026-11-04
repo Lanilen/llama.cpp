@@ -346,6 +346,8 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them); `--moe-cache-predictor-answer-cap` overrides it |
 | `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
+| `GGML_CPU_MMID_FLAT=C` | the CPU's MUL_MAT_ID (the missed experts) hands out the rows of all active experts in C-row chunks instead of a slice of each expert per thread, for up to 8 tokens per expert; 128 on perseus: with `GOMP_SPINCOUNT=30000000` (OpenMP threads spinning ~32 ms instead of sleeping between layers) agent turns +8.6% Q4, +7.2% Q6 (FORK.md) |
+| `GGML_CPU_OP_STATS=1` | at exit, per batch size, each CPU op's wall time, its threads' work, and MUL_MAT_ID's experts and GB/s by weight type |
 | `LLAMA_MOE_CACHE_JIT_SLOTS=N` | `--moe-cache-jit`: the most experts a layer uploads, and the slots each group takes from the cache (default 64) |
 | `LLAMA_MOE_CACHE_JIT_THREADS=N` | `--moe-cache-jit`: the threads that copy its experts to the staging memory (default 4) |
 | `LLAMA_MOE_CACHE_JIT_BG=0` | `--moe-cache-jit`: uploads on the transfer queue that every synchronization waits for, so the CPU experts wait for them, to compare |
