@@ -17,7 +17,7 @@ also tested on an NVIDIA RTX 4070 Ti with Vulkan. They are listed, with how to s
 [hot spare guide](docs/moe-hot-spare.md#changes-that-apply-without-any-option).
 
 **Where it stands.** Qwen3.8-Flash-Next UD-Q4_K_XL on the R9700, with 72 GiB of its experts in system memory,
-generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's turns; UD-Q6_K_XL at 33 and 32 tok/s
+generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's turns; UD-Q6_K_XL at 33 and 34 tok/s
 ([Setups](#setups)). With the experts on the CPU and no cache, a single answer ran at 16.8 tok/s (on PCIe x8 with one
 draft, in October).
 
@@ -265,22 +265,22 @@ python3 tools/moe-trace/moe-cache-tune.py --server build-vk/bin/llama-server -m 
 It only changes how the work is placed and scheduled, never what the model computes. A stage the build or the machine
 can't use is skipped, for example the OpenMP spin without GCC's OpenMP, or the submit size without a Vulkan device.
 
-**What it tunes,** in the order it runs, and what it picked for Flash-Next UD-Q4_K_XL on the 1920X + R9700:
+**What it tunes,** in the order it runs, and what it picked for Flash-Next UD-Q4_K_XL and UD-Q6_K_XL on the 1920X + R9700:
 
-| stage | setting | what it changes | why it depends on the machine | 1920X + R9700, Q4_K_XL |
-|---|---|---|---|---|
-| `omp-spin` | `GOMP_SPINCOUNT` | how long the CPU's threads spin before they sleep | the gap between two layers' CPU work against the spin | 30000000 |
-| `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | the memory system and the number of cores | 128 |
-| `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit | how fast the CPU records against how fast the GPU runs | 100M |
-| `predictor` | `--moe-cache-predictor`, `--moe-cache-predictor-start` | the predictor, or the decayed scores | upload speed against what a better set saves | predictor, no text start |
-| `refill` | `--moe-cache-refill` | a full rebalance after the first tokens | the cost of a full rebalance on the link | 0 |
-| `answer-cap` | `--moe-cache-predictor-answer-cap` | how many swaps an answer's start makes | the same | 500 |
-| `drafts` | `--spec-draft-n-max` | MTP drafts per verify pass | each draft adds a token of CPU experts to a pass | 3 |
-| `budget` | `--moe-cache-budget` | MiB uploaded per token to follow the text | the link's speed | 10 |
-| `mib` | `--moe-cache-mib` | the cache's size, by default against 85% of it | the free VRAM, the uploads to fill it | 20900 |
-| `jit` | `--moe-cache-jit` | which medium prompts' experts upload just in time | when an upload costs less than the CPU's work | 4 |
-| `threads` | `LLAMA_MOE_CACHE_COPY_THREADS` | the threads that copy experts to staging memory | the RAM's bandwidth per thread | 4 |
-| `cpu-threads` | `-t` | the CPU's threads | the cores, and what a second thread on a core costs | 12 |
+| stage | setting | what it changes | why it depends on the machine | Q4_K_XL | Q6_K_XL |
+|---|---|---|---|---|---|
+| `omp-spin` | `GOMP_SPINCOUNT` | how long the CPU's threads spin before they sleep | the gap between two layers' CPU work against the spin | 30000000 | 30000000 |
+| `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | the memory system and the number of cores | 128 | off |
+| `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit | how fast the CPU records against how fast the GPU runs | 100M | 100M |
+| `predictor` | `--moe-cache-predictor`, `--moe-cache-predictor-start` | the predictor, or the decayed scores | upload speed against what a better set saves | predictor, no text start | predictor, no text start |
+| `refill` | `--moe-cache-refill` | a full rebalance after the first tokens | the cost of a full rebalance on the link | 0 | 0 |
+| `answer-cap` | `--moe-cache-predictor-answer-cap` | how many swaps an answer's start makes | the same | 500 | 1000 |
+| `drafts` | `--spec-draft-n-max` | MTP drafts per verify pass | each draft adds a token of CPU experts to a pass | 3 | 3 |
+| `budget` | `--moe-cache-budget` | MiB uploaded per token to follow the text | the link's speed | 10 | 10 |
+| `mib` | `--moe-cache-mib` | the cache's size, by default against 85% of it | the free VRAM, the uploads to fill it | 20900 | 20900 |
+| `jit` | `--moe-cache-jit` | which medium prompts' experts upload just in time | when an upload costs less than the CPU's work | 4 | 16 |
+| `threads` | `LLAMA_MOE_CACHE_COPY_THREADS` | the threads that copy experts to staging memory | the RAM's bandwidth per thread | 4 | 4 |
+| `cpu-threads` | `-t` | the CPU's threads | the cores, and what a second thread on a core costs | 12 | 12 |
 
 It doesn't touch your placement (`-ngl`, `-ncmoe`, `-ub`, devices) or anything that needs root, such as the R9700's
 power profile ([Setups](#setups)). A `gate` stage for gated longer drafts is there too, but it's left out by default:
@@ -314,6 +314,14 @@ threads and `-t 12`. Most of this matches what was found by hand, step by step. 
 - **`--moe-cache-jit 4`, not 8:** the two give the same whole agent turns, with prompts of 150–950 tokens 1.3–1.5× faster
   than without, but 4 costs less generation: 41.87 against 41.53 tok/s, and 43.57 without. For generation alone it would
   be off.
+
+The search of Q6_K_XL took 53 runs. Its pick generated at 32.90 tok/s against 30.50 (+7.9%), and agent turns gained
+13.4%. The spin (+0.61 tok/s), the submit size (+0.66), the predictor without the refill (+0.97) and 3 drafts came out
+as for Q4. It differs in three places:
+- **No gain from the CPU's chunks:** 64, 128 and 256 all came within the noise of off (31.06 against 31.28 for 128).
+- **An answer cap of 1000:** +0.74 tok/s. 500 was faster in agent turns (35.9 against 33.9) and slower in long answers.
+- **`--moe-cache-jit 16`:** 4, 8 and 16 give the same whole agent turns (+5% over off), and 16 costs the least
+  generation: 32.84 tok/s, against 32.42 for 4 and 33.65 without. Q6's experts are larger, so each upload costs more.
 
 The guide has the method in full, the options and the output:
 [tools/moe-trace/README.md](tools/moe-trace/README.md#tuning-a-machine).
@@ -355,9 +363,9 @@ With the card on the COMPUTE profile (below), over a story, questions after 2k a
 and ten recorded agent turns, two passes: generation at 41.83 tok/s, agent turns at 44.62 tok/s, 81.5% of the experts
 in the cache.
 
-UD-Q6_K_XL takes the same placement. Its own settings are still being searched; with Q4's hand-found ones (2 drafts,
-answer cap 1000, `--moe-cache-jit 8`) it generated 33.01 tok/s on the usual answers and 31.85 on agent turns, at 71.1%
-hits.
+UD-Q6_K_XL takes the same placement, with its own picks: `--moe-cache-jit 16`, `--moe-cache-predictor-answer-cap 1000`,
+and no `GGML_CPU_MMID_FLAT`, which made no difference there. Generation at 32.90 tok/s, agent turns at 33.73 tok/s,
+72.9% of the experts in the cache.
 
 - **The draft head's experts are on the GPU** (no `-cmoed`), and the cache is smaller by their 2550 MiB. Against
   `-cmoed` with 23500 MiB: usual answers 31.5 → 32.6 tok/s and agent turns 27.9 → 28.6, at 83.6% hits instead of 86.5%.
@@ -431,7 +439,9 @@ Measured on the R9700 machine. These either didn't help or cost more than they g
   in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N).
 - **One cumulative benchmark:** the numbers above come from different request sets over a month. They'll be redone as
   one ladder, each step added to the last, on the same requests.
-- **The tuning script's search of UD-Q6_K_XL** on the 1920X + R9700.
+- **The lists past their ends on the 1920X + R9700:** both searches ran before the stages went past the ends of their
+  lists, and some picks are at an end: 3 drafts and the 100M submit size for both quants, and `--moe-cache-jit 16` for
+  Q6. The newer script would go on to 4 and 5 drafts, 400M and 1600M, and 32 and 64.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
