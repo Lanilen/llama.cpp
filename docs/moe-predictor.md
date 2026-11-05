@@ -203,7 +203,8 @@ The two passes of a configuration differ by about 0.2 tok/s.
   a point of hits, and the uploads behind it cost more than that point saves. Only the long, new-topic answers (the story,
   the first code question) still gain from it. The card's clock was below COMPUTE's in these runs, the same for every
   arm, so the speeds are lower than in [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) but compare with each other.
-- **A third draft is slower,** by 0.4–1.3 tok/s; on Q6 the short answers lose over 4.
+- **A third draft was slower** in these runs, by 0.4–1.3 tok/s; on Q6 the short answers lost over 4. Since the CPU's
+  experts got faster, three drafts win on Q4 ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
 - **Fewer copy threads don't help:** 2 instead of 4 changed nothing on Q6 and cost 0.3 tok/s on Q4.
 
 These results are for one machine. To find the settings for yours, use [`moe-cache-tune.py`](../tools/moe-trace/README.md#tuning-a-machine).
