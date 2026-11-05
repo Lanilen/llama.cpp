@@ -69,6 +69,21 @@ RESERVED_ENV = [
     "LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_CAP", "LLAMA_MOE_PREDICTOR_ANSWER_CAP", "LLAMA_ARG_THREADS",
     "GOMP_SPINCOUNT", "OMP_WAIT_POLICY", "GGML_CPU_MMID_FLAT", "GGML_VK_FLOPS_PER_SUBMIT",
 ]
+# how a stage's list goes on past its ends, when its winner is the first or last value of it: the field, the step (a factor,
+# or +1), the lowest and the highest value it may reach, and the value that means "not set" (never extended from)
+EXTEND = {
+    "omp-spin": ("spin", 4, 1000000, 1000000000, 0),
+    "cpu-chunks": ("chunks", 2, 8, 4096, 0),
+    "submits": ("submit_mflops", 4, 1, 10000, 0),
+    "refill": ("refill", 2, 16, 4096, 0),
+    "answer-cap": ("answer_cap", 2, 10, 100000, 0),
+    "drafts": ("n_max", "+1", 1, 7, None),  # 8 drafts make a 9-token pass, which leaves the mat-vec kernels
+    "budget": ("budget", 2, 1, 1000, None),
+    "mib": ("mib", None, None, None, None),  # down only: a larger cache may not fit
+    "jit": ("jit", 2, 2, 64, 0),
+    "threads": ("copy_threads", 2, 1, 32, None),
+}
+
 # what each stage needs from the server's build: a string of its binary or libraries
 FEATURES = {"libgomp": b"libgomp", "cpu_chunks": b"GGML_CPU_MMID_FLAT", "submits": b"GGML_VK_FLOPS_PER_SUBMIT",
             "jit": b"--moe-cache-jit", "answer_cap": b"--moe-cache-predictor-answer-cap"}
@@ -296,12 +311,42 @@ def hardware(server):
                     cores.add((phys, core))
     if cores:
         hw["physical_cores"] = len(cores)
+    hw.update(hybrid_cores())
+    if "physical_cores" not in hw and sys.platform == "darwin":
+        for key, name in (("physical_cores", "hw.physicalcpu"), ("p_cores", "hw.perflevel0.physicalcpu"), ("e_cores", "hw.perflevel1.physicalcpu")):
+            try:
+                v = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=10).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                v = ""
+            if v.isdigit() and int(v) > 0:
+                hw[key] = int(v)
     mem = read_text("/proc/meminfo") or ""
     m = re.search(r"MemTotal:\s+(\d+) kB", mem)
     if m:
         hw["ram_mib"] = int(m[1]) // 1024
     hw["devices"] = [{k: d[k] for k in ("name", "description", "total_mib")} for d in list_devices(server)]
     return hw
+
+
+def cpu_list(text):
+    """The CPUs of a Linux list such as 0-11,16."""
+    out = []
+    for part in (text or "").split(","):
+        a, _, b = part.strip().partition("-")
+        if a.isdigit():
+            out += list(range(int(a), int(b if b.isdigit() else a) + 1))
+    return out
+
+
+def hybrid_cores():
+    """The performance and efficiency cores of an Intel hybrid CPU on Linux, by physical core: their perf PMUs list them."""
+    res = {}
+    for key, pmu in (("p_cores", "cpu_core"), ("e_cores", "cpu_atom")):
+        cpus = cpu_list(read_text(f"/sys/devices/{pmu}/cpus"))
+        cores = {(read_text(f"/sys/devices/system/cpu/cpu{c}/topology/physical_package_id"), read_text(f"/sys/devices/system/cpu/cpu{c}/topology/core_id")) for c in cpus}
+        if cores:
+            res[key] = len(cores)
+    return res if len(res) == 2 else {}
 
 
 def list_devices(server):
@@ -353,6 +398,7 @@ RE_PRED = re.compile(r"hot spare, predictor: (\d+) predictions, ([\d.]+) ms each
 RE_TEXT = re.compile(r"hot spare, text starts: (\d+), (\d+) swaps each")
 RE_COPY = re.compile(r"copy worker: (\d+) threads.*?([\d.]+) GB/s per thread")
 RE_JIT = re.compile(r"--moe-cache-jit \d+ uploaded (\d+) experts in (\d+) layer runs")
+RE_SLOTS = re.compile(r"impl: +\d+ layers, \S+: +(\d+) slots \(")
 RE_CACHE = re.compile(r"(\S+) MoE cache size = +([\d.]+) MiB for ([\d.]+) MiB of host experts")
 RE_BREAK = re.compile(r"\|\s+- (.+?)\s+\|\s+(\d+) = (\d+) \+ \(\s*\d+ =.*\)\s*\+\s*(-?\d+) \|")
 RE_INFO = {k: re.compile(p) for k, p in dict(
@@ -378,8 +424,15 @@ def parse_log(path):
             passes.append(cur)
         cur = None
 
+    slots_done = False
     with open(path, errors="replace") as f:
         for line in f:
+            if not slots_done:
+                m = RE_SLOTS.search(line)
+                if m:
+                    st["cache_slots"] = st.get("cache_slots", 0) + int(m[1])  # the first block: the cache as it was made
+                    continue
+                slots_done = "cache_slots" in st
             if "generate_draft:" in line:
                 m = re.search(r"#draft=(\d+)", line)
                 t = stamp(line)
@@ -873,13 +926,62 @@ class Tuner:
             return "no --predictor"
         return None
 
+    def answer_caps(self):
+        """--answer-caps, or --answer-cap-shares of the cache's slots in the warm-up (500, 1000 and 2000 swaps of 6731 slots on
+        the 1920X + R9700 with Flash-Next Q4 at 20900 MiB), rounded to tens."""
+        if self.o.answer_caps:
+            return self.o.answer_caps
+        warm = self.runs.get((self.base.name(), 0))
+        slots = (warm or {}).get("log", {}).get("cache_slots")
+        if not slots:
+            return [500, 1000, 2000]
+        return list(dict.fromkeys(max(10, int(round(f * slots / 10)) * 10) for f in self.o.answer_cap_shares))
+
+    def extensions(self, stage, cands, winner):
+        """The next values past the end of a stage's list that its winner sits at, or none."""
+        spec = EXTEND.get(stage)
+        if not spec:
+            return []
+        field, step, lo, hi, off = spec
+        if field == "mib":
+            sizes = sorted({tuple(int(x) for x in c.mib.split(",")) for c in cands}, key=sum)
+            w = tuple(int(x) for x in winner.mib.split(","))
+            if len(sizes) < 2 or w != sizes[0]:
+                return []
+            f = sum(sizes[0]) / sum(sizes[1])
+            return [replace(winner, mib=",".join(str(int(x * f)) for x in w))]
+        vals = sorted({getattr(c, field) for c in cands if getattr(c, field) is not None and getattr(c, field) != off})
+        w = getattr(winner, field)
+        if w is None or w == off or w not in vals:
+            return []
+        def past(v, up):
+            if step == "+1":
+                return v + 1 if up else v - 1
+            i = vals.index(v)
+            nb = vals[i - 1] if up and i > 0 else vals[i + 1] if not up and i + 1 < len(vals) else None
+            k = max(step, round(v / nb if up else nb / v)) if nb else step  # the list's own spacing, at least the step
+            x = v * k if up else v / k
+            return x if isinstance(v, float) else int(round(x))
+        out = []
+        for up in ((True, False) if len(vals) == 1 else (True,) if w == vals[-1] else (False,) if w == vals[0] else ()):
+            x = past(w, up)
+            if lo <= x <= hi and x not in vals and x != off:
+                out.append(replace(winner, **{field: x}))
+        return out
+
     def cpu_thread_counts(self, cur):
+        hw = self.hw or {}
         if self.o.cpu_threads is not None:
             counts = self.o.cpu_threads
+        elif hw.get("physical_cores"):
+            # the physical cores, and a quarter fewer: one thread per core does the CPU's expert maths, a second one shares
+            # its units; on a hybrid CPU also the performance cores alone, as a slow core holds up the others at each barrier
+            n = hw["physical_cores"]
+            counts = ([n, n - n // 4] if n >= 4 else []) + ([hw["p_cores"]] if hw.get("p_cores") and hw.get("e_cores") else [])
         else:
-            # the physical cores, and a quarter fewer: one thread per core does the CPU's expert maths, a second one shares its units
-            n = (self.hw or {}).get("physical_cores") or 0
-            counts = [n, n - n // 4] if n >= 4 else []
+            # no core count (not Linux or macOS): the logical CPUs, and half of them for SMT
+            n = os.cpu_count() or 0
+            counts = [n, n // 2] if n >= 4 else []
         now = cur.threads or self.placement_threads
         return [t for t in dict.fromkeys(counts) if t > 0 and t != now]
 
@@ -896,7 +998,7 @@ class Tuner:
         elif stage == "submits":
             c = [cur] + [replace(cur, submit_mflops=n) for n in o.submit_mflops]
         elif stage == "answer-cap":
-            c = [cur] + [replace(cur, answer_cap=n) for n in o.answer_caps]
+            c = [cur] + [replace(cur, answer_cap=n) for n in self.answer_caps()]
         elif stage == "jit":
             c = [cur] + [replace(cur, jit=n) for n in o.jits]
         elif stage == "cpu-threads":
@@ -948,7 +1050,27 @@ class Tuner:
                         log(f"--- {stage}: skipped, {len(need)} runs do not fit the time budget")
                 for c in cands:
                     self.visited.setdefault(c.name(), c)
+                incumbent, added = cur, []
                 cur = self.decide(stage, cands, cur, numbered)
+                for _ in range(o.extend):
+                    ext = [c for c in self.extensions(stage, cands, cur) if c not in cands]
+                    if not ext:
+                        break
+                    need = self.missing(ext, numbered)
+                    if execute and need:
+                        if self.fits_budget(len(need), 2 * o.passes):
+                            log(f"--- {stage}: the winner is at the end of the list, trying {', '.join(change(cur.name(), c.name()) for c in ext)}")
+                            self.measure(ext, numbered, stage)
+                        else:
+                            log(f"--- {stage}: its extension does not fit the time budget")
+                    if any((c.name(), p) not in self.runs and (c.name(), p) not in self.failed for c in ext for p in numbered):
+                        break  # not measured: the stage's decision stands
+                    for c in ext:
+                        self.visited.setdefault(c.name(), c)
+                    cands, added = cands + ext, added + [c.name() for c in ext]
+                    self.decisions.pop()
+                    cur = self.decide(stage, cands, incumbent, numbered)
+                    self.decisions[-1]["extended"] = list(added)
         self.final = cur
         if cur != self.base:
             need = self.missing([self.base, cur], confirm_ids)
@@ -1159,6 +1281,8 @@ class Tuner:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: best was {change(d['incumbent'], best)} at {d['gain']:+.2f} tok/s{by}, needed {d.get('threshold', 0):.2f}")
                 else:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: the fastest{by}")
+                if d.get("extended"):
+                    L.append(f"              its list went on past the end: {', '.join(change(d['incumbent'], n).split(' -> ')[-1] for n in d['extended'])}")
                 for name, t in d["tried"].items():
                     if t.get("failed"):
                         L.append(f"              {name} failed: {t['failed']}")
@@ -1248,6 +1372,7 @@ class Tuner:
         est = self.est_run_s()
         log(f"at most {total} runs, {fmt_time(total * est)} at {est / 60:.1f} minutes per run; time budget {self.o.hours:g} h. The stages that do not fit are skipped, last ones first.")
         log("the configurations of a stage depend on what the stages before it choose: this assumes that they keep the starting point.")
+        log(f"a stage whose winner is at an end of its list goes on past it, up to {self.o.extend} more values each way (--extend), 2 runs each.")
 
 
 def fmt_num(v, width, prec):
@@ -1336,9 +1461,11 @@ def parse_args(argv):
                     "~1 ms by default, about the gap between two layers' CPU work (default: 30000000, ~32 ms on a Threadripper 1920X)")
     ap.add_argument("--cpu-chunks", type=list_of(int), default=[64, 128, 256], help="GGML_CPU_MMID_FLAT values to try: the CPU's experts in chunks of this many rows (default: 64,128,256)")
     ap.add_argument("--submit-mflops", type=list_of(int), default=[25, 100], help="GGML_VK_FLOPS_PER_SUBMIT values to try, in millions (default: 25,100)")
-    ap.add_argument("--answer-caps", type=list_of(int), default=[500, 1000, 2000], help="--moe-cache-predictor-answer-cap values to try (default: 500,1000,2000; the search starts at 0, all)")
+    ap.add_argument("--answer-caps", type=list_of(int), help="--moe-cache-predictor-answer-cap values to try (default: by --answer-cap-shares; the search starts at 0, all)")
+    ap.add_argument("--answer-cap-shares", type=list_of(float), default=[0.075, 0.15, 0.3], help="answer caps to try as shares of the cache's slots, read from the warm-up's log (default: 0.075,0.15,0.3)")
     ap.add_argument("--jits", type=list_of(int), default=[4, 8, 16], help="--moe-cache-jit values to try (default: 4,8,16; the search starts at 0, off)")
-    ap.add_argument("--cpu-threads", type=list_of(int), help="-t values to try (default: the physical cores and a quarter fewer, if the placement has another)")
+    ap.add_argument("--cpu-threads", type=list_of(int), help="-t values to try (default: the physical cores and a quarter fewer, and the performance cores alone on a hybrid CPU)")
+    ap.add_argument("--extend", type=int, default=2, help="how many more values a stage tries past the end of its list when its winner is there, each way; 0 = none (default: %(default)s)")
     ap.add_argument("--noise-k", type=float, default=2.0, help="a gain must exceed this many standard errors of the difference (default: %(default)s)")
     ap.add_argument("--min-gain", type=float, default=0.5, help="and this many percent (default: %(default)s)")
     ap.add_argument("--port", type=int, default=8095, help="the server's port on 127.0.0.1; a busy port stops the search (default: %(default)s)")
