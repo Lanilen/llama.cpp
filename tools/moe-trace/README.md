@@ -112,7 +112,7 @@ k = 2560 and 10240, m = 4-10240), for what one product over concatenated weights
 
 ## Tuning a machine
 
-`moe-cache-tune.py` finds the best hot spare settings for your machine and model, the CPU's and Vulkan's included, and writes a file you can share. The best settings depend on the hardware. On an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, the search picked for Flash-Next Q4 the predictor and no refill, an answer cap of 500, 3 drafts, budget 10 and `--moe-cache-jit 4`, with `GOMP_SPINCOUNT=30000000`, `GGML_CPU_MMID_FLAT=128` and `GGML_VK_FLOPS_PER_SUBMIT=100000000` ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)). A newer CPU or a faster link can change all of that.
+`moe-cache-tune.py` finds the best hot spare settings for your machine and model, the CPU's and Vulkan's included, and writes a file you can share. The best settings depend on the hardware. On an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, the search picked for Flash-Next Q4 the predictor and no refill, an answer cap of 500, 3 drafts, budget 10 and `--moe-cache-jit 4`, with `GOMP_SPINCOUNT=30000000`, `GGML_CPU_MMID_FLAT=128` and `GGML_VK_FLOPS_PER_SUBMIT=100000000`; for Flash-Next Q6 the same, except an answer cap of 1000, `--moe-cache-jit 16` and no gain from `GGML_CPU_MMID_FLAT` ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)). A newer CPU or a faster link can change all of that.
 
 It needs Python 3.8+ and nothing else, so you can copy the one file to another machine. It has been run on Linux only. Elsewhere the hardware details will be sparser, and the rest is untested.
 
