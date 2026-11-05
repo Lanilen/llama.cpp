@@ -37,7 +37,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 
 try:
     import ctypes
@@ -1036,9 +1036,14 @@ class Tuner:
         cur = self.base
         numbered = list(range(1, o.passes + 1))
         confirm_ids = [f"c{i}" for i in numbered]
+        tried = {}  # stage: the values its earlier rounds tried, as {field: value} changes
         for rnd in range(o.rounds):
             for stage in o.stages:
                 cands = self.candidates(stage, cur)
+                if rnd and stage not in self.skipped:
+                    # a later round tries again every value the stage tried before, its extensions and its old starting
+                    # value too, now with the other stages' choices in place
+                    cands = list(dict.fromkeys(cands + [replace(cur, **d) for d in tried.get(stage, [])]))
                 if len(cands) < 2:
                     continue
                 need = self.missing(cands, numbered)
@@ -1071,6 +1076,13 @@ class Tuner:
                     self.decisions.pop()
                     cur = self.decide(stage, cands, incumbent, numbered)
                     self.decisions[-1]["extended"] = list(added)
+                if rnd and self.decisions and self.decisions[-1]["stage"] == stage:
+                    self.decisions[-1]["stage"] = f"{stage} ({rnd + 1})"
+                changed = [f.name for f in fields(Config) if any(getattr(c, f.name) != getattr(incumbent, f.name) for c in cands)]
+                for c in cands:
+                    d = {f: getattr(c, f) for f in changed}
+                    if d not in tried.setdefault(stage, []):
+                        tried[stage].append(d)
         self.final = cur
         if cur != self.base:
             need = self.missing([self.base, cur], confirm_ids)
