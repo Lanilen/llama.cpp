@@ -253,8 +253,11 @@ python3 tools/moe-trace/moe-cache-tune.py --server build-vk/bin/llama-server -m 
 - Every configuration answers the same requests on a fresh `llama-server` at temperature 0, at least twice, the second
   pass in reverse order. The requests are a story, questions after 2k and 18k tokens of code, a 4-turn session, and an
   agent's turns. Those are six made-up ones by default; `--agent` replays recorded ones.
-- It changes one setting per stage and carries the best one forward. A setting wins only if its gain beats the noise
-  measured between the passes.
+- It starts from llama.cpp's defaults, with your cache size and placement. It changes one setting per stage and carries
+  the best one forward. A setting wins only if its gain beats the noise measured between the passes.
+- The values it tries are spaced around what suited the 1920X + R9700, but they don't have to suit your machine: when a
+  stage's best value is at an end of its list, the stage goes on past it, up to two more values each way. The answer
+  caps are shares of your cache's slots, and the thread counts follow your cores, performance cores included.
 - A last stage runs the result against the starting point again, and the starting point stays if the gain doesn't hold.
 - It needs Python 3.8 and nothing else. Stopped, it continues where it was, and it fits the stages to `--hours`.
 - The results file has the hardware and the timings, but no prompts and no answers.
