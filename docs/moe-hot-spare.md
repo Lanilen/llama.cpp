@@ -94,8 +94,9 @@ the selections so far. With one:
   instead of the scores;
 - **the refill is off** unless set (`--moe-cache-refill N`);
 - **`--moe-cache-predictor-answer-cap N`** limits the answer's start to the N best swaps and leaves the rest to the
-  budget. On Flash-Next, 1000 sped up agent turns by 8–12% and cost the usual answers up to 2.6%, because the uploads of
-  a full rebalance cost more than the point of hits it buys;
+  budget. A full rebalance buys about a point of hits with uploads that cost more than it saves. On Flash-Next with
+  the 1920X + R9700, 1000 sped up agent turns by 8–12% for up to 2.6% of the usual answers, and the tuning script found
+  500 better still: agent turns 46.8 tok/s against 44.2 at 1000, the usual answers the same;
 - **`--moe-cache-predictor-start FILE`**, a second file, predicts from a turn's text before its prompt runs, so its
   experts upload while a short prompt computes.
 
@@ -231,6 +232,10 @@ The output is the same up to rounding, as for the resident experts: read again i
 positions of a greedy answer in batches of 1 move by a mean KL of 0.0011-0.0012 with or without it (Q4, also with N=1). With `-v`
 the cache's statistics at exit add a line for it: experts uploaded per layer run, how many were left out for want of
 slots, the share of the misses' selections they took from the CPU, and its time per layer run.
+
+With the settings of the tuning script's search on the 1920X + R9700 (Q4, 3 drafts, an answer cap of 500), 4 and 8 gave
+the same whole agent turns, 8% faster than without. 4 cost less generation: 41.87 tok/s against 41.53, and 43.57
+without. So the search picked 4.
 
 ### The CPU's experts
 
@@ -587,8 +592,10 @@ that borrows the main model's embedding and output head). The draft context has 
   prompts faster at no cost during generation; without it, use `--spec-draft-n-ubatch 16` (or 31, the largest that stays
   small).
 - Size the cache per GPU around the draft, with the headroom above for the compute buffer that is reserved again.
-- Each drafted token makes the CPU compute the experts of one more token per pass. One (`--spec-draft-n-max 1`) was
-  best on the RX 480s, two on the R9700 (+11% over one), and three gained less there.
+- Each drafted token makes the CPU compute the experts of one more token per pass, so the best count depends on how
+  much that costs. One (`--spec-draft-n-max 1`) was best on the 1920X + RX480x2. On the 1920X + R9700, with the CPU's
+  experts as in [The CPU's experts](#the-cpus-experts), three were best: 43.6 tok/s against 41.6 with two, a pass
+  yielding 2.92 tokens in 67 ms against 2.44 in 59.
 
 ## Fusion
 
