@@ -144,15 +144,24 @@ A run takes about 5 minutes and each configuration runs at least twice, so all t
 | `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan device. |
 | `predictor` | none, `--moe-cache-predictor`, also `--moe-cache-predictor-start` | The largest effect of the cache's settings. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
 | `refill` | `--refills 0,64,128` | Tested at the predictor setting just chosen. |
-| `answer-cap` | `--answer-caps 500,1000,2000` against 0, all (`--moe-cache-predictor-answer-cap`) | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. |
+| `answer-cap` | `--answer-cap-shares 0.075,0.15,0.3` of the cache's slots, against 0, all (`--moe-cache-predictor-answer-cap`) | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. The slots come from the warm-up's log, so the caps scale with the cache (500, 1000 and 2000 swaps of 6731 slots on the 1920X + R9700); `--answer-caps` gives swap counts instead. |
 | `drafts` | `--draft-n 1,2` and the start, 3 | Sets how much each pass verifies, which the budget and the hit rate then count. |
 | `gate` | `--draft-gates 3:0.6,5:0.8,8:0.9` (`--spec-draft-n-max`:`--spec-draft-p-min`) | Not in the defaults: gates lose to the graph rebuild that each new verify length costs. `--stages` adds it. |
 | `budget` | `--budgets 5,20` and the start, 10 | After the drafts, because the budget counts every token of a verify batch. |
 | `mib` | `--mibs`, by default 85% of `--mib` | A smaller cache can win if uploads are slow or the card is short of memory. |
 | `jit` | `--jits 4,8,16` against 0, off (`--moe-cache-jit`) | Judged by the agent's whole turns, prompts included, since it speeds up prompts and costs a little generation. Needs prompts of 33 tokens and more that keep the cache (`--moe-cache-batch`). |
 | `threads` | `--copy-threads 2,8` and the start, 4 (`LLAMA_MOE_CACHE_COPY_THREADS`) | A small effect. |
-| `cpu-threads` | `--cpu-threads`, by default the physical cores and a quarter fewer, against the placement's `-t` | Replaces `-t` in the placement. A second thread on a core shares its arithmetic. |
+| `cpu-threads` | `--cpu-threads`, by default the physical cores and a quarter fewer, and on a hybrid CPU the performance cores alone, against the placement's `-t` | Replaces `-t` in the placement. A second thread on a core shares its arithmetic, and a slow core holds the others up at each barrier. The cores come from `/proc/cpuinfo` and sysfs on Linux (Intel's `cpu_core` and `cpu_atom` for hybrid CPUs), `sysctl` on macOS, and elsewhere the logical CPUs and half of them. |
 | confirm | the result against the starting point | See below. |
+
+**The starting point and the lists.** The search starts from llama.cpp's defaults, your `--mib` and your placement: nothing set for the CPU and Vulkan variables, the JIT and the answer cap, budget 10, the refill at its default, 3 drafts, 4 copy threads and your `-t`. The lists of values to try are spaced around what suited the 1920X + R9700, so another machine's best value can lie past an end. When a stage's winner is the first or last value of its list, the stage goes on past it, up to `--extend` (2) more values each way, and decides again:
+- the budget, the chunks, the JIT, the refill, the answer cap and the copy threads double or halve;
+- the submit size steps by the list's own spacing, 4×;
+- the drafts go one at a time, up to 7: 8 drafts make a 9-token pass, which leaves the mat-vec kernels;
+- the spin has one value, so it tries one more each way, 4× apart;
+- the cache size only goes down, by the same 85%, since a larger cache may not fit.
+
+The summary says where a list went on, and the dry run can't know it yet, so its count of runs is a floor.
 
 A stage is also skipped when it can't change anything here: the build lacks the setting (the tool looks for its name in the server and the libraries beside it), the machine can't use it, or a stage before it ruled it out. The summary says why. A stage is skipped if it doesn't fit `--hours`, keeping enough time for the confirm stage. Skipped stages are listed as not searched, and a later start with more hours picks them up. Decisions are recomputed from the stored runs in the same order, so a restart takes the same path. `--stages` chooses the stages and their order, `--objective short`, `long`, `agent` or `agent_turn` optimizes for one kind of request, and `--rounds 2` goes through the stages again.
 
