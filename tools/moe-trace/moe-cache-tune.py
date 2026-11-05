@@ -796,7 +796,7 @@ class Tuner:
             os.remove(failed)
         self.runs[(name, pid)] = rec
         self.failed.pop((name, pid), None)
-        m = metrics(rec)
+        m = metrics(rec, self.ref_lengths())
         log(f"  all {m['all']:.2f} tok/s, short {m['short']:.2f}, long {m['long']:.2f}, agent {m['agent']:.2f} (whole turns {m['agent_turn']:.2f}, prompts {fmt_num(m['agent_prompt'], 1, 1)} t/s), "
             f"hits {st['hits']:.1f}%, uploads {m['mib_gen']:.2f} MiB per generated token, {rec['wall_s']:.0f} s")
 
@@ -812,6 +812,11 @@ class Tuner:
         self.failed[(name, pid)] = reason
         self.failed_now.add(name)
         write_json(self.run_path(cfg, pid, failed=True), dict(name=name, config=asdict(cfg), **{"pass": pid}, failed=reason))
+
+    def ref_lengths(self):
+        """The answer lengths of the warm-up, by request: the turns of every run are timed at these lengths."""
+        ref = self.runs.get((self.base.name(), 0))
+        return {r["label"]: r["predicted_n"] for r in ref["requests"]} if ref else {}
 
     def ensure(self, cfg, pid, stage):
         if (cfg.name(), pid) in self.runs:
@@ -955,7 +960,7 @@ class Tuner:
             self.confirm = self.decide_confirm(cur, confirm_ids)
 
     def values(self, cfg, pids, metric=None):
-        rows = [metrics(self.runs[(cfg.name(), p)]) for p in pids if (cfg.name(), p) in self.runs]
+        rows = [metrics(self.runs[(cfg.name(), p)], self.ref_lengths()) for p in pids if (cfg.name(), p) in self.runs]
         return [r[metric or self.o.objective] for r in rows]
 
     def mean(self, cfg, pids, metric=None):
@@ -1068,7 +1073,7 @@ class Tuner:
         rs = [self.runs[(c.name(), p)] for p in pids if (c.name(), p) in self.runs]
         if not rs:
             return None
-        ms = [metrics(r) for r in rs]
+        ms = [metrics(r, self.ref_lengths()) for r in rs]
         avg = lambda k: (lambda v: sum(v) / len(v) if v else None)([m[k] for m in ms if m.get(k) is not None])
         row = dict(name=c.name(), config=asdict(c), passes=len(rs), all_passes=[round(m["all"], 3) for m in ms])
         for k in ("all", "short", "long", "agent", "agent_turn", "agent_prompt", "hits", "mib_batch_token", "mib_gen", "accept", "fill_prompt", "update_ms", "restore_ms",
@@ -1104,7 +1109,7 @@ class Tuner:
         L.append("")
         L.append("tok/s of generation, weighted by tokens: all = every request, short = answers after a large prompt, long = long answers to short prompts,")
         L.append("agent = an agent's turns (some hundred new tokens of prompt each, then a short answer); turn = the agent's answer tokens per second of its")
-        L.append("whole turns, prompts included; a.pp = the prompt tok/s of its turns.")
+        L.append("whole turns, prompts included, each answer timed at its length in the warm-up; a.pp = the prompt tok/s of its turns.")
         L.append("hits and MiB/batch count every token of a small batch, rejected drafts and short prompts too; MiB/gen is the uploads per generated token.")
         L.append("answers: requests whose answer differs between the passes / from the warm-up (speed follows the text, near ties can differ at temperature 0).")
         L.append("")
@@ -1245,8 +1250,11 @@ def change(a, b):
     return ", ".join(f"{x} -> {y}" for x, y in zip(pa, pb) if x != y)
 
 
-def metrics(rec):
-    """Speeds weighted by tokens, and uploads per generated token (the log's per-token numbers count every token of a verify batch)."""
+def metrics(rec, ref=None):
+    """Speeds weighted by tokens, and uploads per generated token (the log's per-token numbers count every token of a verify batch).
+    ref has each request's answer length in the warm-up: an agent's whole turn is timed as if its answer had that length, since
+    answers that stop on their own come out longer or shorter as the text drifts, and with prompts most of a turn's time, a
+    longer answer would look like a faster turn."""
     reqs, st = rec["requests"], rec["log"]
     def speed(kinds):
         g = [r for r in reqs if r["kind"] in kinds]
@@ -1257,10 +1265,12 @@ def metrics(rec):
     fill = next((r for r in reqs if r["label"] == "fill"), None)
     dp = st.get("draft_passes") or {}
     agent = [r for r in reqs if r["kind"] == "agent"]
-    turn_ms = sum(r["prompt_ms"] + r["predicted_ms"] for r in agent)
+    ref = ref or {}
+    n_ref = {r["label"]: ref.get(r["label"]) or r["predicted_n"] for r in agent}
+    turn_ms = sum(r["prompt_ms"] + r["predicted_ms"] * n_ref[r["label"]] / max(r["predicted_n"], 1) for r in agent)
     agent_pp = sum(r["prompt_ms"] for r in agent)
     return dict(all=speed(("short", "long", "agent")), short=speed(("short",)), long=speed(("long",)), agent=speed(("agent",)),
-                agent_turn=sum(r["predicted_n"] for r in agent) * 1000.0 / turn_ms if turn_ms > 0 else 0.0,
+                agent_turn=sum(n_ref.values()) * 1000.0 / turn_ms if turn_ms > 0 else 0.0,
                 agent_prompt=sum(r["prompt_n"] for r in agent) * 1000.0 / agent_pp if agent_pp > 0 else None, hits=st.get("hits"), mib_batch_token=st.get("mib_batch_token"),
                 mib_gen=st.get("small_mib", 0.0) / max(n_gen, 1), accept=sum(r["draft_n_accepted"] for r in reqs) / drafted if drafted else None,
                 fill_prompt=fill["prompt_n"] * 1000.0 / fill["prompt_ms"] if fill and fill["prompt_ms"] > 0 else None, update_ms=st.get("update_ms"), restore_ms=st.get("restore_ms"),
