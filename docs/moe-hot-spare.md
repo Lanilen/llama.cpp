@@ -284,7 +284,7 @@ compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 aga
   the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
 
 Small batches are those of up to the `--moe-cache-batch` size whose compute buffers fit next to the cache (see
-[Prompts](#prompts---moe-cache-resize)). On Kallista (RTX 4070 Ti, Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
+[Prompts](#prompts---moe-cache-resize)). On the 14600KF + RTX 4070 Ti (Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
 of 193, 349 and 749 tokens read at 458, 413 and 556 tok/s when they kept the cache, against 111, 186 and 356 when they
 released it, and the generation after them ran at 51-59 tok/s against 30-34, while the cache filled again; `--moe-cache-batch 0`
 kept the cache up to 1024 tokens there.
