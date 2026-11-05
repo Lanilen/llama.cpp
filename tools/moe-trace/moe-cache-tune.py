@@ -1020,6 +1020,16 @@ class Tuner:
         limit = self.threshold(sigma, len(pids), len(pids), base)
         d["threshold"] = round(limit, 3)
         if gain > limit:
+            if metric != self.o.objective:
+                # a stage judged by its own speed: of the candidates that beat the incumbent and come within the threshold
+                # of the best, the objective picks
+                close = [c for c in done if c != cur and self.mean(c, pids, metric) - base > limit
+                         and self.mean(best, pids, metric) - self.mean(c, pids, metric) <= limit]
+                pick = max(close, key=lambda c: self.mean(c, pids))
+                if pick != best:
+                    d["tie_on_metric"] = best.name()
+                    best = pick
+                    d.update(best=best.name(), gain=round(self.mean(best, pids, metric) - base, 3))
             d["winner"] = best.name()
             self.decisions.append(d)
             return best
@@ -1143,6 +1153,8 @@ class Tuner:
                 best = d.get("best", d["winner"])
                 if d["winner"] != d["incumbent"]:
                     L.append(f"  {d['stage']:11s} {change(d['incumbent'], d['winner'])}: {d['gain']:+.2f} tok/s{by}, needed {d['threshold']:.2f}")
+                    if d.get("tie_on_metric"):
+                        L.append(f"              {change(d['incumbent'], d['tie_on_metric'])} was within that of it, and slower by {o.objective}")
                 elif best != d["incumbent"]:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: best was {change(d['incumbent'], best)} at {d['gain']:+.2f} tok/s{by}, needed {d.get('threshold', 0):.2f}")
                 else:
