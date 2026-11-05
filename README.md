@@ -14,7 +14,7 @@
 >
 > With Qwen3.8-Flash-Next on the two RX 480s, a 9.6k-token prompt reads at 86 tok/s instead of 36.5, and generation runs
 > at 14.5 tok/s instead of 11.7. On the R9700, the cache took generation from 16.8 to 25.9 tok/s with the same
-> settings, and with everything since it runs at 41 tok/s on Q4_K_XL and 33 on Q6_K_XL. The results and how they were
+> settings, and with everything since it runs at 42 tok/s on Q4_K_XL and 33 on Q6_K_XL. The results and how they were
 > measured are in [FORK.md](FORK.md).
 >
 > **It is tuned for one home lab.** Some changes work around the RX 480's Vulkan driver and could make other GPUs slower
