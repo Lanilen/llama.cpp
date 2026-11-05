@@ -262,9 +262,9 @@ python3 tools/moe-trace/moe-cache-tune.py --server build-vk/bin/llama-server -m 
 It only changes how the work is placed and scheduled, never what the model computes. A stage the build or the machine
 can't use is skipped, for example the OpenMP spin without GCC's OpenMP, or the submit size without a Vulkan device.
 
-**What it tunes,** in the order it runs. The last column is perseus's choice, by hand, for Flash-Next on the R9700:
+**What it tunes,** in the order it runs. The last column is the choice found by hand for Flash-Next on the 1920X + R9700:
 
-| stage | setting | what it changes | why it depends on the machine | perseus |
+| stage | setting | what it changes | why it depends on the machine | 1920X + R9700 |
 |---|---|---|---|---|
 | `omp-spin` | `GOMP_SPINCOUNT` | how long the CPU's threads spin before they sleep | the gap between two layers' CPU work against the spin | 30000000 |
 | `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | the memory system and the number of cores | 128 |
@@ -287,9 +287,9 @@ request (answers after a large prompt, long answers, agent turns, whole agent tu
 choose from are all in hand; `--objective` searches for one of them instead.
 
 A `gate` stage for gated longer drafts is there too, but it's left out by default: gates lose to the graph rebuild of
-each new verify length. On perseus a full search is about 50 runs and 5–6 hours.
+each new verify length. On the 1920X + R9700 a full search is about 50 runs and 5–6 hours.
 
-**The first full search,** Q4_K_XL on perseus with the recorded agent turns: from nothing set, its pick ran at 41.5
+**The first full search,** Q4_K_XL on the 1920X + R9700 with the recorded agent turns: from nothing set, its pick ran at 41.5
 against 37.0 tok/s (+12%), and agent turns +23%. It agreed with the settings found by hand on the spin, the chunks, the
 submit size, the predictor without refill, the budget, the cache size, the copy threads and `-t 12`. It found two that
 do better:
@@ -419,7 +419,7 @@ Measured on the R9700 machine. These either didn't help or cost more than they g
   in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N).
 - **One cumulative benchmark:** the numbers above come from different request sets over a month. They'll be redone as
   one ladder, each step added to the last, on the same requests.
-- **The tuning script's full search** on perseus with all its stages, against the settings found by hand.
+- **The tuning script's full search** on the 1920X + R9700 with all its stages, against the settings found by hand.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
