@@ -279,10 +279,27 @@ can't use is skipped, for example the OpenMP spin without GCC's OpenMP, or the s
 | `threads` | `LLAMA_MOE_CACHE_COPY_THREADS` | the threads that copy experts to staging memory | the RAM's bandwidth per thread | 4 |
 | `cpu-threads` | `-t` | the CPU's threads | the cores, and what a second thread on a core costs | 12 |
 
-It judges by generation speed over all the requests, except the `jit` stage, which goes by the agent's whole turns,
-prompts included, since that's where the uploads pay. `--objective` picks another speed. A `gate` stage for gated longer
-drafts is there too, but it's left out by default: gates lose to the graph rebuild of each new verify length. On perseus
-a full search is about 50 runs and 5–6 hours. The settings it doesn't touch are your placement (`-ngl`, `-ncmoe`, `-ub`,
+**The pick is the best overall balance.** The stages and the final check go by generation speed over the whole mix of
+requests. The exception is `jit`, which goes by the agent's whole turns, prompts included, since that's where its
+uploads pay; between values that tie there, generation decides. If you mostly do one kind of work, an agent's loop for
+example, its best settings can differ from the balance. The summary has every configuration's speed for each kind of
+request (answers after a large prompt, long answers, agent turns, whole agent turns, agent prompts), so the tests to
+choose from are all in hand; `--objective` searches for one of them instead.
+
+A `gate` stage for gated longer drafts is there too, but it's left out by default: gates lose to the graph rebuild of
+each new verify length. On perseus a full search is about 50 runs and 5–6 hours.
+
+**The first full search,** Q4_K_XL on perseus with the recorded agent turns: from nothing set, its pick ran at 41.5
+against 37.0 tok/s (+12%), and agent turns +23%. It agreed with the settings found by hand on the spin, the chunks, the
+submit size, the predictor without refill, the budget, the cache size, the copy threads and `-t 12`. It found two that
+do better:
+- **3 drafts instead of 2:** 43.6 against 41.6 tok/s, in every kind of request. With the CPU's experts faster, a third
+  draft is now cheap: a pass yields 2.92 tokens in 67 ms, against 2.44 in 59 ms.
+- **An answer cap of 500 instead of 1000:** agent turns 46.8 against 44.2 tok/s, the usual answers the same.
+
+`--moe-cache-jit` is the clearest trade-off. At 4 or 8, the agent's prompts of 150–950 tokens ran 1.3–1.5× faster and
+its whole turns 8% faster, while generation lost 4% to the slots JIT takes from the cache. The balance picks 4, which
+tied 8 on the turns and cost less generation (the final check above ran with 8); for generation alone it would be off. The settings it doesn't touch are your placement (`-ngl`, `-ncmoe`, `-ub`,
 devices) and anything that needs root, such as the R9700's power profile ([Setups](#setups)).
 
 The guide has the method in full, the options and the output:
