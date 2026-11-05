@@ -237,7 +237,7 @@ In `tools/moe-trace` ([README](tools/moe-trace/README.md)) and `tools/moe-predic
 
 ## Tuning a machine
 
-The settings in [Setups](#setups) were found on one machine, and most of them depend on the hardware: how fast the
+The settings in [Setups](#setups) were picked for one machine, and most of them depend on the hardware: how fast the
 link uploads, how fast the CPU reads its experts, how the GPU keeps up with the recording.
 [`tools/moe-trace/moe-cache-tune.py`](tools/moe-trace/README.md#tuning-a-machine) searches them for yours, and writes a
 results file you can share. It's on `moe-tuning` with all its stages (on `moe-predictor` with the cache's and the
