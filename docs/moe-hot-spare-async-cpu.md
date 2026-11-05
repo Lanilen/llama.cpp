@@ -20,7 +20,7 @@ Status: shelved after phase 0 (below), nothing implemented.
   ~11-12 ms that its weight reads need at the R9700's bandwidth. Fewer, fused dispatches are the next lever, for Q4
   and Q6 alike.
 
-The original design follows. Measured on perseus (R9700, Threadripper 1920X, RADV) with Qwen3.8-Flash-Next
+The original design follows. Measured on the 1920X + R9700 (RADV) with Qwen3.8-Flash-Next
 UD-Q4_K_XL, the everyday preset (64k, `-ub 8192`, MTP, `-t 12`), on 2026-10-28 (`~/traces/fn-profile`).
 
 ## Where a generation step goes today
@@ -134,15 +134,15 @@ or fewer, fused dispatches: ~7800 nodes per step).
 
 ## Plan
 
-0. **Measure W and the recording** (perseus, ~10 minutes, `~/traces/fn-phase0.sh`): `GGML_VK_HOST_TIMING` splits the
+0. **Measure W and the recording** (1920X + R9700, ~10 minutes, `~/traces/fn-phase0.sh`): `GGML_VK_HOST_TIMING` splits the
    24.5 ms into setup, fusion checks, recording and queue submits; the perf logger in its concurrent mode
    (`GGML_VK_PERF_LOGGER_CONCURRENT`: timestamps only where the graph already has barriers) gives W. Go if W leaves a
    gain worth the change.
 1. **Vulkan gates** with a test of their own: a copy that waits for a host signal given 100 ms later, a host wait for
-   a GPU signal; on Kallista (NVIDIA) and perseus (RADV), where waiting before the signal is submitted must work.
-2. **Scheduler worker** behind `GGML_SCHED_ASYNC_CPU=1`; Kallista's coder30b hot spare has the same three splits per
+   a GPU signal; on the 14600KF + RTX 4070 Ti (NVIDIA) and the 1920X + R9700 (RADV), where waiting before the signal is submitted must work.
+2. **Scheduler worker** behind `GGML_SCHED_ASYNC_CPU=1`; the 14600KF + RTX 4070 Ti's Qwen3-Coder-30B hot spare has the same three splits per
    layer: greedy outputs identical to the flag off, then speed.
-3. **Perseus A/B**: the profile sweep's c23500, c16000, c0 and the long layout with the flag on and off; then decide
+3. **A/B on the 1920X + R9700**: the profile sweep's c23500, c16000, c0 and the long layout with the flag on and off; then decide
    on Q6 with its predicted speed from the new numbers.
 
 ## Risks
