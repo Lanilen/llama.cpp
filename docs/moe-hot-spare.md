@@ -98,13 +98,13 @@ checks what the reserve allocated, and otherwise tries half the size, down to 32
 they keep the cache and run on the hot spare, the cached experts on the GPU and the misses on the CPU, so a medium prompt such
 as a tool output neither copies every expert to the GPU nor uploads the cache again. Larger batches are large. The log says
 `MoE cache resize: batches of up to N tokens keep the cache`. An MTP draft context then fits its own small reserve for the same
-size in what is left (its buffers for a batch can be larger than the main context's: on perseus 2048-token reserves for both
+size in what is left (its buffers for a batch can be larger than the main context's: on the 1920X + R9700 2048-token reserves for both
 spilled into system memory and generation fell from 26 to 8.5 tok/s), and if it fits only a smaller one, the main context
 follows it.
 
 Backends also keep memory of their own between graphs, sized by the largest graph so far and outside the scheduler's buffers:
 the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch grows them a lot (the sparse attention
-top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at 59k cells and `-ub 8192` on perseus), and
+top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at 59k cells and `-ub 8192` on the 1920X + R9700), and
 the cache coming back on top of them overcommitted the GPU: the driver moved memory to the host and generation stayed at 7
 tok/s instead of 20 for the rest of the session. So when large batches end, and at the next small batch after a medium one,
 the context gives them back (`ggml_backend_release_scratch`, Vulkan only) before the cache comes back; the next graph
@@ -206,7 +206,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
 | `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
-| `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on perseus 29.5 GB/s instead of 20) |
+| `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on the 1920X 29.5 GB/s instead of 20) |
 | `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
