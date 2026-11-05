@@ -104,7 +104,7 @@ selections hit with 4.9 uploads per generated token, against 86.1% with 13.7 for
 
 **Capping the answer's start: `--moe-cache-predictor-answer-cap N`.** Without a text start, the answer's start rebalances
 in full from the main predictor (0, the default). With N it makes at most the N best of those swaps, and the budgeted
-refresh does the rest. On perseus (Flash-Next Q4 and Q6, 2026-11-04) 1000 sped agent turns up by 8–12% and cost the
+refresh does the rest. On the 1920X + R9700 (Flash-Next Q4 and Q6) 1000 sped agent turns up by 8–12% and cost the
 usual answers up to 2.6%, because the uploads of a full rebalance cost more than the point of hits it buys. The flag
 overrides `LLAMA_MOE_PREDICTOR_ANSWER_CAP`.
 
@@ -150,17 +150,17 @@ checks what the reserve allocated, and otherwise tries half the size, down to 32
 they keep the cache and run on the hot spare, the cached experts on the GPU and the misses on the CPU, so a medium prompt such
 as a tool output neither copies every expert to the GPU nor uploads the cache again. Larger batches are large. The log says
 `MoE cache resize: batches of up to N tokens keep the cache`. With an MTP draft context the two share what is left (the draft's
-buffers for a batch can be larger than the main context's: on perseus 2048-token reserves for both spilled into system memory
+buffers for a batch can be larger than the main context's: on the 1920X + R9700 2048-token reserves for both spilled into system memory
 and generation fell from 26 to 8.5 tok/s). The main context measures its buffers for each size and stays at 32 tokens, the draft
 picks the largest size that fits both, and the main context takes its share. If either then finds less room, the other follows
 it down. The two used to fit in turn, so more free memory could mean less: with 2048 tokens taking most of it, the draft got
-128, and both stayed at 128 with the rest unused. Kallista (RTX 4070 Ti, Ornith 35B with a 3000 MiB cache, Ornith 9B as the draft, follow-up
+128, and both stayed at 128 with the rest unused. The 14600KF + RTX 4070 Ti (Ornith 35B with a 3000 MiB cache, Ornith 9B as the draft, follow-up
 prompts of about 350 tokens): 128 tokens and 4 releases before, 1024 and 1 release now, the later prompts 3.2-3.7 s before and
 1.8-2.0 s now.
 
 Backends also keep memory of their own between graphs, sized by the largest graph so far and outside the scheduler's buffers:
 the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch grows them a lot (the sparse attention
-top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at 59k cells and `-ub 8192` on perseus), and
+top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at 59k cells and `-ub 8192` on the 1920X + R9700), and
 the cache coming back on top of them overcommitted the GPU: the driver moved memory to the host and generation stayed at 7
 tok/s instead of 20 for the rest of the session. So when large batches end, and at the next small batch after a medium one,
 the context gives them back (`ggml_backend_release_scratch`, Vulkan only) before the cache comes back; the next graph
@@ -324,7 +324,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
 | `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
-| `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on perseus 29.5 GB/s instead of 20) |
+| `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on the 1920X 29.5 GB/s instead of 20) |
 | `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
 | `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
 | `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
@@ -417,7 +417,7 @@ compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 aga
   the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
 
 Small batches are those of up to the `--moe-cache-batch` size whose compute buffers fit next to the cache (see
-[Prompts](#prompts---moe-cache-resize)). On Kallista (RTX 4070 Ti, Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
+[Prompts](#prompts---moe-cache-resize)). On the 14600KF + RTX 4070 Ti (Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
 of 193, 349 and 749 tokens read at 458, 413 and 556 tok/s when they kept the cache, against 111, 186 and 356 when they
 released it, and the generation after them ran at 51-59 tok/s against 30-34, while the cache filled again; `--moe-cache-batch 0`
 kept the cache up to 1024 tokens there.
