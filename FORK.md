@@ -121,6 +121,9 @@ the GPU once), but large batches need large compute buffers, which the cache wou
 - **`--moe-cache-jit N`:** such a medium batch doesn't swap experts, since its resident set was picked for generation.
   With `N`, each layer uploads its missing experts that at least N of its tokens select, just before it runs, and the
   GPU runs them. Only the cache branch waits for those uploads; the CPU starts at once.
+- **`LLAMA_MOE_RESIZE_SPLIT=N`:** a batch of up to N tokens that is too large to fit next to the cache keeps it all the
+  same, and runs in ubatches of the size that fits. It skips the release, the 1.9 s restore, and the uploads of every
+  expert, and the cache and the jit serve the prompt. The MTP draft's context follows the same rule.
 
 **Measured:**
 - `--moe-cache-resize`, 2x RX 480: a 9.6k-token prompt 36.5 → 86.0 tok/s (`-ub 512` → `-ub 4096`, larger cache too).
@@ -128,6 +131,10 @@ the GPU once), but large batches need large compute buffers, which the cache wou
   Fitting the main and draft contexts together: follow-ups 127 → 51.5 s on Q4, 158 → 57 s on Q6.
 - `--moe-cache-jit 8`, R9700: prompts of 33–1024 tokens 91.7 → 120.3 tok/s on Q4 (+31%) and 78.7 → 98.3 on Q6 (+25%),
   for under a point of generation's hit rate.
+- `LLAMA_MOE_RESIZE_SPLIT=4096`, R9700 with a 20900 MiB cache, where batches of up to 1024 tokens fit: prompts of
+  1.9k–2.3k tokens 125–142 → 161–211 tok/s on Q4 and 97–110 → 135–172 on Q6. The whole set of requests takes 14 s less
+  on Q4 and 27 s less on Q6, with generation as fast or faster (follow-ups +2.5 tok/s). 8192 measured the same: no
+  request fell between the two.
 
 ### Scheduler and Vulkan changes for split models
 
@@ -355,7 +362,7 @@ lab's file isn't published). The cache, draft and CPU settings are the tuning sc
 ([Tuning a machine](#tuning-a-machine)):
 
 ```bash
-GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 \
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=4096 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
