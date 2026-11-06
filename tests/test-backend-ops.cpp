@@ -12905,6 +12905,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // a ubatch of 33-64 tokens, which the medium tiles serve (Flash-Next's medium prompts; its draft's prompt batches)
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 48, 14336, {1,  1}, {1, 1}));
+    }
+
     // small mat-vecs at Qwen3.8-Flash-Next's widths (k = n_embd 2560, or 10240 for its 4 hyper-connection streams): how the
     // time grows with the rows, to see what one mat-vec over concatenated weights would save against several
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
