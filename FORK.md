@@ -271,15 +271,15 @@ can't use is skipped, for example the OpenMP spin without GCC's OpenMP, or the s
 | stage | setting | what it changes | why it depends on the machine | Q4_K_XL | Q6_K_XL |
 |---|---|---|---|---|---|
 | `omp-spin` | `GOMP_SPINCOUNT` | how long the CPU's threads spin before they sleep | the gap between two layers' CPU work against the spin | 30000000 | 30000000 |
-| `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | the memory system and the number of cores | 128 | off |
+| `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | the memory system and the number of cores | 128 | 128 |
 | `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit | how fast the CPU records against how fast the GPU runs | 100M | 100M |
 | `predictor` | `--moe-cache-predictor`, `--moe-cache-predictor-start` | the predictor, or the decayed scores | upload speed against what a better set saves | predictor, no text start | predictor, no text start |
 | `refill` | `--moe-cache-refill` | a full rebalance after the first tokens | the cost of a full rebalance on the link | 0 | 0 |
-| `answer-cap` | `--moe-cache-predictor-answer-cap` | how many swaps an answer's start makes | the same | 500 | 1000 |
+| `answer-cap` | `--moe-cache-predictor-answer-cap` | how many swaps an answer's start makes | the same | 250 | 500 |
 | `drafts` | `--spec-draft-n-max` | MTP drafts per verify pass | each draft adds a token of CPU experts to a pass | 3 | 3 |
-| `budget` | `--moe-cache-budget` | MiB uploaded per token to follow the text | the link's speed | 10 | 10 |
+| `budget` | `--moe-cache-budget` | MiB uploaded per token to follow the text | the link's speed | 10 | 20 |
 | `mib` | `--moe-cache-mib` | the cache's size, by default against 85% of it | the free VRAM, the uploads to fill it | 20900 | 20900 |
-| `jit` | `--moe-cache-jit` | which medium prompts' experts upload just in time | when an upload costs less than the CPU's work | 4 | 16 |
+| `jit` | `--moe-cache-jit` | which medium prompts' experts upload just in time | when an upload costs less than the CPU's work | 4 | 8 |
 | `threads` | `LLAMA_MOE_CACHE_COPY_THREADS` | the threads that copy experts to staging memory | the RAM's bandwidth per thread | 4 | 4 |
 | `cpu-threads` | `-t` | the CPU's threads | the cores, and what a second thread on a core costs | 12 | 12 |
 
@@ -297,40 +297,36 @@ example, its best settings can differ from the balance. The summary has every co
 request (answers after a large prompt, long answers, agent turns, whole agent turns, agent prompts), so the tests to
 choose from are all in hand; `--objective` searches for one of them instead.
 
-**On the 1920X + R9700,** the search of Q4_K_XL, with ten recorded agent turns, took 63 runs of about 5 minutes. Its pick
-generated at 41.83 tok/s against 37.03 with none of these set (+13%), and agent turns gained 21.7%. Each stage that
-changed something, against the stage before:
+**On the 1920X + R9700,** each model was searched in two rounds by the balance, with ten recorded agent turns and runs
+of about 5 minutes; the second round tried every stage again from the first round's pick, with every value it had
+tried, the starting values included. Q4_K_XL's pick (185 runs) came to 43.32 tok/s by the balance against 36.54 with
+none of these set (+18.6%): agent turns +23.1%, whole agent turns, prompts included, +16.7%. Q6_K_XL's (211 runs) came
+to 34.13 against 29.82 (+14.5%): agent turns +19.3%, whole agent turns +13.2%. Each stage that changed something,
+against the stage before:
 
-| stage | to | gain |
+| stage | Q4_K_XL | Q6_K_XL |
 |---|---|---|
-| `omp-spin` | `GOMP_SPINCOUNT=30000000` | +2.08 tok/s |
-| `cpu-chunks` | `GGML_CPU_MMID_FLAT=128` (64 and 256 less) | +1.12 tok/s |
-| `submits` | `GGML_VK_FLOPS_PER_SUBMIT=100000000` (25M less) | +0.92 tok/s |
-| `predictor` | the predictor, no refill | +1.86 tok/s |
-| `answer-cap` | 500 (1000 and 2000 less) | +1.11 tok/s |
-| `jit` | 4 | whole agent turns +8%, generation −4% |
+| `omp-spin` | `GOMP_SPINCOUNT=30000000`, +2.02 tok/s | the same, +0.57 |
+| `cpu-chunks` | `GGML_CPU_MMID_FLAT=128`, +1.03 | 128 in the second round, +0.50 (with the predictor on) |
+| `submits` | `GGML_VK_FLOPS_PER_SUBMIT=100000000`, +0.86 | the same, +0.65 |
+| `predictor` | the predictor, no refill, +2.81 | the predictor, +1.44; no refill in the second round, +0.57 |
+| `answer-cap` | 500, +1.73; 250 in the second round, +0.41 | 1000, +0.52; 500 in the second round, +0.80 |
+| `budget` | 10 (12, 15 and 20 no faster) | 20, +0.23 |
+| `jit` | 4: whole agent turns faster, generation −4% | 8 |
 
-The other stages kept their starting values: no refill once the predictor is on, 3 drafts, budget 10, 20900 MiB, 4 copy
-threads and `-t 12`. Most of this matches what was found by hand, step by step. The search did better in three places:
-- **3 drafts, not 2:** 43.6 against 41.6 tok/s, in every kind of request. With the CPU's experts faster, a third draft is
-  cheap: a pass yields 2.92 tokens in 67 ms, against 2.44 in 59 ms.
-- **An answer cap of 500, not 1000:** agent turns 46.8 against 44.2 tok/s, with the usual answers the same.
-- **`--moe-cache-jit 4`, not 8:** the two give the same whole agent turns, with prompts of 150–950 tokens 1.3–1.5× faster
-  than without, but 4 costs less generation: 41.87 against 41.53 tok/s, and 43.57 without. For generation alone it would
-  be off.
+Both kept 3 drafts (4 slower), 20900 MiB, 4 copy threads and `-t 12`. Most of this matches what was found by hand, step
+by step. The search did better in three places:
+- **3 drafts, not 2:** 43.6 against 41.6 tok/s on Q4, in every kind of request. With the CPU's experts faster, a third
+  draft is cheap: a pass yields 2.92 tokens in 67 ms, against 2.44 in 59 ms.
+- **A small answer cap:** on Q4, 250 against 500 and 1000 makes short answers and agent turns faster and long answers no
+  slower (125 was no better); on Q6, 500 against 1000 makes short answers 3.5% and agent turns 3.7% faster.
+- **`--moe-cache-jit` at 4 or 8, not off:** prompts of 150–950 tokens run 1.3–1.5× faster than without, at a cost in
+  generation, as its slots come out of the cache. For generation alone it would be off.
 
-The search of Q6_K_XL took 53 runs. Its pick generated at 32.90 tok/s against 30.50 (+7.9%), and agent turns gained
-13.4%. The spin (+0.61 tok/s), the submit size (+0.66), the predictor without the refill (+0.97) and 3 drafts came out
-as for Q4. It differs in three places:
-- **No gain from the CPU's chunks:** 64, 128 and 256 all came within the noise of off (31.06 against 31.28 for 128).
-- **An answer cap of 1000:** +0.74 tok/s. 500 was faster in agent turns (35.9 against 33.9) and slower in long answers.
-- **`--moe-cache-jit 16`:** 4, 8 and 16 give the same whole agent turns (+5% over off), and 16 costs the least
-  generation: 32.84 tok/s, against 32.42 for 4 and 33.65 without. Q6's experts are larger, so each upload costs more.
-
-A second round from Q4's pick (`--rounds 2`, every stage again with every value it tried, the old starting values
-included) kept all of it: without the spin, the chunks or the submit size, generation fell by 1.95, 1.41 and 1.24
-tok/s, so they weren't artifacts of the default start. The values past the ends of the lists lost or tied: 4 drafts,
-400M submits, budget 40, an answer cap of 125, a refill of 32, `--moe-cache-jit 2`, a spin of 480M.
+The second round kept the CPU and Vulkan settings: on Q4 without the spin, the chunks or the submit size, generation
+fell by 1.95, 1.41 and 1.24 tok/s, so they weren't artifacts of the default start. The values past the ends of the
+lists lost or tied: 4 drafts, 400M submits, budget 40, a refill of 32, `--moe-cache-jit 2`, spins of 7.5M and 120M. Q6's
+second round ran out of its 8 hours before drafts, budget, jit and threads came up again.
 
 The guide has the method in full, the options and the output:
 [tools/moe-trace/README.md](tools/moe-trace/README.md#tuning-a-machine).
@@ -363,18 +359,18 @@ GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=10000000
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
-    --moe-cache-predictor flashnext-pred.gguf --moe-cache-refill 0 --moe-cache-jit 4 --moe-cache-predictor-answer-cap 500 \
+    --moe-cache-predictor flashnext-pred.gguf --moe-cache-refill 0 --moe-cache-jit 4 --moe-cache-predictor-answer-cap 250 \
     -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -devd Vulkan0 \
     --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 2048 --load-mode mmap+mlock
 ```
 
 With the card on the COMPUTE profile (below), over a story, questions after 2k and 18k tokens of code, a 4-turn session
-and ten recorded agent turns, two passes: generation at 41.83 tok/s, agent turns at 44.62 tok/s, 81.5% of the experts
-in the cache.
+and ten recorded agent turns, two passes: 43.31 tok/s by the balance (42.09 over every request's tokens), agent turns
+at 45.03 tok/s, 80.1% of the experts in the cache.
 
-UD-Q6_K_XL takes the same placement, with its own picks: `--moe-cache-jit 16`, `--moe-cache-predictor-answer-cap 1000`,
-and no `GGML_CPU_MMID_FLAT`, which made no difference there. Generation at 32.90 tok/s, agent turns at 33.73 tok/s,
-72.9% of the experts in the cache.
+UD-Q6_K_XL takes the same placement, with its own picks: `--moe-cache-budget 20`, `--moe-cache-jit 8` and
+`--moe-cache-predictor-answer-cap 500`. 34.15 tok/s by the balance (33.45 over every request's tokens), agent turns at
+35.32 tok/s, 73.0% of the experts in the cache.
 
 - **The draft head's experts are on the GPU** (no `-cmoed`), and the cache is smaller by their 2550 MiB. Against
   `-cmoed` with 23500 MiB: usual answers 31.5 → 32.6 tok/s and agent turns 27.9 → 28.6, at 83.6% hits instead of 86.5%.
@@ -448,8 +444,7 @@ Measured on the R9700 machine. These either didn't help or cost more than they g
   in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N).
 - **One cumulative benchmark:** the numbers above come from different request sets over a month. They'll be redone as
   one ladder, each step added to the last, on the same requests.
-- **UD-Q6_K_XL by the balance, in two rounds:** its search went by every request's tokens. Replayed by the balance, its
-  path changes at the refill, and its second round ran out of time.
+- **UD-Q6_K_XL's second round in full:** drafts, budget, jit and threads weren't tried again from its pick.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
