@@ -2321,6 +2321,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 g_moe_resize.pending = false;
             }
         }
+        if (moe_cache) {
+            moe_cache->prepare_batch(balloc->get_n_tokens());
+        }
         // LLAMA_MOE_RESIZE_SPLIT=N: a batch of up to N tokens that doesn't fit next to the cache keeps it all the same
         // and runs in ubatches of the size that fits, instead of releasing the cache for one large reserve (the cost of
         // restoring it then goes, and the cache's experts serve the prompt); the draft's context follows the same rule,
