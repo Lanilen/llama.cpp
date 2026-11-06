@@ -2321,7 +2321,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 g_moe_resize.pending = false;
             }
         }
-        const bool large = balloc->get_n_tokens() > resize_small_max;
+        // LLAMA_MOE_RESIZE_SPLIT=N: a batch of up to N tokens that doesn't fit next to the cache keeps it all the same
+        // and runs in ubatches of the size that fits, instead of releasing the cache for one large reserve (the cost of
+        // restoring it then goes, and the cache's experts serve the prompt); the draft's context follows the same rule,
+        // so its buffers stay small too. Only once the small batches have grown past the hot spare's own limit
+        static const int64_t split_max = getenv("LLAMA_MOE_RESIZE_SPLIT") ? atoll(getenv("LLAMA_MOE_RESIZE_SPLIT")) : 0;
+        const bool split = split_max > 0 && resize_small_max > n_min && balloc->get_n_tokens() <= split_max;
+        const bool large = balloc->get_n_tokens() > resize_small_max && !split;
         if (large != moe_resize_large) {
             synchronize();
             if (large && moe_cache) {
@@ -2367,7 +2373,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        // the small reserve holds ubatches of up to resize_small_max tokens (LLAMA_MOE_RESIZE_SPLIT cuts larger batches)
+        const uint32_t n_ubatch = resize_small_max > 0 && !moe_resize_large ? std::min<uint32_t>(cparams.n_ubatch, (uint32_t) resize_small_max) : cparams.n_ubatch;
+        mctx = memory->init_batch(*balloc, n_ubatch, embd_all);
         if (!mctx) {
             return -2;
         }
