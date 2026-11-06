@@ -121,6 +121,9 @@ the GPU once), but large batches need large compute buffers, which the cache wou
 - **`--moe-cache-jit N`:** such a medium batch doesn't swap experts, since its resident set was picked for generation.
   With `N`, each layer uploads its missing experts that at least N of its tokens select, just before it runs, and the
   GPU runs them. Only the cache branch waits for those uploads; the CPU starts at once.
+- **`LLAMA_MOE_CACHE_JIT_SHARE=1`:** the jit's slots are resident slots too, lent to the jit only while a batch uses it:
+  each group lends the slots of its weakest residents. `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N` caps the uploads, and
+  the slots lent, at one per N tokens of the ubatch (at least 64), so more slots can serve large batches.
 - **`LLAMA_MOE_RESIZE_SPLIT=N`:** a batch of up to N tokens that is too large to fit next to the cache keeps it all the
   same, and runs in ubatches of the size that fits. It skips the release, the 1.9 s restore, and the uploads of every
   expert, and the cache and the jit serve the prompt. The MTP draft's context follows the same rule.
@@ -135,6 +138,10 @@ the GPU once), but large batches need large compute buffers, which the cache wou
   1.9k–2.3k tokens 125–142 → 161–211 tok/s on Q4 and 97–110 → 135–172 on Q6. The whole set of requests takes 14 s less
   on Q4 and 27 s less on Q6, with generation as fast or faster (follow-ups +2.5 tok/s). 8192 measured the same: no
   request fell between the two.
+- On top of it, `LLAMA_MOE_CACHE_JIT_SHARE=1` with 128 slots (`LLAMA_MOE_CACHE_JIT_SLOTS=128`) and
+  `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8`: 2k prompts another 29-31% faster on Q4. The set of requests took 16.8 s less
+  on Q4 (-7%) and 13.3 s less on Q6 (-5%). The cost is Q4's short answers after a large prompt, 0.8 tok/s slower
+  (-1.9%) while the lent slots refill; other generation was within 0.8 tok/s.
 
 ### Scheduler and Vulkan changes for split models
 
@@ -369,6 +376,7 @@ lab's file isn't published). The cache, draft and CPU settings are the tuning sc
 
 ```bash
 GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=4096 \
+LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \

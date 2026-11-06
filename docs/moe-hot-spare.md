@@ -246,6 +246,29 @@ With the settings of the tuning script's search on the 1920X + R9700 (Q4, 3 draf
 the same whole agent turns, 8% faster than without. 4 cost less generation: 41.87 tok/s against 41.53, and 43.57
 without. So the search picked 4.
 
+**Slots shared with the resident set** (`LLAMA_MOE_CACHE_JIT_SHARE=1`). By default the jit's slots come out of the
+cache, so generation gives them up for good: 2-3% of Q4's generation at N=4 on the R9700. Shared, they are resident slots
+too, and a batch that uses the jit borrows slots only while it runs. Before such a batch (and before the cache is
+restored for it), each group lends the jit the slots of its weakest residents: empty slots first, none that an upload is
+writing to. The experts in them leave the resident set, and the jit uploads into those slots, wherever they are. When
+the next batch that doesn't use the jit comes, the slots come back empty, and the refreshes fill them; those fills don't
+count against the answer cap, since the cache had them before. Lending the fixed jit slots instead was slower:
+the refill after a batch puts the best missing experts into the empty slots first, so the next lend evicted strong
+experts, and prompts of 150-350 tokens ran 7-17% slower.
+
+With sharing, more slots cost generation little, but a small batch gains nothing from them.
+`LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N` caps a layer's uploads, and the slots lent, at one per N tokens of the ubatch,
+with a floor of 64. On the R9700 with `LLAMA_MOE_RESIZE_SPLIT=4096` (fn-share2: Local Coder's presets, two passes, against
+the split alone), 128 slots with N=8 gave:
+
+| | prompts of 1.9k-2.3k tokens | prompts of 150-350 tokens | generation: short answers / follow-ups / agent turns | whole run |
+| --- | --- | --- | --- | --- |
+| Q4_K_XL | 162-209 → 218-270 tok/s (+29-31%) | -1 to -5% | -0.79 / -0.45 / +0.35 tok/s | 235.6 → 218.8 s |
+| Q6_K_XL | | | -0.09 / -0.77 / -0.09 tok/s | 286.1 → 272.8 s |
+
+256 slots were no better than 128. The jit's own check (`LLAMA_MOE_CACHE_JIT_CHECK=1`: every upload read back, the maps
+checked) found no difference in 180,360 uploads.
+
 ### The CPU's experts
 
 *On the `moe-tuning` branch.*
