@@ -1736,6 +1736,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmq_cm1_wg_denoms_k, m_mmq_cm1_wg_denoms_k, s_mmq_cm1_wg_denoms_k,
+                            l_mmq_cm1_wg_denoms, m_mmq_cm1_wg_denoms, s_mmq_cm1_wg_denoms,
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
 
     uint32_t l_align, m_align, s_align;
@@ -1832,6 +1833,34 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         m_warptile_mmq_cm1_int_k = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
         s_warptile_mmq_cm1_int_k = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
 
+        // GGML_VK_CM1_INT_TILE_{S,M,L}=BM,BN,WM,WN (GGML_VK_CM1_INT_K_TILE_* for the k-quant tiles of Q3_K/Q6_K): other
+        // shapes for the int8 coopmat1 matmuls, to measure them; the sizes are specialization constants, so no shader is
+        // rebuilt. A shape the shared memory doesn't hold is turned off as usual, and the next smaller tile runs
+        const auto cm1_override = [&](const char * name, std::vector<uint32_t> & wt) {
+            const char * env = getenv(name);
+            uint32_t bm = 0, bn = 0, wm = 0, wn = 0;
+            if (env == nullptr || sscanf(env, "%u,%u,%u,%u", &bm, &bn, &wm, &wn) != 4) {
+                return;
+            }
+            const uint32_t bs = wm > 0 && wn > 0 && itm > 0 && itn > 0 ? cm1_sg * (bm / wm) * (bn / wn) : 0;
+            if (bs == 0 || bm % wm != 0 || bn % wn != 0 || wm % itm != 0 || wn % itn != 0 || bn % 32 != 0 ||
+                bs > device->properties.limits.maxComputeWorkGroupInvocations) {
+                GGML_LOG_WARN("ggml_vulkan: %s=%s: not a tile shape for subgroups of %u and %ux%u matrices, ignored\n", name, env, cm1_sg, itm, itn);
+                return;
+            }
+            wt[0] = bs; wt[1] = bm; wt[2] = bn; wt[4] = wm; wt[5] = wn;
+            GGML_LOG_INFO("ggml_vulkan: %s: %u x %u, warp tiles %u x %u, %u threads\n", name, bm, bn, wm, wn, bs);
+        };
+        cm1_override("GGML_VK_CM1_INT_TILE_S", s_warptile_mmq_cm1_int);
+        cm1_override("GGML_VK_CM1_INT_TILE_M", m_warptile_mmq_cm1_int);
+        cm1_override("GGML_VK_CM1_INT_TILE_L", l_warptile_mmq_cm1_int);
+        cm1_override("GGML_VK_CM1_INT_K_TILE_S", s_warptile_mmq_cm1_int_k);
+        cm1_override("GGML_VK_CM1_INT_K_TILE_M", m_warptile_mmq_cm1_int_k);
+        cm1_override("GGML_VK_CM1_INT_K_TILE_L", l_warptile_mmq_cm1_int_k);
+
+        l_mmq_cm1_wg_denoms   = { l_warptile_mmq_cm1_int[1],   l_warptile_mmq_cm1_int[2],   1 };
+        m_mmq_cm1_wg_denoms   = { m_warptile_mmq_cm1_int[1],   m_warptile_mmq_cm1_int[2],   1 };
+        s_mmq_cm1_wg_denoms   = { s_warptile_mmq_cm1_int[1],   s_warptile_mmq_cm1_int[2],   1 };
         l_mmq_cm1_wg_denoms_k = { l_warptile_mmq_cm1_int_k[1], l_warptile_mmq_cm1_int_k[2], 1 };
         m_mmq_cm1_wg_denoms_k = { m_warptile_mmq_cm1_int_k[1], m_warptile_mmq_cm1_int_k[2], 1 };
         s_mmq_cm1_wg_denoms_k = { s_warptile_mmq_cm1_int_k[1], s_warptile_mmq_cm1_int_k[2], 1 };
@@ -2426,9 +2455,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         };
 
         std::vector<vk_tile_config> tc_mmq_cm1_int = {
-            {s_warptile_mmq_cm1_int, s_mmq_wg_denoms, s_align},
-            {m_warptile_mmq_cm1_int, m_mmq_wg_denoms, m_align},
-            {l_warptile_mmq_cm1_int, l_mmq_wg_denoms, l_align},
+            {s_warptile_mmq_cm1_int, s_mmq_cm1_wg_denoms, s_align},
+            {m_warptile_mmq_cm1_int, m_mmq_cm1_wg_denoms, m_align},
+            {l_warptile_mmq_cm1_int, l_mmq_cm1_wg_denoms, l_align},
         };
         std::vector<vk_tile_config> tc_mmq_cm1_int_k = {
             {s_warptile_mmq_cm1_int_k, s_mmq_cm1_wg_denoms_k, s_align},
