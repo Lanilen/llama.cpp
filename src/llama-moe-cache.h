@@ -102,6 +102,11 @@ public:
     void release();
     void restore();
 
+    // hot spare mode with resize, --moe-cache-jit and LLAMA_MOE_CACHE_JIT_SHARE=1: the jit slots hold resident experts
+    // too; before a batch of n_tokens tokens (and before restore), they go to the jit for a batch whose ubatches use it,
+    // and back to the resident set, empty, for the others
+    void prepare_batch(int64_t n_tokens);
+
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 

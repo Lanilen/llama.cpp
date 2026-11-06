@@ -2321,6 +2321,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 g_moe_resize.pending = false;
             }
         }
+        if (moe_cache) {
+            moe_cache->prepare_batch(balloc->get_n_tokens());
+        }
         const bool large = balloc->get_n_tokens() > resize_small_max;
         if (large != moe_resize_large) {
             synchronize();
