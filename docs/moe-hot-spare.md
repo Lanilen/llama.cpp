@@ -170,6 +170,15 @@ R9700 this fit kept the cache for prompts of up to 1024 tokens: follow-up turns 
 instead of 158 on Q6. On the RTX 4070 Ti (a 35B model with a 3000 MiB cache and a 9B draft, follow-ups of about
 350 tokens), it kept 1024 tokens instead of 128, and those prompts took 1.8–2.0 s instead of 3.2–3.7.
 
+**Larger batches that keep the cache anyway** (`LLAMA_MOE_RESIZE_SPLIT=N`). A batch of up to N tokens that is too large
+for the buffers that fit keeps the cache all the same and runs in ubatches of that size, instead of releasing it. Its
+experts then come from the cache, the jit and the CPU, not from a copy of every expert, and the restore after it goes.
+The MTP draft's context follows the same rule, so its buffers stay small too. On the R9700 with a 20900 MiB cache
+(batches of up to 1024 tokens fit), `LLAMA_MOE_RESIZE_SPLIT=4096` made prompts of 1.9k–2.3k tokens 14–69% faster on Q4
+(turn1 125 → 211 tok/s) and 23–76% faster on Q6 (97 → 172). Generation was as fast or faster, and a set of requests
+with agent turns took 14 s less on Q4 and 27 s less on Q6. Prompts of 13k tokens and more still release the cache, at
+the same speed as before. 8192 measured the same as 4096, since no request fell between the two.
+
 **The backends' own memory.** Backends keep memory of their own between graphs, sized by the largest graph so far and
 outside the scheduler's buffers: the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch
 grows them a lot (the sparse attention top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at
