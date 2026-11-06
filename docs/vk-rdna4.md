@@ -14,12 +14,19 @@ R9700). Other GPUs are unaffected: every change is behind a check for RDNA4.
 2. **Q4_K and Q5_K int8 matmuls (prompt processing).** The int8 cooperative-matrix matmuls for Q4_K and Q5_K are
    created on RDNA4 too. Upstream leaves them out there, so those types fell back to the f16 matmul.
    `GGML_VK_RDNA4_NO_INT_K=1` turns them off.
-3. **Switches for measuring** (no effect unless set):
+3. **MUL_MAT_ID's tile by the rows an expert gets.** The tile size follows the mean rows per expert (tokens × experts
+   used ÷ experts): small under 32, medium up to 64, and otherwise by the tokens as before. Upstream picks it by the
+   ubatch's tokens, so models with many small experts got the large tile in small batches.
+   `GGML_VK_MMID_TILE_BY_TOKENS=1` goes back to that.
+4. **Switches for measuring** (no effect unless set):
    - `GGML_VK_DISABLE_COOPMAT_INT=1`: no int8 cooperative matrices at all (the experts and Q6_K back on the f16 path);
    - `GGML_VK_FORCE_MMID_TILE=0|1|2`: always the small, medium or large tile for MUL_MAT_ID (without coopmat2 it picks
      its tile like a dense matmul).
    - `GGML_VK_FORCE_MM_TILE=0|1|2`: the same for MUL_MAT. On the R9700, in Flash-Next's small prompt batches (experts on
      the CPU), the default choice, the small tile, was the fastest; the medium and large ones were slower.
+   - `GGML_VK_CM1_INT_TILE_{S,M,L}=BM,BN,WM,WN` (and `GGML_VK_CM1_INT_K_TILE_*` for Q3_K/Q6_K): other shapes for the
+     int8 cooperative-matrix tiles: BM × BN per workgroup, WM × WN per subgroup. The sizes are specialization constants,
+     so no shader is rebuilt.
 
 ## Measured
 
@@ -49,8 +56,22 @@ In the change 2 rows, "upstream" is this branch with change 1 only.
 
 - **For scale, the int8 path upstream already uses** (for the other types) is worth 3318 against 3217 tok/s on Q4_K_XL
   prompts: `GGML_VK_DISABLE_COOPMAT_INT=1` turns it off.
-- **MUL_MAT_ID tiles.** The automatic choice was best or within noise at `-ub 512` and `-ub 2048`, for both quants, so
-  it stays. For example, Q4_K_XL at `-ub 2048`: auto 3368, small 3104, medium 3364, large 3273.
+- **MUL_MAT_ID tiles, Qwen3-Coder-30B** (128 experts, 8 used): the automatic choice was best or within noise at
+  `-ub 512` and `-ub 2048`, for both quants. For example, Q4_K_XL at `-ub 2048`: auto 3368, small 3104, medium 3364,
+  large 3273. At 512 tokens it has 32 rows an expert, so change 3 picks the same tile there.
+- **MUL_MAT_ID tiles by rows (change 3), Qwen3.8-Flash-Next's shapes** (512 experts, 10 used; `test-backend-ops perf`,
+  two runs each). At 512 tokens, about 10 rows an expert, the small tile instead of the large one:
+
+  | type, matrix | by tokens | by rows | |
+  |---|---|---|---|
+  | q4_K 640 × 2560 | 6.5 TFLOPS | 7.8 | +18.7% |
+  | q6_K 640 × 2560 | 5.5 | 6.2 | +13.2% |
+  | q5_1 2560 × 640 | 7.3 | 9.7 | +32.7% |
+  | q8_0 2560 × 640 | 6.2 | 7.8 | +24.3% |
+
+  At 2048 and 8192 tokens, and for Qwen3-30B's shapes, the two were the same within the noise. MUL_MAT_ID passes
+  1109/1109. For scale, ROCm runs these shapes 1.3–2.1× faster than Vulkan, and dense matmuls 1.45–1.8× faster (q6_K
+  the same).
 
 ## Building for RDNA4
 
