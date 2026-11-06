@@ -643,6 +643,8 @@ struct llama_moe_cache::impl {
     bool     jit_check = false; // LLAMA_MOE_CACHE_JIT_CHECK=1: read the uploads back and check the maps
     bool     jit_resident = false; // LLAMA_MOE_CACHE_JIT_MODE=resident: move resident experts to the jit slots instead, a test of the slots
     bool     jit_share = false; // LLAMA_MOE_CACHE_JIT_SHARE=1: the jit slots are resident slots too, see prepare_batch
+    int32_t  jit_tokens_per_slot = 0; // LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N: a layer uploads at most one expert per N tokens
+                                      // of the ubatch (at least 64), 0 = all its slots
     bool     jit_lent  = false; // the shared slots are the jit's, for the running batch
     size_t   n_lends   = 0;
     size_t   lend_waits = 0;    // uploads into the shared slots that a lend waited for
@@ -687,6 +689,7 @@ struct llama_moe_cache::impl {
             jit_check = getenv("LLAMA_MOE_CACHE_JIT_CHECK") && atoi(getenv("LLAMA_MOE_CACHE_JIT_CHECK")) != 0;
             jit_resident = getenv("LLAMA_MOE_CACHE_JIT_MODE") && std::string(getenv("LLAMA_MOE_CACHE_JIT_MODE")) == "resident";
             jit_share = getenv("LLAMA_MOE_CACHE_JIT_SHARE") && atoi(getenv("LLAMA_MOE_CACHE_JIT_SHARE")) != 0 && !jit_resident;
+            jit_tokens_per_slot = getenv("LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT") ? std::max(0, atoi(getenv("LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT"))) : 0;
         } else if (params.jit > 0) {
             LLAMA_LOG_WARN("%s: --moe-cache-jit needs --moe-cache-mode hot-spare, ignored\n", __func__);
         }
@@ -2545,12 +2548,19 @@ struct llama_moe_cache::impl {
                     jit_pick.push_back(e);
                 }
             }
-            if ((int32_t) jit_pick.size() > g.n_jit) {
+            // a small ubatch saves less CPU time per upload than a large one, so it may upload fewer (fn-split: 128 slots
+            // made prompts of 700-2300 tokens faster than 64, and prompts of 150-350 tokens slower)
+            int32_t cap = g.n_jit;
+            if (jit_tokens_per_slot > 0) {
+                const int32_t n_tok = (int32_t) (ids.size()/std::max<int32_t>(1, n_expert_used));
+                cap = std::min(g.n_jit, std::max(64, n_tok/jit_tokens_per_slot));
+            }
+            if ((int32_t) jit_pick.size() > cap) {
                 // the slots go to the experts with the most tokens
-                std::nth_element(jit_pick.begin(), jit_pick.begin() + g.n_jit, jit_pick.end(),
+                std::nth_element(jit_pick.begin(), jit_pick.begin() + cap, jit_pick.end(),
                     [&](int32_t a, int32_t b) { return jit_count[a] != jit_count[b] ? jit_count[a] > jit_count[b] : a < b; });
-                jit_st.capped += jit_pick.size() - g.n_jit;
-                jit_pick.resize(g.n_jit);
+                jit_st.capped += jit_pick.size() - cap;
+                jit_pick.resize(cap);
             }
             // in expert order, so a bank gets one upload
             std::sort(jit_pick.begin(), jit_pick.end());
