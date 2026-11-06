@@ -7528,10 +7528,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
+    // without coopmat2 the tile follows the rows an expert gets on average, not the ubatch's tokens: with many experts
+    // (Flash-Next's 512, 10 used: ~10 rows each at 512 tokens) the small tile was 18-33% faster on the R9700 than the
+    // large one the tokens picked (fn-mmid); GGML_VK_MMID_TILE_BY_TOKENS=1 picks by the tokens as before
+    static const bool mmid_tile_by_tokens = getenv("GGML_VK_MMID_TILE_BY_TOKENS") && atoi(getenv("GGML_VK_MMID_TILE_BY_TOKENS")) != 0;
+    uint32_t n_tile = nei1;
+    if (!ctx->device->coopmat2 && !mmid_tile_by_tokens) {
+        const uint64_t rows = (uint64_t) nei0 * nei1 / std::max<uint64_t>(1, n_as);
+        n_tile = rows < 32 ? 32 : rows <= 64 ? 64 : nei1;
+    }
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, n_tile, true));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n_tile, aligned, true);
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
