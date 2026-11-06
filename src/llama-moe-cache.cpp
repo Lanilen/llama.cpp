@@ -480,6 +480,9 @@ struct llama_moe_cache::impl {
         int32_t n_resident = 0;
         int32_t n_jit = 0; // --moe-cache-jit: slots after n_slots where a layer of a large ubatch uploads its experts just before it runs
         int32_t n_share = 0; // LLAMA_MOE_CACHE_JIT_SHARE: of those, the slots that hold resident experts while no batch uses the jit
+        std::vector<int32_t> lent;    // LLAMA_MOE_CACHE_JIT_SHARE: the slots lent to the jit for the running batch, see prepare_batch
+        std::vector<uint8_t> is_lent; // [n_slots + n_share]
+        int32_t n_refill = 0;         // lent slots given back empty: filling them is not one of the answer's capped swaps
     };
 
     // hot spare mode: an expert being uploaded in the background, it becomes resident when its ticket is done
@@ -645,9 +648,9 @@ struct llama_moe_cache::impl {
     bool     jit_share = false; // LLAMA_MOE_CACHE_JIT_SHARE=1: the jit slots are resident slots too, see prepare_batch
     int32_t  jit_tokens_per_slot = 0; // LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N: a layer uploads at most one expert per N tokens
                                       // of the ubatch (at least 64), 0 = all its slots
-    bool     jit_lent  = false; // the shared slots are the jit's, for the running batch
+    bool     jit_lent  = false; // slots are lent to the jit, for the running batch
     size_t   n_lends   = 0;
-    size_t   lend_waits = 0;    // uploads into the shared slots that a lend waited for
+    size_t   lent_slots = 0;    // slots lent, over all lends and groups
     int64_t  t_lend_us = 0;
     int64_t  n_ubatch = 0;  // ubatches computed (before_ubatch), the jit fills the maps once per ubatch and layer
     jit_stats jit_st;
@@ -929,6 +932,9 @@ struct llama_moe_cache::impl {
                 g.n_share = jit_share ? g.n_jit : 0;
                 g.key_of_slot.assign(g.n_slots + g.n_share, -1);
                 g.slot_pending.assign(g.n_slots + g.n_share, 0);
+                if (g.n_share > 0) {
+                    g.is_lent.assign(g.n_slots + g.n_share, 0);
+                }
                 n_tensors[g.id] += 2*g.layers.size();
             } else {
                 g.slru.init(model.layers.size(), n_expert, g.n_slots);
@@ -1275,7 +1281,14 @@ struct llama_moe_cache::impl {
             if (e < 0 || e >= (int32_t) l.slot_of.size() || l.slot_of[e] >= 0 || g.n_resident >= res_slots(g)) {
                 continue;
             }
-            const int32_t s = g.n_resident++;
+            int32_t s = g.n_resident;
+            while (s < res_slots(g) && (g.key_of_slot[s] >= 0 || lent_slot(g, s))) {
+                s++;
+            }
+            if (s >= res_slots(g)) {
+                continue;
+            }
+            g.n_resident++;
             g.key_of_slot[s] = il*(int32_t) l.slot_of.size() + e;
             set_resident(l, e, s);
             upload_expert(g, l, e, s, false);
@@ -1283,9 +1296,13 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // hot spare mode: the slots of group g that hold resident experts now, the shared jit slots unless they are lent
+    // hot spare mode: the slots of group g that hold resident experts, the shared jit slots too; a lent slot holds none
     int32_t res_slots(const group & g) const {
-        return g.n_slots + (jit_lent ? 0 : g.n_share);
+        return g.n_slots + g.n_share;
+    }
+
+    static bool lent_slot(const group & g, int32_t s) {
+        return !g.is_lent.empty() && g.is_lent[s];
     }
 
     // hot spare mode: make expert e of layer l resident at slot s, or not resident if s < 0
@@ -1633,7 +1650,7 @@ struct llama_moe_cache::impl {
                 }
             }
             for (int32_t s = 0; s < res_slots(g); ++s) {
-                if (g.slot_pending[s]) {
+                if (g.slot_pending[s] || lent_slot(g, s)) {
                     continue;
                 }
                 const int32_t key = g.key_of_slot[s];
@@ -1707,9 +1724,14 @@ struct llama_moe_cache::impl {
             }
             st.swaps++;
             st.bytes += expert_size;
-            // the shared jit slots come back empty after a batch that used the jit: filling them is not one of the
-            // answer's capped swaps, which the cache had without them
-            if (no_wait && full_left != SIZE_MAX && !(old_key < 0 && sw.slot >= g.n_slots)) {
+            // the slots lent to the jit come back empty after a batch that used it: filling them is not one of the answer's
+            // capped swaps, which the cache had without them
+            bool refill = false;
+            if (old_key < 0 && g.n_refill > 0) {
+                g.n_refill--;
+                refill = true;
+            }
+            if (no_wait && full_left != SIZE_MAX && !refill) {
                 full_left--;
             }
         }
@@ -1991,9 +2013,11 @@ struct llama_moe_cache::impl {
         released = true;
     }
 
-    // LLAMA_MOE_CACHE_JIT_SHARE: before a batch, the shared jit slots go to the jit if its ubatches can use it (more
-    // than max_batch tokens that stay on the hot spare), their experts leaving the resident set, and come back empty
-    // otherwise, for the next refresh to fill; with the cache released only the resident set changes
+    // LLAMA_MOE_CACHE_JIT_SHARE: before a batch whose ubatches can use the jit (more than max_batch tokens that stay on
+    // the hot spare), each group lends it the slots of its weakest residents (empty slots first, none being uploaded), as
+    // many as a layer of those ubatches uploads at most; their experts leave the resident set. They come back empty
+    // before the next batch that doesn't use the jit, for the refreshes to fill. With the cache released only the resident
+    // set changes
     void prepare_batch(int64_t n_tokens) {
         const bool lend = n_tokens > max_batch && hot_batch > max_batch;
         if (!jit_share || lend == jit_lent) {
@@ -2001,43 +2025,52 @@ struct llama_moe_cache::impl {
         }
         jit_lent = lend;
         if (!lend) {
+            for (group & g : groups) {
+                for (int32_t s : g.lent) {
+                    g.is_lent[s] = 0;
+                }
+                g.n_refill += (int32_t) g.lent.size();
+                g.lent.clear();
+            }
             return;
         }
         const int64_t t_start_us = ggml_time_us();
         join_installer();
-        if (!released) {
-            // an upload in flight into a shared slot lands first, its expert then leaves with the others
-            finish_submits();
-            for (size_t i = 0; i < pending_uploads.size(); ++i) {
-                const group & g = groups[pending_uploads[i].ig];
-                if (pending_uploads[i].slot < g.n_slots) {
-                    continue;
-                }
-                device & d = devices[g.id];
-                if (pending_uploads[i].ticket == 0) {
-                    submit_bg(d);
-                }
-                d.upload_bg_done(d.backend, pending_uploads[i].ticket, true);
-                lend_waits++;
-            }
-            activate_uploads();
-        }
+        const int64_t n_ub = std::min<int64_t>(n_tokens, hot_batch);
+        std::vector<std::pair<float, int32_t>> weak;
         for (group & g : groups) {
             if (g.n_share == 0) {
                 continue;
             }
             const int32_t n_expert = g.ref[0]->ne[2];
-            for (int32_t s = g.n_slots; s < g.n_slots + g.n_share; ++s) {
-                const int32_t key = g.key_of_slot[s];
-                if (key < 0) {
+            const int32_t n_lend = jit_tokens_per_slot > 0 ? std::min<int32_t>(g.n_share, std::max<int64_t>(64, n_ub/jit_tokens_per_slot)) : g.n_share;
+            weak.clear();
+            for (int32_t s = 0; s < res_slots(g); ++s) {
+                if (g.slot_pending[s] || g.is_lent[s]) {
                     continue;
                 }
-                if (!released) {
-                    set_resident(layers[key / n_expert], key % n_expert, -1);
-                }
-                g.key_of_slot[s] = -1;
-                g.n_resident--;
+                const int32_t key = g.key_of_slot[s];
+                const layer & lk = layers[std::max(key, 0) / n_expert];
+                weak.emplace_back(key < 0 ? -1.0f : (pred_valid ? lk.pred : lk.score)[key % n_expert], s);
             }
+            const size_t n = std::min<size_t>(n_lend, weak.size());
+            std::partial_sort(weak.begin(), weak.begin() + n, weak.end(), [](const auto & x, const auto & y) { return x.first < y.first; });
+            for (size_t i = 0; i < n; ++i) {
+                const int32_t s = weak[i].second;
+                const int32_t key = g.key_of_slot[s];
+                if (key >= 0) {
+                    if (!released) {
+                        set_resident(layers[key / n_expert], key % n_expert, -1);
+                    }
+                    g.key_of_slot[s] = -1;
+                    g.n_resident--;
+                }
+                g.is_lent[s] = 1;
+                g.lent.push_back(s);
+                lent_slots++;
+            }
+            // in slot order, so the uploads of neighbouring slots are recorded in order
+            std::sort(g.lent.begin(), g.lent.end());
         }
         if (!released) {
             flush_maps();
@@ -2318,7 +2351,7 @@ struct llama_moe_cache::impl {
                 }
             }
             const int32_t n_res = res_slots(g);
-            const size_t n = std::min<size_t>(n_res, all.size());
+            const size_t n = std::min<size_t>(n_res - g.lent.size(), all.size());
             std::nth_element(all.begin(), all.begin() + n, all.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
             std::unordered_map<int32_t, bool> want; // key -> already in a slot
             for (size_t i = 0; i < n; ++i) {
@@ -2337,7 +2370,7 @@ struct llama_moe_cache::impl {
             g.n_resident = 0;
             for (int32_t s = 0; s < n_res; ++s) {
                 int32_t & key = g.key_of_slot[s];
-                while (key < 0 && it != want.end()) {
+                while (key < 0 && !lent_slot(g, s) && it != want.end()) {
                     if (!it->second) {
                         key = it->first;
                     }
@@ -2555,6 +2588,10 @@ struct llama_moe_cache::impl {
                 const int32_t n_tok = (int32_t) (ids.size()/std::max<int32_t>(1, n_expert_used));
                 cap = std::min(g.n_jit, std::max(64, n_tok/jit_tokens_per_slot));
             }
+            if (jit_share) {
+                // the slots lent for this batch (none: the batch wasn't prepared, so no slot is free)
+                cap = std::min<int32_t>(cap, (int32_t) g.lent.size());
+            }
             if ((int32_t) jit_pick.size() > cap) {
                 // the slots go to the experts with the most tokens
                 std::nth_element(jit_pick.begin(), jit_pick.begin() + cap, jit_pick.end(),
@@ -2597,12 +2634,26 @@ struct llama_moe_cache::impl {
                 staging = d.jit_staging;
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const size_t expert_size = l.experts[ip]->nb[2];
-                    if (bg && !d.upload_bg(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size)) {
-                        GGML_ASSERT(ip == 0 && "background upload failed after the first tensor of the jit experts");
-                        bg = false;
-                    }
-                    if (!bg) {
-                        ggml_backend_tensor_set_async(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size);
+                    if (jit_share) {
+                        // one upload per lent slot, wherever it is
+                        for (size_t j = 0; j < n; ++j) {
+                            const size_t off = (size_t) g.lent[j]*expert_size;
+                            if (bg && !d.upload_bg(backend, g.banks[ip], staging + j*expert_size, off, expert_size)) {
+                                GGML_ASSERT(ip == 0 && j == 0 && "background upload failed after the first jit expert");
+                                bg = false;
+                            }
+                            if (!bg) {
+                                ggml_backend_tensor_set_async(backend, g.banks[ip], staging + j*expert_size, off, expert_size);
+                            }
+                        }
+                    } else {
+                        if (bg && !d.upload_bg(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size)) {
+                            GGML_ASSERT(ip == 0 && "background upload failed after the first tensor of the jit experts");
+                            bg = false;
+                        }
+                        if (!bg) {
+                            ggml_backend_tensor_set_async(backend, g.banks[ip], staging, (size_t) g.n_slots*expert_size, n*expert_size);
+                        }
                     }
                     staging += n*expert_size;
                     jit_st.bytes += n*expert_size;
@@ -2621,7 +2672,7 @@ struct llama_moe_cache::impl {
                 for (size_t j = 0; j < n; ++j) {
                     const int32_t e = jit_pick[j];
                     jmiss[e] = -1;
-                    jslot[e] = g.n_slots + (int32_t) j;
+                    jslot[e] = jit_share ? g.lent[j] : g.n_slots + (int32_t) j;
                     jhit[e]  = e;
                     jit_st.moved += jit_count[e];
                 }
@@ -2633,13 +2684,19 @@ struct llama_moe_cache::impl {
                         const ggml_tensor * w = l.experts[ip];
                         const size_t expert_size = w->nb[2];
                         back.resize(n*expert_size);
-                        ggml_backend_tensor_get(g.banks[ip], back.data(), (size_t) g.n_slots*expert_size, n*expert_size);
+                        if (jit_share) {
+                            for (size_t j = 0; j < n; ++j) {
+                                ggml_backend_tensor_get(g.banks[ip], back.data() + j*expert_size, (size_t) g.lent[j]*expert_size, expert_size);
+                            }
+                        } else {
+                            ggml_backend_tensor_get(g.banks[ip], back.data(), (size_t) g.n_slots*expert_size, n*expert_size);
+                        }
                         for (size_t j = 0; j < n; ++j) {
                             jit_st.checked++;
                             if (memcmp(back.data() + j*expert_size, (const uint8_t *) w->data + jit_pick[j]*expert_size, expert_size) != 0) {
                                 if (jit_st.bad_data++ < 8) {
                                     LLAMA_LOG_WARN("%s: layer %d, expert %d, %s: slot %d differs from the host expert\n",
-                                        __func__, il, jit_pick[j], ggml_get_name(w), g.n_slots + (int32_t) j);
+                                        __func__, il, jit_pick[j], ggml_get_name(w), jit_share ? g.lent[j] : g.n_slots + (int32_t) j);
                                 }
                             }
                         }
@@ -2796,7 +2853,8 @@ struct llama_moe_cache::impl {
                 jit_st.toggle_off, jit_st.bg, std::any_of(layers.begin(), layers.end(), [](const layer & l) { return l.jit_dev_maps != nullptr; }) ? ", maps from pinned memory" : "");
             if (jit_share) {
                 LLAMA_LOG_INFO("llama_moe_cache: hot spare, ubatch  > 32: --moe-cache-jit slots shared with the resident set: lent %zu times, "
-                    "%.3f ms each, %zu uploads waited for\n", n_lends, n_lends > 0 ? t_lend_us/1000.0/n_lends : 0.0, lend_waits);
+                    "%.3f ms each, %.1f slots a group each\n", n_lends, n_lends > 0 ? t_lend_us/1000.0/n_lends : 0.0,
+                    n_lends > 0 ? (double) lent_slots/n_lends/std::max<size_t>(1, std::count_if(groups.begin(), groups.end(), [](const group & g) { return g.n_share > 0; })) : 0.0);
             }
         }
         if (resize) {
