@@ -24,6 +24,7 @@ import glob
 import http.client
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -1057,6 +1058,7 @@ class Tuner:
                     self.visited.setdefault(c.name(), c)
                 incumbent, added = cur, []
                 cur = self.decide(stage, cands, cur, numbered)
+                end = cur  # the winner of the stage's own list
                 for _ in range(o.extend):
                     ext = [c for c in self.extensions(stage, cands, cur) if c not in cands]
                     if not ext:
@@ -1076,6 +1078,7 @@ class Tuner:
                     self.decisions.pop()
                     cur = self.decide(stage, cands, incumbent, numbered)
                     self.decisions[-1]["extended"] = list(added)
+                    cur = self.hold_end(stage, end, cur, numbered)
                 if rnd and self.decisions and self.decisions[-1]["stage"] == stage:
                     self.decisions[-1]["stage"] = f"{stage} ({rnd + 1})"
                 changed = [f.name for f in fields(Config) if any(getattr(c, f.name) != getattr(incumbent, f.name) for c in cands)]
@@ -1131,7 +1134,7 @@ class Tuner:
             n = len(self.values(c, pids))
             row = dict(passes=n)
             if n:
-                row.update({k: round(self.mean(c, pids, k), 3) for k in ("all", "short", "long", "agent", "agent_turn")})
+                row.update({k: round(self.mean(c, pids, k), 3) for k in ("balance", "all", "short", "long", "agent", "agent_turn")})
             if n == len(pids):
                 done.append(c)
             elif any((c.name(), p) in self.failed for p in pids):
@@ -1169,6 +1172,25 @@ class Tuner:
             return best
         self.decisions.append(d)
         return cur
+
+    def hold_end(self, stage, end, new, pids):
+        """A value past the end of a stage's list replaces the list's winner only if it beats it by the threshold too: a
+        winner that ties it is kept, as on a plateau (a longer spin) any value would come out on top by chance, and the
+        stages after it would all run again for nothing."""
+        d = self.decisions[-1]
+        if new == end or end.name() == d["incumbent"] or d["status"] != "decided":
+            return new  # beating the incumbent was already the test
+        metric = d["metric"]
+        sigma = self.noise(metric)
+        edge = self.mean(new, pids, metric) - self.mean(end, pids, metric)
+        limit = self.threshold(sigma, len(pids), len(pids), self.mean(end, pids, metric))
+        if edge > limit:
+            return new
+        base = self.mean(self.visited.get(d["incumbent"]) or end, pids, metric)
+        d.update(winner=end.name(), best=end.name(), gain=round(self.mean(end, pids, metric) - base, 3),
+                 held=dict(name=new.name(), edge=round(edge, 3), threshold=round(limit, 3)))
+        d.pop("tie_on_metric", None)
+        return end
 
     def decide_confirm(self, final, pids):
         a, b = self.values(self.base, pids), self.values(final, pids)
@@ -1219,8 +1241,8 @@ class Tuner:
             return None
         ms = [metrics(r, self.ref_lengths()) for r in rs]
         avg = lambda k: (lambda v: sum(v) / len(v) if v else None)([m[k] for m in ms if m.get(k) is not None])
-        row = dict(name=c.name(), config=asdict(c), passes=len(rs), all_passes=[round(m["all"], 3) for m in ms])
-        for k in ("all", "short", "long", "agent", "agent_turn", "agent_prompt", "hits", "mib_batch_token", "mib_gen", "accept", "fill_prompt", "update_ms", "restore_ms",
+        row = dict(name=c.name(), config=asdict(c), passes=len(rs), all_passes=[round(m[self.o.objective], 3) for m in ms])
+        for k in ("balance", "all", "short", "long", "agent", "agent_turn", "agent_prompt", "hits", "mib_batch_token", "mib_gen", "accept", "fill_prompt", "update_ms", "restore_ms",
                   "drafted", "got", "rejected", "ms_pass"):
             v = avg(k)
             row[k] = round(v, 3) if v is not None else None
@@ -1251,18 +1273,19 @@ class Tuner:
         L.append(f"model:   {os.path.basename(o.model)}, {info.get('arch')}, {info.get('n_layer')} layers, {info.get('n_expert')} experts, {info.get('n_expert_used')} used, {info.get('file_type')}")
         L.append(f"run:     {len(self.runs)} complete runs, {o.passes} passes per configuration, objective {o.objective}, scale {o.scale:g}")
         L.append("")
-        L.append("tok/s of generation, weighted by tokens: all = every request, short = answers after a large prompt, long = long answers to short prompts,")
+        L.append("tok/s of generation: bal = the balance of short, long and agent, each counting the same (their geometric mean); the passes are of the objective.")
+        L.append("Weighted by tokens: all = every request, short = answers after a large prompt, long = long answers to short prompts,")
         L.append("agent = an agent's turns (some hundred new tokens of prompt each, then a short answer); turn = the agent's answer tokens per second of its")
         L.append("whole turns, prompts included, each answer timed at its length in the warm-up; a.pp = the prompt tok/s of its turns.")
         L.append("hits and MiB/batch count every token of a small batch, rejected drafts and short prompts too; MiB/gen is the uploads per generated token.")
         L.append("answers: requests whose answer differs between the passes / from the warm-up (speed follows the text, near ties can differ at temperature 0).")
         L.append("")
         w = max([len(r["name"]) for r in rows] + [24])
-        L.append(f"{'config':{w}s} {'n':>1s} {'hits':>6s} {'MiB/batch':>9s} {'MiB/gen':>7s} {'all':>6s} {'(passes)':17s} {'short':>6s} {'long':>6s} {'agent':>6s} {'turn':>6s} {'a.pp':>6s} {'fill t/s':>8s} {'answers':>7s}")
+        L.append(f"{'config':{w}s} {'n':>1s} {'hits':>6s} {'MiB/batch':>9s} {'MiB/gen':>7s} {'bal':>6s} {'all':>6s} {'(passes)':17s} {'short':>6s} {'long':>6s} {'agent':>6s} {'turn':>6s} {'a.pp':>6s} {'fill t/s':>8s} {'answers':>7s}")
         for r in rows:
             passes = " ".join(f"{x:.2f}" for x in r["all_passes"])
             base_d = "-" if r["base_hash_diffs"] is None else r["base_hash_diffs"]
-            L.append(f"{r['name']:{w}s} {r['passes']:1d} {fmt_num(r['hits'], 5, 1)}% {fmt_num(r['mib_batch_token'], 9, 2)} {fmt_num(r['mib_gen'], 7, 2)} {fmt_num(r['all'], 6, 2)} ({passes:15s}) "
+            L.append(f"{r['name']:{w}s} {r['passes']:1d} {fmt_num(r['hits'], 5, 1)}% {fmt_num(r['mib_batch_token'], 9, 2)} {fmt_num(r['mib_gen'], 7, 2)} {fmt_num(r['balance'], 6, 2)} {fmt_num(r['all'], 6, 2)} ({passes:15s}) "
                      f"{fmt_num(r['short'], 6, 2)} {fmt_num(r['long'], 6, 2)} {fmt_num(r['agent'], 6, 2)} {fmt_num(r['agent_turn'], 6, 2)} {fmt_num(r['agent_prompt'], 6, 1)} "
                      f"{fmt_num(r['fill_prompt'], 8, 1)} {r['pass_hash_diffs']}/{base_d}".rstrip())
         if self.draft_on and any(r["drafted"] for r in rows):
@@ -1272,10 +1295,10 @@ class Tuner:
                 last = self.runs.get((r["name"], numbered[0]))
                 dp = (last or {}).get("log", {}).get("draft_passes") or {}
                 L.append(f"{r['name']:{w}s} {fmt_num(r['accept'], 6, 3)} {fmt_num(r['drafted'], 7, 2)} {fmt_num(r['got'], 5, 2)} {fmt_num(r['rejected'], 8, 3)} {fmt_num(r['ms_pass'], 6, 1)}  " + " ".join(f"{x:.2f}" for x in dp.get("stands_by_position", [])))
-        sig = {k: self.noise(k) for k in ("all", "short", "long", "agent", "agent_turn")}
+        sig = {k: self.noise(k) for k in ("balance", "all", "short", "long", "agent", "agent_turn")}
         if sig["all"] is not None:
             L.append("")
-            L.append(f"noise: the standard deviation of one run is {sig['all']:.2f} tok/s for all, {sig['short']:.2f} for short, {sig['long']:.2f} for long, "
+            L.append(f"noise: the standard deviation of one run is {sig['balance']:.2f} tok/s for bal, {sig['all']:.2f} for all, {sig['short']:.2f} for short, {sig['long']:.2f} for long, "
                      f"{sig['agent']:.2f} for agent, {sig['agent_turn']:.2f} for turn, pooled over {len(rows)} configurations")
         L.append("")
         L.append(f"stages (judged by {o.objective}, unless they say otherwise):")
@@ -1295,6 +1318,9 @@ class Tuner:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: the fastest{by}")
                 if d.get("extended"):
                     L.append(f"              its list went on past the end: {', '.join(change(d['incumbent'], n).split(' -> ')[-1] for n in d['extended'])}")
+                if d.get("held"):
+                    h = d["held"]
+                    L.append(f"              {change(d['winner'], h['name'])} was faster by {h['edge']:+.2f}, within the {h['threshold']:.2f} it needed over the end of the list")
                 for name, t in d["tried"].items():
                     if t.get("failed"):
                         L.append(f"              {name} failed: {t['failed']}")
@@ -1418,7 +1444,12 @@ def metrics(rec, ref=None):
     n_ref = {r["label"]: ref.get(r["label"]) or r["predicted_n"] for r in agent}
     turn_ms = sum(r["prompt_ms"] + r["predicted_ms"] * n_ref[r["label"]] / max(r["predicted_n"], 1) for r in agent)
     agent_pp = sum(r["prompt_ms"] for r in agent)
-    return dict(all=speed(("short", "long", "agent")), short=speed(("short",)), long=speed(("long",)), agent=speed(("agent",)),
+    kinds = [speed((k,)) for k in ("short", "long", "agent")]
+    kinds = [v for v in kinds if v > 0]
+    # each kind of request counts the same, whatever its share of the tokens (long answers have most of them); a geometric
+    # mean, so a percent gained in one kind makes up for a percent lost in another
+    balance = math.exp(sum(math.log(v) for v in kinds) / len(kinds)) if kinds else 0.0
+    return dict(all=speed(("short", "long", "agent")), balance=balance, short=speed(("short",)), long=speed(("long",)), agent=speed(("agent",)),
                 agent_turn=sum(n_ref.values()) * 1000.0 / turn_ms if turn_ms > 0 else 0.0,
                 agent_prompt=sum(r["prompt_n"] for r in agent) * 1000.0 / agent_pp if agent_pp > 0 else None, hits=st.get("hits"), mib_batch_token=st.get("mib_batch_token"),
                 mib_gen=st.get("small_mib", 0.0) / max(n_gen, 1), accept=sum(r["draft_n_accepted"] for r in reqs) / drafted if drafted else None,
@@ -1460,8 +1491,9 @@ def parse_args(argv):
     ap.add_argument("--passes", type=int, default=2, help="passes per configuration, at least 2 (default: %(default)s)")
     ap.add_argument("--rounds", type=int, default=1, help="times through the stages: a second one revisits the early choices with the later ones in place (default: %(default)s)")
     ap.add_argument("--stages", type=list_of(str), default=DEFAULT_STAGES, help=f"the stages and their order (default: {','.join(DEFAULT_STAGES)}; also gate)")
-    ap.add_argument("--objective", choices=["all", "short", "long", "agent", "agent_turn"], default="all",
-                    help="the speed to optimize: all requests, answers after large prompts, long answers, an agent's answers, or an agent's whole turns; "
+    ap.add_argument("--objective", choices=["balance", "all", "short", "long", "agent", "agent_turn"], default="balance",
+                    help="the speed to optimize: the balance of the three kinds of request (each counts the same), all requests by their tokens, "
+                         "answers after large prompts, long answers, an agent's answers, or an agent's whole turns; "
                          "the jit stage always goes by agent_turn (default: %(default)s)")
     ap.add_argument("--budgets", type=list_of(float), default=[5.0, 20.0], help="--moe-cache-budget values to try, next to the current one (default: 5,20; the search starts at 10)")
     ap.add_argument("--refills", type=list_of(int), default=[0, 64, 128], help="--moe-cache-refill values to try (default: 0,64,128)")
