@@ -7557,12 +7557,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    // without coopmat2 the tile follows the rows an expert gets on average, not the ubatch's tokens: with many experts
-    // (Flash-Next's 512, 10 used: ~10 rows each at 512 tokens) the small tile was 18-33% faster on the R9700 than the
-    // large one the tokens picked (fn-mmid); GGML_VK_MMID_TILE_BY_TOKENS=1 picks by the tokens as before
+    // on RDNA4 the tile follows the rows an expert gets on average, not the ubatch's tokens: with many experts
+    // (Flash-Next's 512, 10 used: ~10 rows each at 512 tokens) the small tile was 13-33% faster on the R9700 than the
+    // large one the tokens picked, and the same elsewhere (fn-mmid2); GGML_VK_MMID_TILE_BY_TOKENS=1 picks by the tokens
     static const bool mmid_tile_by_tokens = getenv("GGML_VK_MMID_TILE_BY_TOKENS") && atoi(getenv("GGML_VK_MMID_TILE_BY_TOKENS")) != 0;
     uint32_t n_tile = nei1;
-    if (!ctx->device->coopmat2 && !mmid_tile_by_tokens) {
+    if (ctx->device->architecture == AMD_RDNA4 && !ctx->device->coopmat2 && !mmid_tile_by_tokens) {
         const uint64_t rows = (uint64_t) nei0 * nei1 / std::max<uint64_t>(1, n_as);
         n_tile = rows < 32 ? 32 : rows <= 64 ? 64 : nei1;
     }
