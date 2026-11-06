@@ -12883,6 +12883,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // the same experts in a prompt's ubatch on the GPU: all 512, 10 used a token, so about 40 rows an expert at 2048
+    // tokens (Qwen3-30B's 128 x 8 have 128)
+    for (int bs : {512, 2048, 8192}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
