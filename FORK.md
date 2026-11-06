@@ -256,8 +256,9 @@ python3 tools/moe-trace/moe-cache-tune.py --server build-vk/bin/llama-server -m 
 - It starts from llama.cpp's defaults, with your cache size and placement. It changes one setting per stage and carries
   the best one forward. A setting wins only if its gain beats the noise measured between the passes.
 - The values it tries are spaced around what suited the 1920X + R9700, but they don't have to suit your machine: when a
-  stage's best value is at an end of its list, the stage goes on past it, up to two more values each way. The answer
-  caps are shares of your cache's slots, and the thread counts follow your cores, performance cores included.
+  stage's best value is at an end of its list, the stage goes on past it, up to two more values each way. A value past
+  the end has to beat the end by the noise too, so a plateau's chance winner doesn't send the search down another path.
+  The answer caps are shares of your cache's slots, and the thread counts follow your cores, performance cores included.
 - A last stage runs the result against the starting point again, and the starting point stays if the gain doesn't hold.
 - It needs Python 3.8 and nothing else. Stopped, it continues where it was, and it fits the stages to `--hours`.
 - The results file has the hardware and the timings, but no prompts and no answers.
@@ -286,9 +287,12 @@ It doesn't touch your placement (`-ngl`, `-ncmoe`, `-ub`, devices) or anything t
 power profile ([Setups](#setups)). A `gate` stage for gated longer drafts is there too, but it's left out by default:
 gates lose to the graph rebuild of each new verify length.
 
-**The pick is the best overall balance.** The stages and the final check go by generation speed over the whole mix of
-requests. The exception is `jit`, which goes by the agent's whole turns, prompts included, since that's where its
-uploads pay; between values that tie there, generation decides. If you mostly do one kind of work, an agent's loop for
+**The pick is the best overall balance.** The stages and the final check go by the balance of the three kinds of
+request: answers after a large prompt, long answers and agent turns each count the same (their geometric mean). Counting
+every request by its tokens instead would let long answers, which have most of the tokens, outvote the rest: on the
+1920X + R9700 a refill of 64 with an answer cap of 250 gained 1.6% that way, with long answers 5% faster and agent turns
+3.5% slower. The exception is `jit`, which goes by the agent's whole turns, prompts included, since that's where its
+uploads pay; between values that tie there, the balance decides. If you mostly do one kind of work, an agent's loop for
 example, its best settings can differ from the balance. The summary has every configuration's speed for each kind of
 request (answers after a large prompt, long answers, agent turns, whole agent turns, agent prompts), so the tests to
 choose from are all in hand; `--objective` searches for one of them instead.
@@ -322,6 +326,11 @@ as for Q4. It differs in three places:
 - **An answer cap of 1000:** +0.74 tok/s. 500 was faster in agent turns (35.9 against 33.9) and slower in long answers.
 - **`--moe-cache-jit 16`:** 4, 8 and 16 give the same whole agent turns (+5% over off), and 16 costs the least
   generation: 32.84 tok/s, against 32.42 for 4 and 33.65 without. Q6's experts are larger, so each upload costs more.
+
+A second round from Q4's pick (`--rounds 2`, every stage again with every value it tried, the old starting values
+included) kept all of it: without the spin, the chunks or the submit size, generation fell by 1.95, 1.41 and 1.24
+tok/s, so they weren't artifacts of the default start. The values past the ends of the lists lost or tied: 4 drafts,
+400M submits, budget 40, an answer cap of 125, a refill of 32, `--moe-cache-jit 2`, a spin of 480M.
 
 The guide has the method in full, the options and the output:
 [tools/moe-trace/README.md](tools/moe-trace/README.md#tuning-a-machine).
@@ -439,9 +448,8 @@ Measured on the R9700 machine. These either didn't help or cost more than they g
   in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N).
 - **One cumulative benchmark:** the numbers above come from different request sets over a month. They'll be redone as
   one ladder, each step added to the last, on the same requests.
-- **The lists past their ends on the 1920X + R9700:** both searches ran before the stages went past the ends of their
-  lists, and some picks are at an end: 3 drafts and the 100M submit size for both quants, and `--moe-cache-jit 16` for
-  Q6. The newer script would go on to 4 and 5 drafts, 400M and 1600M, and 32 and 64.
+- **UD-Q6_K_XL by the balance, in two rounds:** its search went by every request's tokens. Replayed by the balance, its
+  path changes at the refill, and its second round ran out of time.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
