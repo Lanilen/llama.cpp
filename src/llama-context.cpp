@@ -3267,6 +3267,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // LLAMA_OFFLOAD_COPY_STATS=1: the time spent here and the bytes uploaded, printed at exit (a backend whose uploads
+    // from unpinned memory are synchronous spends the whole copy here)
+    static const bool copy_stats = getenv("LLAMA_OFFLOAD_COPY_STATS") && atoi(getenv("LLAMA_OFFLOAD_COPY_STATS")) != 0;
+    struct offload_copy_stats {
+        int64_t us = 0;
+        size_t  bytes = 0, calls = 0, tensors = 0;
+        ~offload_copy_stats() {
+            if (tensors > 0) {
+                LLAMA_LOG_INFO("%s: offloaded experts: %zu tensors, %zu uploads, %.2f GiB in %.2f s (%.2f GiB/s while copying)\n", __func__,
+                    tensors, calls, bytes/1073741824.0, us/1e6, us > 0 ? bytes/1073741824.0/(us/1e6) : 0.0);
+            }
+        }
+    };
+    static offload_copy_stats cst;
+    const int64_t t_copy_start_us = copy_stats ? ggml_time_us() : 0;
+    if (copy_stats) {
+        cst.tensors++;
+    }
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3288,6 +3307,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
             if (next < e) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                cst.bytes += copy_stats ? (e - next)*expert_size : 0;
+                cst.calls += copy_stats;
             }
             e   += n;
             next = e;
@@ -3299,9 +3320,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            cst.bytes += copy_stats ? size : 0;
+            cst.calls += copy_stats;
         }
 
         first = last + 1;
+    }
+    if (copy_stats) {
+        cst.us += ggml_time_us() - t_copy_start_us;
     }
 
     return true;
