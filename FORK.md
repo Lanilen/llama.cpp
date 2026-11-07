@@ -344,8 +344,8 @@ Both kept 3 drafts (4 slower), 20900 MiB, 4 copy threads and `-t 12`. Most of th
 by step. The search did better in three places:
 - **3 drafts, not 2:** 43.07 against 42.00 tok/s on Q4. With the CPU's experts faster, a third draft is cheap: a pass
   yields 2.92 tokens in 67 ms, against 2.44 in 59 ms.
-- **A small answer cap:** an answer's start that swaps less leaves the cache to the predictor's rebalances; on Q6, 125
-  and 250 beat 500 and 1000 by 0.4–0.5 tok/s, and 62 was slower.
+- **A small answer cap:** on Q6, 125 and 250 beat 500 and 1000 by 0.4–0.5 tok/s, and 62 was slower; on Q4, 250 and
+  500 tied.
 - **`--moe-cache-jit 8`, not off:** with the shared slots it costs generation little (Q4: 42.71 against 43.07 tok/s
   off), and the prompts gain a lot. Q4's agent prompts went from 334 to 410 tok/s and its fills from 282 to 453.
 
