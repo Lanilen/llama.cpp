@@ -654,7 +654,15 @@ struct llama_moe_cache::impl {
     int64_t  t_lend_us = 0;
     int64_t  n_ubatch = 0;  // ubatches computed (before_ubatch), the jit fills the maps once per ubatch and layer
     jit_stats jit_st;
+    static inline const bool offload_check = getenv("LLAMA_OFFLOAD_FAST_CHECK") && atoi(getenv("LLAMA_OFFLOAD_FAST_CHECK")) != 0;
+    struct offload_part {
+        ggml_tensor * dst;
+        const uint8_t * src;
+        size_t offset, n;
+    };
+    std::vector<offload_part> offload_parts;
     struct offload_stats {
+        size_t  checked = 0, bad = 0;
         size_t  bytes = 0, uploads = 0, finishes = 0;
         int64_t t_wait_us = 0; // waiting for a half's uploads before reusing it
         int64_t t_copy_us = 0; // the copies to the staging memory at the end of a tensor
@@ -2787,6 +2795,9 @@ struct llama_moe_cache::impl {
             }
             d.staging_used += GGML_PAD(n, 64);
             d.bg_recorded = true;
+            if (offload_check) {
+                offload_parts.push_back({ dst, src, offset, n });
+            }
             offload_st.bytes += n;
             offload_st.uploads++;
             src += n; offset += n; size -= n;
@@ -2805,6 +2816,20 @@ struct llama_moe_cache::impl {
         offload_st.t_copy_us += ggml_time_us() - t0_us;
         d.upload_bg_require(backend, d.half_ticket[d.half]);
         offload_st.finishes++;
+        if (offload_check) {
+            // LLAMA_OFFLOAD_FAST_CHECK=1: wait for the uploads and read every part back
+            d.upload_bg_done(d.backend, d.half_ticket[d.half], true);
+            std::vector<uint8_t> back;
+            for (const offload_part & p : offload_parts) {
+                back.resize(p.n);
+                ggml_backend_tensor_get(p.dst, back.data(), p.offset, p.n);
+                offload_st.checked++;
+                if (memcmp(back.data(), p.src, p.n) != 0 && offload_st.bad++ < 8) {
+                    LLAMA_LOG_WARN("%s: %s: %zu bytes at %zu differ from the host experts\n", __func__, ggml_get_name(p.dst), p.n, p.offset);
+                }
+            }
+            offload_parts.clear();
+        }
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -2886,6 +2911,9 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST: %.2f GiB of host experts in %zu uploads for %zu tensors; %.2f s waiting for a half's "
                 "uploads, %.2f s copying at the end of a tensor\n", offload_st.bytes/1073741824.0, offload_st.uploads, offload_st.finishes,
                 offload_st.t_wait_us/1e6, offload_st.t_copy_us/1e6);
+            if (offload_check) {
+                LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST_CHECK: %zu parts read back, %zu differ\n", offload_st.checked, offload_st.bad);
+            }
         }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
