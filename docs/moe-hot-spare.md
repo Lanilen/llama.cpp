@@ -200,8 +200,8 @@ presets, two passes each):
 
 The answers after them generated as fast. `LLAMA_OFFLOAD_FAST_CHECK=1` reads every part back after its upload and
 compares it with the host weights: all 29,104 parts of a run were the same. Two of seven answers came out with other
-text than today's. They were the same with the check on, which changes all the timings, so they come from the cache's
-refills, not from the copies.
+text than today's, the same in every run with it. They were also the same with the check on, which waits for every
+upload, so they don't come from the copied data.
 
 **The backends' own memory.** Backends keep memory of their own between graphs, sized by the largest graph so far and
 outside the scheduler's buffers: the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch
