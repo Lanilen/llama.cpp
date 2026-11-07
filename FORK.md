@@ -234,13 +234,16 @@ tokens.
 Kernel tuning for the R9700, behind checks for RDNA4:
 - Q4_K/Q5_K matvecs without MMVQ;
 - the Q4_K/Q5_K int8 matmuls that upstream leaves out on RDNA4;
-- MUL_MAT_ID's tile chosen by the rows an expert gets, not the ubatch's tokens.
+- MUL_MAT_ID's tile chosen by the rows an expert gets, not the ubatch's tokens;
+- int8 tile shapes from a sweep: a medium 128 × 64, and a large tile for MUL_MAT_ID, which upstream doesn't give it on AMD.
 
 It passes the Vulkan matrix tests.
 
 **Measured:**
 - Qwen3-Coder-30B-A3B UD-Q4_K_XL on the GPU: generation 175 → 184–186 tok/s, prompts 3318 → 3379 tok/s.
 - Flash-Next's expert matmuls at 512 tokens (512 experts, about 10 rows each): 13–33% faster with the tile by rows.
+- The tile shapes: dense matmuls of 48 tokens 62–64% faster, Flash-Next's expert matmuls 9% faster at 2048 tokens and
+  up to 16% at 8192.
 
 ### Tools
 
