@@ -203,6 +203,10 @@ compares it with the host weights: all 29,104 parts of a run were the same. Two 
 text than today's, the same in every run with it. They were also the same with the check on, which waits for every
 upload, so they don't come from the copied data.
 
+With the faster copies, releasing the cache pays off sooner, and the split's best limit moves down. On the R9700,
+kept 2.3k-token prompts read at 249-251 tok/s against 204 released, and 3.6k-token prompts at 256 against 298 released.
+`LLAMA_MOE_RESIZE_SPLIT=3072` made a run of prompts of 1.3k-3.6k tokens 4% shorter on Q4 and 5% on Q6 than 4096.
+
 **The backends' own memory.** Backends keep memory of their own between graphs, sized by the largest graph so far and
 outside the scheduler's buffers: the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch
 grows them a lot (the sparse attention top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at
