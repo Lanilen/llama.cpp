@@ -3286,6 +3286,18 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         cst.tensors++;
     }
 
+    // LLAMA_OFFLOAD_FAST=1: through the MoE cache's staging memory and background uploads when it has them for this
+    // backend, else the backend's own copy (synchronous from memory that isn't pinned, as the weights are)
+    bool fast = lctx->moe_cache != nullptr;
+    bool any_fast = false;
+    auto upload = [&](const uint8_t * data, size_t off, size_t n) {
+        fast = fast && lctx->moe_cache->offload_copy(backend, dst, data, off, n);
+        any_fast = any_fast || fast;
+        if (!fast) {
+            ggml_backend_tensor_set_async(backend, dst, data, off, n);
+        }
+    };
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3306,7 +3318,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                upload((const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
                 cst.bytes += copy_stats ? (e - next)*expert_size : 0;
                 cst.calls += copy_stats;
             }
@@ -3319,12 +3331,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            upload((const uint8_t *) src->data + offset, offset, size);
             cst.bytes += copy_stats ? size : 0;
             cst.calls += copy_stats;
         }
 
         first = last + 1;
+    }
+    if (any_fast) {
+        lctx->moe_cache->offload_finish(backend);
     }
     if (copy_stats) {
         cst.us += ggml_time_us() - t_copy_start_us;

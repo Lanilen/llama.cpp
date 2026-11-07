@@ -654,6 +654,11 @@ struct llama_moe_cache::impl {
     int64_t  t_lend_us = 0;
     int64_t  n_ubatch = 0;  // ubatches computed (before_ubatch), the jit fills the maps once per ubatch and layer
     jit_stats jit_st;
+    struct offload_stats {
+        size_t  bytes = 0, uploads = 0, finishes = 0;
+        int64_t t_wait_us = 0; // waiting for a half's uploads before reusing it
+        int64_t t_copy_us = 0; // the copies to the staging memory at the end of a tensor
+    } offload_st;
     std::unique_ptr<copy_worker> jit_worker; // copies to the staging memory while the host waits
     std::unordered_map<const ggml_tensor *, int32_t> jit_of; // device maps of large ubatches -> layer
     std::vector<int32_t> jit_count;
@@ -2733,6 +2738,75 @@ struct llama_moe_cache::impl {
         ggml_backend_tensor_set_async(backend, dst, data, 0, ggml_nbytes(src));
     }
 
+    // LLAMA_OFFLOAD_FAST: the device of backend if it can take the scheduler's expert copies through its staging memory
+    device * offload_device(ggml_backend_t backend) {
+        static const bool enabled = getenv("LLAMA_OFFLOAD_FAST") && atoi(getenv("LLAMA_OFFLOAD_FAST")) != 0;
+        if (!enabled || mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+            return nullptr;
+        }
+        for (device & d : devices) {
+            if (d.backend == backend && d.pinned && d.upload_bg != nullptr && d.upload_bg_require != nullptr && d.staging_size > 0) {
+                return &d;
+            }
+        }
+        return nullptr;
+    }
+
+    // the scheduler's copy of host experts (a large batch, the layer's experts run from that copy): through the staging
+    // halves like the cache's own background uploads, so the copies to pinned memory run on the copy threads while the
+    // other half uploads, instead of the backend's synchronous copy from memory that isn't pinned
+    bool offload_copy(ggml_backend_t backend, ggml_tensor * dst, const uint8_t * src, size_t offset, size_t size) {
+        device * dp = offload_device(backend);
+        if (dp == nullptr) {
+            return false;
+        }
+        device & d = *dp;
+        join_installer();
+        const size_t half_size = d.staging_size/2;
+        static const size_t job_size = 16*1024*1024; // the copy threads take the copies in pieces of this size
+        bool first = true;
+        while (size > 0) {
+            const size_t n = std::min(size, half_size);
+            if (d.staging_used + n > half_size) {
+                // a full half is submitted, the other half is reused once its uploads are done
+                const int64_t t0_us = ggml_time_us();
+                submit_bg(d);
+                d.half ^= 1;
+                d.upload_bg_done(d.backend, d.half_ticket[d.half], true);
+                d.staging_used = 0;
+                offload_st.t_wait_us += ggml_time_us() - t0_us;
+            }
+            uint8_t * stg = d.staging + d.half*half_size + d.staging_used;
+            if (!d.upload_bg(backend, dst, stg, offset, n)) {
+                GGML_ASSERT(first && "background upload failed after the first part of an offload copy");
+                return false;
+            }
+            first = false;
+            for (size_t k = 0; k < n; k += job_size) {
+                d.jobs.push_back({ stg + k, src + k, std::min(job_size, n - k) });
+            }
+            d.staging_used += GGML_PAD(n, 64);
+            d.bg_recorded = true;
+            offload_st.bytes += n;
+            offload_st.uploads++;
+            src += n; offset += n; size -= n;
+        }
+        return true;
+    }
+
+    void offload_finish(ggml_backend_t backend) {
+        device * dp = offload_device(backend);
+        if (dp == nullptr || !dp->bg_recorded) {
+            return;
+        }
+        device & d = *dp;
+        const int64_t t0_us = ggml_time_us();
+        submit_bg(d);
+        offload_st.t_copy_us += ggml_time_us() - t0_us;
+        d.upload_bg_require(backend, d.half_ticket[d.half]);
+        offload_st.finishes++;
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         if (const auto it_jit = jit_of.find(src); it_jit != jit_of.end()) {
             jit_copy(backend, it_jit->second, src, dst, graph);
@@ -2808,6 +2882,11 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (offload_st.uploads > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST: %.2f GiB of host experts in %zu uploads for %zu tensors; %.2f s waiting for a half's "
+                "uploads, %.2f s copying at the end of a tensor\n", offload_st.bytes/1073741824.0, offload_st.uploads, offload_st.finishes,
+                offload_st.t_wait_us/1e6, offload_st.t_copy_us/1e6);
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -2990,6 +3069,14 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+bool llama_moe_cache::offload_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t offset, size_t size) {
+    return pimpl->offload_copy(backend, dst, (const uint8_t *) src, offset, size);
+}
+
+void llama_moe_cache::offload_finish(ggml_backend_t backend) {
+    pimpl->offload_finish(backend);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
