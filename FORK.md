@@ -124,6 +124,9 @@ the GPU once), but large batches need large compute buffers, which the cache wou
 - **`LLAMA_MOE_CACHE_JIT_SHARE=1`:** the jit's slots are resident slots too, lent to the jit only while a batch uses it:
   each group lends the slots of its weakest residents. `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N` caps the uploads, and
   the slots lent, at one per N tokens of the ubatch (at least 64), so more slots can serve large batches.
+- **`LLAMA_OFFLOAD_FAST=1`:** a batch that releases the cache copies every used expert to the GPU. These copies go
+  through the cache's pinned staging memory and background uploads, instead of the backend's synchronous copy from the
+  mmapped weights.
 - **`LLAMA_MOE_RESIZE_SPLIT=N`:** a batch of up to N tokens that is too large to fit next to the cache keeps it all the
   same, and runs in ubatches of the size that fits. It skips the release, the 1.9 s restore, and the uploads of every
   expert, and the cache and the jit serve the prompt. The MTP draft's context follows the same rule.
@@ -142,6 +145,9 @@ the GPU once), but large batches need large compute buffers, which the cache wou
   `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8`: 2k prompts another 29-31% faster on Q4. The set of requests took 16.8 s less
   on Q4 (-7%) and 13.3 s less on Q6 (-5%). The cost is Q4's short answers after a large prompt, 0.8 tok/s slower
   (-1.9%) while the lent slots refill; other generation was within 0.8 tok/s.
+- `LLAMA_OFFLOAD_FAST=1`, R9700, Q4: the expert copies of released prompts took 21 s instead of 93 (26 against 5.8
+  GiB/s). Prompts of 4.8k-31k tokens were 15-38% faster, and the answers after them as fast. Every uploaded part read back
+  the same as the host weights.
 
 ### Scheduler and Vulkan changes for split models
 
@@ -381,7 +387,7 @@ lab's file isn't published). The cache, draft and CPU settings are the tuning sc
 
 ```bash
 GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=4096 \
-LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 \
+LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
