@@ -18,7 +18,10 @@ R9700). Other GPUs are unaffected: every change is behind a check for RDNA4.
    used ÷ experts): small under 32, medium up to 64, and otherwise by the tokens as before. Upstream picks it by the
    ubatch's tokens, so models with many small experts got the large tile in small batches.
    `GGML_VK_MMID_TILE_BY_TOKENS=1` goes back to that.
-4. **Switches for measuring** (no effect unless set):
+4. **Other int8 tile shapes.** The medium int8 cooperative-matrix tile is 128 × 64 instead of 64 × 64. MUL_MAT_ID gets
+   tiles of its own, and a large one at 64 × 128, which upstream gives it nowhere on AMD.
+   `GGML_VK_RDNA4_NO_MMID_L=1` turns that large tile off again.
+5. **Switches for measuring** (no effect unless set):
    - `GGML_VK_DISABLE_COOPMAT_INT=1`: no int8 cooperative matrices at all (the experts and Q6_K back on the f16 path);
    - `GGML_VK_FORCE_MMID_TILE=0|1|2`: always the small, medium or large tile for MUL_MAT_ID (without coopmat2 it picks
      its tile like a dense matmul).
@@ -26,7 +29,8 @@ R9700). Other GPUs are unaffected: every change is behind a check for RDNA4.
      the CPU), the default choice, the small tile, was the fastest; the medium and large ones were slower.
    - `GGML_VK_CM1_INT_TILE_{S,M,L}=BM,BN,WM,WN` (and `GGML_VK_CM1_INT_K_TILE_*` for Q3_K/Q6_K): other shapes for the
      int8 cooperative-matrix tiles: BM × BN per workgroup, WM × WN per subgroup. The sizes are specialization constants,
-     so no shader is rebuilt.
+     so no shader is rebuilt. `GGML_VK_CM1_INT_ID_TILE_{S,M,L}` sets MUL_MAT_ID's own tiles, which otherwise follow the
+     dense ones, except for the large one (change 4).
 
 ## Measured
 
@@ -70,7 +74,23 @@ In the change 2 rows, "upstream" is this branch with change 1 only.
   | q8_0 2560 × 640 | 6.2 | 7.8 | +24.3% |
 
   At 2048 and 8192 tokens, and for Qwen3-30B's shapes, the two were the same within the noise. MUL_MAT_ID passes
-  1109/1109. For scale, ROCm runs these shapes 1.3–2.1× faster than Vulkan, and dense matmuls 1.45–1.8× faster (q6_K
+  1109/1109.
+- **Tile shapes (change 4).** A sweep of 25 shapes, each tile size forced in turn, found the medium 128 × 64 faster than
+  64 × 64. Dense matmuls were 20–25% faster when it was forced at 512 tokens. Expert matmuls were 6–20% faster at
+  512–2048 tokens, but 8–12% slower at 8192, where they had no large tile to fall to. With the tiles picked as they would
+  be, against the old ones (two passes each, MUL_MAT 2437/2437 and MUL_MAT_ID 1109/1109):
+
+  | case | old | new | |
+  |---|---|---|---|
+  | dense q4_K 4096 × 14336, 48 tokens | 14.8 TFLOPS | 24.0 | +62% |
+  | dense q8_0, 48 tokens | 14.4 | 23.6 | +64% |
+  | dense q4_K / q8_0, 512 tokens | 51.9 / 59.6 | 51.5 / 58.4 | the same |
+  | MUL_MAT_ID q4_K 512 × 10, 2048 tokens | 14.0 | 15.2 | +9% |
+  | MUL_MAT_ID q8_0 512 × 10, 8192 tokens | 15.7 | 18.2 | +16% |
+  | MUL_MAT_ID q4_K 128 × 8 (Qwen3-30B), 512 tokens | 14.2 | 15.4 | +8% |
+
+  The geometric mean over the 14 cases was +10.5%. The large tile at 128 × 256 for dense q8_0 (+17% at 512 tokens) made
+  q4_K 35% slower, so it stays at 128 × 128. For scale, ROCm runs these shapes 1.3–2.1× faster than Vulkan, and dense matmuls 1.45–1.8× faster (q6_K
   the same).
 
 ## Building for RDNA4
