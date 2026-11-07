@@ -148,6 +148,8 @@ the GPU once), but large batches need large compute buffers, which the cache wou
 - `LLAMA_OFFLOAD_FAST=1`, R9700, Q4: the expert copies of released prompts took 21 s instead of 93 (26 against 5.8
   GiB/s). Prompts of 4.8k-31k tokens were 15-38% faster, and the answers after them as fast. Every uploaded part read back
   the same as the host weights.
+- With the fast copies, releasing pays from about 3.1k tokens instead of 5k: kept 2.3k prompts 249-251 tok/s against
+  204 released, 3.6k 256 against 298. `LLAMA_MOE_RESIZE_SPLIT=3072` gave the shortest runs, 4-5% shorter than 4096.
 
 ### Scheduler and Vulkan changes for split models
 
@@ -386,7 +388,7 @@ lab's file isn't published). The cache, draft and CPU settings are the tuning sc
 ([Tuning a machine](#tuning-a-machine)):
 
 ```bash
-GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=4096 \
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=3072 \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
