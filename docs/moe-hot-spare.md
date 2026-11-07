@@ -179,6 +179,30 @@ The MTP draft's context follows the same rule, so its buffers stay small too. On
 with agent turns took 14 s less on Q4 and 27 s less on Q6. Prompts of 13k tokens and more still release the cache, at
 the same speed as before. 8192 measured the same as 4096, since no request fell between the two.
 
+**Faster copies for large batches** (`LLAMA_OFFLOAD_FAST=1`). A batch that releases the cache runs its experts from
+copies the scheduler makes of the host weights, every used expert of every layer, about 67 GiB per ubatch for
+Flash-Next Q4. The weights are mmapped, which isn't memory the GPU can read directly. So the Vulkan backend copies
+each part on one thread into a staging buffer, uploads it, and waits for the device before the next. On the R9700,
+released prompts of 5k-13k tokens spent 58 of their 88 s in those copies, at 5.8 GiB/s, with the GPU idle meanwhile.
+With `LLAMA_OFFLOAD_FAST=1` the copies go through the cache's own pinned staging memory and background uploads: the
+copy threads fill one half while the other half uploads, and the next graph waits for the uploads on the device. The
+same copies then took 21 s instead of 93 (26 GiB/s while copying). Prompts that release the cache (Q4, Local Coder's
+presets, two passes each):
+
+| prompt | today | `LLAMA_OFFLOAD_FAST=1` |
+| --- | --- | --- |
+| 4.8k tokens | 255 tok/s | 352 (+38%) |
+| 6.7k | 329 | 435 (+32%) |
+| 9.3k | 405 | 522 (+29%) |
+| 12.3k | 472 | 599 (+27%) |
+| 19.0k | 466 | 534 (+15%) |
+| 31.4k | 547 | 661 (+21%) |
+
+The answers after them generated as fast. `LLAMA_OFFLOAD_FAST_CHECK=1` reads every part back after its upload and
+compares it with the host weights: all 29,104 parts of a run were the same. Two of seven answers came out with other
+text than today's. They were the same with the check on, which changes all the timings, so they come from the cache's
+refills, not from the copies.
+
 **The backends' own memory.** Backends keep memory of their own between graphs, sized by the largest graph so far and
 outside the scheduler's buffers: the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch
 grows them a lot (the sparse attention top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at
