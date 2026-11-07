@@ -1811,6 +1811,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         l_warptile_mmq_cm1_int = { cm1_bs(128, 128), 128, 128, 32, std::min(cm1_sg, 128u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
         m_warptile_mmq_cm1_int = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
+        if (device->architecture == AMD_RDNA4) {
+            // a medium 128 x 64: dense matmuls of 33-64 tokens 62% faster on the R9700, Flash-Next's expert matmuls of 2048
+            // tokens 9% (fn-tile2, fn-tile3)
+            m_warptile_mmq_cm1_int = { cm1_bs(128,  64), 128,  64, 32, std::min(cm1_sg, 128u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
+        }
         s_warptile_mmq_cm1_int = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
 
         l_warptile_mmq_cm1_int_k = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
@@ -1845,6 +1850,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // MUL_MAT_ID's tiles of the same types, the dense ones unless GGML_VK_CM1_INT_ID_TILE_{S,M,L} gives others (fn-tile:
         // a medium 128 x 64 made the expert matmuls of 512-2048 tokens faster and of 8192 slower)
         l_warptile_mmqid_cm1_int = l_warptile_mmq_cm1_int;
+        if (device->architecture == AMD_RDNA4) {
+            // MUL_MAT_ID's large tile, which RDNA4 uses (see mul_mat_id_l), at 64 x 128: with the medium 128 x 64 above it made
+            // the expert matmuls of 8192 tokens 5-16% faster than with the old medium alone (fn-tile3)
+            l_warptile_mmqid_cm1_int = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
+        }
         m_warptile_mmqid_cm1_int = m_warptile_mmq_cm1_int;
         s_warptile_mmqid_cm1_int = s_warptile_mmq_cm1_int;
         cm1_override("GGML_VK_CM1_INT_ID_TILE_S", s_warptile_mmqid_cm1_int);
@@ -4868,9 +4878,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary;
                 device->mul_mat_m[i]    = true;
                 device->mul_mat_s[i]    = true;
-                // GGML_VK_RDNA4_MMID_L=1: MUL_MAT_ID's large tile on RDNA4 too (for its own shape, GGML_VK_CM1_INT_ID_TILE_L)
+                // MUL_MAT_ID's large tile on RDNA4 (its own shape, l_warptile_mmqid_cm1_int); GGML_VK_RDNA4_NO_MMID_L=1: none, as
+                // upstream does on AMD
                 device->mul_mat_id_l[i] = device->architecture == vk_device_architecture::AMD_RDNA4 && device->coopmat_support &&
-                                          getenv("GGML_VK_RDNA4_MMID_L") != nullptr;
+                                          getenv("GGML_VK_RDNA4_NO_MMID_L") == nullptr;
                 device->mul_mat_id_m[i] = true;
                 device->mul_mat_id_s[i] = true;
                 break;
