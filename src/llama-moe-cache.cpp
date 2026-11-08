@@ -2770,6 +2770,11 @@ struct llama_moe_cache::impl {
         }
         device & d = *dp;
         join_installer();
+        // the uploads run on the transfer queue and wait for nothing the backend computes, while dst is the scheduler's
+        // copy in the compute buffer, whose memory the graph's earlier tensors (the previous splits, still running) may
+        // share: drain the backend first, as the backend's own copy from memory that isn't pinned does (without this
+        // the copies overwrote tensors in use, and a greedy answer after a released prompt changed: fn-drift-ctx)
+        ggml_backend_synchronize(backend);
         const size_t half_size = d.staging_size/2;
         static const size_t job_size = 16*1024*1024; // the copy threads take the copies in pieces of this size
         bool first = true;
