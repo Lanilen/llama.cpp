@@ -198,7 +198,7 @@ layers at the newest token.
 - **Training** (`tools/moe-predictor`): traces of the model's routing on public conversations and its own answers,
   then records, training, export and a check against llama.cpp.
 
-**Measured,** Flash-Next on the R9700, trained on 948 traces (13.1M tokens):
+**Measured,** Flash-Next on the R9700, the first file, trained on 948 traces of the R9700 (13.1M tokens):
 - **Offline,** on held-out conversations: the top 164 experts per layer served 86.7% of the next 128 tokens'
   selections from an answer's start, against 76.0% for the counts (83.5% against 74.1% with whole sources held out).
   It carries over to Q6_K_XL, whose routing is 93.8% the same.
@@ -209,6 +209,12 @@ layers at the newest token.
   tuning script's picks, smaller still, are in [Tuning a machine](#tuning-a-machine).
 - **The text start** cuts the uploads by a quarter to 40%, but it was slower overall on the R9700, so it isn't used
   there.
+
+**The current file** adds 236 traces from the 14600KF + RTX 4070 Ti (7.9M tokens, 36% of them agent turns), 1,181
+traces in all. On held-out answers it serves 86.7% against the first file's 86.4%, level or better on 55 of 64
+sources: most on agent turns and multilingual chat; it loses on long-context fills later in an answer. Live on the R9700,
+against the first file with the setup of [Setups](#setups): Q4 follow-ups +6.0%, agent turns −0.7%, usual answers
+−0.5%, the whole run 205.2 → 203.4 s; Q6 follow-ups +2.0%, agent turns +1.9%, usual answers +0.3%, 248.7 → 247.0 s.
 
 ### The CPU's experts
 
@@ -451,6 +457,12 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   Loading the weights instead of mapping them gave 2–3%.
 - **Keeping the GPU busy** with one sleeping wave from a second process held it at about 3.28 GHz: Q4 answers +1.3%,
   Q6 nothing, prompts −16–17%.
+- **Prefetching a token's misses from its n-grams,** what Flash-Next's engram (its per-layer n-gram table, read at
+  layer 1) is keyed by, on traces from the 14600KF + RTX 4070 Ti. Exact token, bigram and trigram tables counted from
+  the traces cover 21% of a held-out token's cache misses with 4 guesses a layer, 13% of the guesses right. The previous
+  token's misses do as well (22%, 26% right). Only the layers where routing follows the token do better, up to 44%
+  (7 and 47; 3 in one of the two sets of traces). Keeping to the tokens the model weights the engram most for (its gate) made the tables worse (13%, 8%
+  right). Uploading the guesses would take about 40 ms of PCIe a token.
 
 ## Still to measure
 
