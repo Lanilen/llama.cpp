@@ -349,7 +349,8 @@ cmake --build build-vk -j
   the machine. [rocm-hide-gpus](https://github.com/Lanilen/rocm-hide-gpus) is a preload library that hides those GPUs
   from ROCm only, so one llama.cpp process can run the R9700 on ROCm and the RX 480s on Vulkan. With a model entirely
   on the R9700, Vulkan generates faster than ROCm (Qwen3-Coder-30B Q4: 185 against 116 tok/s), and ROCm reads prompts
-  faster.
+  faster. With Flash-Next's experts on the CPU and no hot spare (`-ncmoe 49` on both), the two generate at about the
+  same speed (ROCm −1.8% to +4.2% over Q4 and Q6 answers and agent turns), and ROCm reads prompts 72–90% faster.
 
 ## Setups
 
