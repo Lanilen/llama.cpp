@@ -1,11 +1,20 @@
 # MoE hot spare: run the CPU's experts beside the GPU's recording (design)
 
-Status: shelved after phase 0 (below), nothing implemented. Re-estimated on 2026-11-04 (below): still not worth building.
+Status: shelved, nothing implemented. The idea was to let the host record and submit a whole graph's Vulkan work ahead
+of the GPU while the CPU computes the missed experts on a worker thread, so that the step costs the longer of the two
+chains instead of their sum.
 
-## Re-estimate (2026-11-04, `~/traces/fn-ops-compute`)
+Conclusion: the GPU's idle time in a pass is the CPU experts' time. The recording already runs while the GPU works, and
+the hand-off between the CPU and the GPU costs at most about 2 ms a pass, so this design would gain at most about 3%.
+The lever is the CPU experts themselves: fewer misses, and less time per miss.
 
-This was redone with the shared expert beside the MoE, on a Q4 verify batch at 1024 tokens of context (drift profile, one
-process per batch size). The time the GPU sits idle in a batch matches the CPU experts' time, to within about 2 ms:
+All measurements are on the 1920X + R9700 (RADV) with Qwen3.8-Flash-Next UD-Q4_K_XL and the everyday preset (64k
+context, `-ub 8192`, MTP, `-t 12`) unless a section says otherwise.
+
+## Where the GPU's idle time goes
+
+A Q4 verify batch at 1024 tokens of context, with the shared expert computed beside the MoE, one process per batch
+size. The time the GPU sits idle in a pass matches the CPU experts' time, to within about 2 ms:
 
 | tokens | wall | GPU busy | GPU idle | CPU experts |
 |---|---|---|---|---|
@@ -13,37 +22,15 @@ process per batch size). The time the GPU sits idle in a batch matches the CPU e
 | 3 | 60.4 ms | 39.5 ms | 21.0 ms | 24.0 ms |
 | 8 | 110.6 ms | 56.8 ms | 53.9 ms | 53.3 ms |
 
-The Vulkan host's 19–23 ms of recording and submits already runs while the GPU works. The hand-off between the CPU and
-the GPU costs at most about 2 ms a pass. Everything else the GPU waits for is the CPU computing its experts, which the
-layer's next step needs. Submitting ahead against a semaphore can't remove that time, so this design would gain at most
-about 3%.
+The Vulkan host's 19–23 ms of recording and submits already runs while the GPU works. Everything else the GPU waits for
+is the CPU computing its experts, which the layer's next step needs; submitting ahead against a semaphore can't remove
+that time. What is left for this design is the hand-off, at most about 2 ms a pass.
 
-Strata's in-stream wait looks the same, but its edge is elsewhere. Its CPU experts take 6.5 ms a window of about 3
-tokens, with 92% hits (STRATA_DECODE_TIMING, tail skip off), against our 19–24 ms. The lever is the CPU experts: fewer
-misses, and less time per miss.
+Strata's in-stream wait looks the same, but its edge is elsewhere: its CPU experts take 6.5 ms a window of about 3
+tokens, with 92% hits (its `STRATA_DECODE_TIMING`, route tail skip off, so every routed expert is computed), against
+our 19–24 ms.
 
-## Phase 0 result (2026-10-28, `~/traces/fn-phase0`)
-
-- W, the GPU's busy time per step, is ~40 ms (the perf logger's concurrent mode: median 39.7 ms per 100 Vulkan calls,
-  about one step), out of a 53.8 ms compute part. That is near the table's last row: this change would gain ~10%.
-- Of the Vulkan calls' 0.256 ms of host time each, 0.142 ms is queue submits (8.13 per call, 17.5 us each), 0.084 ms
-  recording, 0.028 ms fusion checks: ~790 submits and ~13.8 ms per step. The backend splits each graph by its flops
-  (`last_total_flops / 40`, doubling for the first three), which suits large graphs, not 73-node generation splits.
-  `GGML_VK_FLOPS_PER_SUBMIT=0` (one submit per 100 nodes) takes most of that off the host for no code, and reaches
-  about the same ceiling (compute part ~W + the CPU's misses beyond the cached experts' time). Tried first:
-  `~/traces/fn-submit.sh`.
-  Measured (`~/traces/fn-submit`): submits 8.13 -> 1.85 per call, the Vulkan calls' host time 24.5 -> 13.2 ms per
-  step, but the wait for the GPU 10.9 -> 21.0 ms: compute part 54.2 -> 51.6 ms, 25.9 -> 26.9 tok/s (27.1 with
-  `GGML_VK_MAX_NODES_PER_SUBMIT=1000` too, one submit per call); 16 GB cache 24.3 -> 24.8; prompts unchanged. The
-  host's savings became GPU waiting: the GPU is the limit.
-- After that, the GPU is the limit: ~7800 nodes per step in dispatches of 10-90 us for 2 tokens, ~40 ms against
-  ~11-12 ms that its weight reads need at the R9700's bandwidth. Fewer, fused dispatches are the next lever, for Q4
-  and Q6 alike.
-
-The original design follows. Measured on the 1920X + R9700 (RADV) with Qwen3.8-Flash-Next
-UD-Q4_K_XL, the everyday preset (64k, `-ub 8192`, MTP, `-t 12`), on 2026-10-28 (`~/traces/fn-profile`).
-
-## Where a generation step goes today
+## The pass as the scheduler runs it
 
 With the hot spare, every MoE layer is three splits:
 
@@ -63,7 +50,10 @@ C(L)   wait for the event (GPU still running G1)  "waiting for Vulkan0"
 G1(L+1) copy C(L)'s output in, record + submit    nothing is recorded until C(L) is done
 ```
 
-One MTP step (1.8 tokens) at the 23.5 GB cache, 84% hits, from `GGML_SCHED_TIMING`:
+### The profile the design started from
+
+One MTP step (1.8 tokens) at the 23.5 GB cache, 84% hits, from `GGML_SCHED_TIMING`, before the queue submit change
+below:
 
 | part | ms per step |
 |---|---|
@@ -79,10 +69,30 @@ One MTP step (1.8 tokens) at the 23.5 GB cache, 84% hits, from `GGML_SCHED_TIMIN
 
 The cache sweep (23.5 / 16 / 10 / 5 / 0 GB) fits step = 62 ms + 0.455 ms per % of experts missed: the misses add to
 the step one for one. At 100% misses that is ~2.7 GB in ~45 ms, ~60 GB/s, what the 1920X's four channels give, so a
-miss costs its bytes (Q6: 1.42x). `-t 12` is best; 24 threads slow the recording thread down (30.8 ms of copies).
-`GGML_SCHED_OVERLAP=0` costs only 1%: hiding the cached experts saves about what the extra 48 splits cost to record.
+miss costs its bytes (Q6: 1.42x). `-t 12` is best; 24 threads slow the recording thread down (30.8 ms of copies, 44%
+slower). `GGML_SCHED_OVERLAP=0` costs only 1%: hiding the cached experts saves about what the extra 48 splits cost to
+record.
 
-## The change
+### The GPU's busy time and the host's submits
+
+- W, the GPU's busy time per step, is ~40 ms (the perf logger's concurrent mode, `GGML_VK_PERF_LOGGER_CONCURRENT`:
+  median 39.7 ms per 100 Vulkan calls, about one step), out of the 53.8 ms compute part. By the table in
+  [What it would gain](#what-it-would-gain) that would leave ~10%; what the GPU waits for (above) brings it to ~3%.
+- Of the Vulkan calls' 0.256 ms of host time each (`GGML_VK_HOST_TIMING`), 0.142 ms was queue submits (8.13 per call,
+  17.5 us each), 0.084 ms recording, 0.028 ms fusion checks: ~790 submits and ~13.8 ms per step. The backend split each
+  graph by its flops (`last_total_flops / 40`, doubling for the first three), which suits large graphs, not 73-node
+  generation splits.
+- One submit per call fixes that without this design, and is now the default: a graph of up to
+  `GGML_VK_MAX_NODES_PER_SUBMIT` nodes (100) is submitted once; `GGML_VK_FLOPS_PER_SUBMIT` still overrides it. Measured
+  with `GGML_VK_FLOPS_PER_SUBMIT=0`: submits 8.13 -> 1.85 per call, the Vulkan calls' host time 24.5 -> 13.2 ms per
+  step, but the wait for the GPU 10.9 -> 21.0 ms: compute part 54.2 -> 51.6 ms, 25.9 -> 26.9 tok/s, and 27.1 with
+  `GGML_VK_MAX_NODES_PER_SUBMIT=1000` too (one submit per call, what the default now does for these splits); 16 GB
+  cache 24.3 -> 24.8; prompts unchanged. The host's savings became GPU waiting.
+- After that the GPU is the limit: ~7800 nodes per step in dispatches of 10-90 us for 2 tokens, ~40 ms against
+  ~11-12 ms that its weight reads need at the R9700's bandwidth. Fewer, fused dispatches are the lever there, for Q4 and
+  Q6 alike.
+
+## The design
 
 Record and submit every Vulkan split as soon as the host gets to it, without waiting for the CPU: a split that needs a
 CPU split's output waits for it on the GPU, behind a timeline semaphore that the host signals when the CPU is done.
@@ -95,7 +105,7 @@ GPU:           G1(L) | Gc(L) | ...waits gate L... | copy C(L) out, G1(L+1) | Gc(
 ```
 
 The main thread never waits inside a graph; it can record the whole graph ahead of the GPU. The order the GPU and the
-CPU see is the same as today, so the results are bit-identical:
+CPU see is the same as now, so the results are bit-identical:
 
 - every GPU command after gate L runs after C(L) has finished, and C(L+1) reads inputs that the GPU writes after gate
   L, so it starts after C(L) and after the copy of C(L)'s output;
@@ -115,20 +125,20 @@ CPU see is the same as today, so the results are bit-identical:
 - `cpy_tensor_async` from a pinned host tensor already records a buffer copy (it reads the data when the GPU runs
   it); with a gate pending it must skip its shortcut that writes small tensors from the host at once.
 
-**Scheduler** (`ggml-backend.cpp`, behind `GGML_SCHED_ASYNC_CPU=1` until it is measured):
+**Scheduler** (`ggml-backend.cpp`, behind a `GGML_SCHED_ASYNC_CPU=1` switch until measured; it does not exist):
 
 - one worker thread per scheduler, created on first use, that runs CPU splits from a queue: wait for the gate values
   of its GPU inputs, `ggml_backend_graph_compute`, signal its own gate value;
-- a CPU split's inputs from a GPU split are read asynchronously into its pinned buffers (as today with async reads),
+- a CPU split's inputs from a GPU split are read asynchronously into its pinned buffers (as now with async reads),
   followed by `gate_signal_after` instead of an event;
 - a GPU split's inputs from a CPU split are a `gate_wait` for that split's value, then the recorded copy;
-- the graph ends with the main thread waiting for the worker's queue to drain, then `synchronize` as today;
+- the graph ends with the main thread waiting for the worker's queue to drain, then `synchronize` as now;
 - a graph with any other pattern (a CPU split whose inputs are not pinned, a backend without gates, several GPUs
-  feeding one CPU split) runs as today.
+  feeding one CPU split) runs as now.
 
 Nothing changes in llama.cpp's graphs: the hot spare's three splits per layer are already the right shape.
 
-## What it can gain
+## What it would gain
 
 The step's compute part becomes the longer of two chains instead of their sum:
 
@@ -136,42 +146,42 @@ The step's compute part becomes the longer of two chains instead of their sum:
 - **the data chain**: per layer G1 on the GPU, then the CPU's misses beside Gc, plus two GPU/host hand-offs:
   W - Gc + max(C, Gc) + ~3 ms, where W is the GPU's busy time per step.
 
-W is the unknown. The perf logger's default mode puts a barrier after every op and says 44 ms, an upper bound; the
-`GGML_SCHED_OVERLAP=0` run waited 20 ms per step for the GPU on top of its recording. With Gc ~11 ms (the cached
-experts' `MUL_MAT_ID`, ~80 us x 3 x 48):
+With Gc ~11 ms (the cached experts' `MUL_MAT_ID`, ~80 us x 3 x 48), from the profile above:
 
-| W (GPU busy per step) | compute part | step | Q4 tok/s (today 25.9) | Q6 tok/s (predicted today 23.0) |
+| W (GPU busy per step) | compute part | step | Q4 tok/s (profiled: 25.9) | Q6 tok/s (predicted from the profile: 23.0) |
 |---|---|---|---|---|
 | 25 ms | ~31 ms | ~47 ms | ~38 | ~32 |
 | 35 ms | ~41 ms | ~57 ms | ~32 | ~27 |
 | 44 ms | ~50 ms | ~66 ms | ~27 | ~24 |
 
+44 ms is the upper bound from the perf logger's default mode, which puts a barrier after every op; W measured ~40 ms.
 The steps add ~15.7 ms outside the compute part (draft, hot spare update, sampling). Q6's misses cost 1.42x the bytes
 and there are more of them (~75% hits at 23.5 GB), so its C grows from ~14 to ~23 ms per step, and its Gc and W by
-~4.6 ms (the cached experts read 1.42x too); the data chain carries only the part of C beyond Gc. At the low end of W the recording becomes the limit,
-and the next lever is the recording itself (command buffers reused while the graph and `n_kv`'s padding stay the same,
-or fewer, fused dispatches: ~7800 nodes per step).
+~4.6 ms (the cached experts read 1.42x too); the data chain carries only the part of C beyond Gc. At the low end of W
+the recording becomes the limit, and the next lever is the recording itself (command buffers reused while the graph and
+`n_kv`'s padding stay the same, or fewer, fused dispatches).
 
-## Plan
+The model assumes the GPU's idle time is the host's recording getting in the way. The measurement in
+[Where the GPU's idle time goes](#where-the-gpus-idle-time-goes) shows it is the CPU experts instead, which the data
+chain still waits for, so the real gain is the hand-off's ~2 ms a pass, about 3%.
 
-0. **Measure W and the recording** (1920X + R9700, ~10 minutes, `~/traces/fn-phase0.sh`): `GGML_VK_HOST_TIMING` splits the
-   24.5 ms into setup, fusion checks, recording and queue submits; the perf logger in its concurrent mode
-   (`GGML_VK_PERF_LOGGER_CONCURRENT`: timestamps only where the graph already has barriers) gives W. Go if W leaves a
-   gain worth the change.
+## What building it would take
+
 1. **Vulkan gates** with a test of their own: a copy that waits for a host signal given 100 ms later, a host wait for
-   a GPU signal; on the 14600KF + RTX 4070 Ti (NVIDIA) and the 1920X + R9700 (RADV), where waiting before the signal is submitted must work.
-2. **Scheduler worker** behind `GGML_SCHED_ASYNC_CPU=1`; the 14600KF + RTX 4070 Ti's Qwen3-Coder-30B hot spare has the same three splits per
-   layer: greedy outputs identical to the flag off, then speed.
-3. **A/B on the 1920X + R9700**: the profile sweep's c23500, c16000, c0 and the long layout with the flag on and off; then decide
-   on Q6 with its predicted speed from the new numbers.
+   a GPU signal; on the 14600KF + RTX 4070 Ti (NVIDIA) and the 1920X + R9700 (RADV), where waiting before the signal
+   is submitted must work.
+2. **Scheduler worker** behind the switch; the 14600KF + RTX 4070 Ti's Qwen3-Coder-30B hot spare has the same three
+   splits per layer: greedy outputs identical to the switch off, then speed.
+3. **A/B on the 1920X + R9700**: the cache sweep's 23.5 GB, 16 GB and 0 GB points and the long layout with the switch on
+   and off; then Q6.
 
-## Risks
+### Risks
 
 - The worker's CPU threads and the recording thread share 12 cores: `-t 11` may beat `-t 12` (24 threads were 44%
-  slower today because the recording thread lost its core).
+  slower because the recording thread lost its core).
 - A gated submission blocks the queue behind it: the hot spare's background uploads must stay on their own queue.
 - Recording far ahead uses more command buffers and descriptor sets per graph; a prealloc growth inside a split
   synchronizes the backend, which then waits for the worker's gates (no deadlock: the worker needs nothing from the
   main thread).
 - RADV runs timeline waits submitted before their signal through a submission thread; its latency adds to every
-  hand-off (96 per step). Phase 1 measures it.
+  hand-off (96 per step). Step 1 would measure it.
