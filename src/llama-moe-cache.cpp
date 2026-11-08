@@ -2861,8 +2861,14 @@ struct llama_moe_cache::impl {
                 return false;
             }
             first = false;
-            for (size_t k = 0; k < n; k += job_size) {
-                d.jobs.push_back({ stg + k, src + k, std::min(job_size, n - k) });
+            // the worker starts with the cache's first upload, which a released first prompt comes before: without it
+            // the jobs were never run, and the uploads read staging memory nothing had written
+            if (get_worker() != nullptr) {
+                for (size_t k = 0; k < n; k += job_size) {
+                    d.jobs.push_back({ stg + k, src + k, std::min(job_size, n - k) });
+                }
+            } else {
+                copy_to_staging(stg, src, n);
             }
             d.staging_used += GGML_PAD(n, 64);
             d.bg_recorded = true;
