@@ -2485,8 +2485,10 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_CACHE_VERIFY %s: %zu resident experts read back, %zu differ (%zu still uploading)\n",
+        // straight to stderr: at exit the log's worker thread may not print it
+        fprintf(stderr, "llama_moe_cache: LLAMA_MOE_CACHE_VERIFY %s: %zu resident experts read back, %zu differ (%zu still uploading)\n",
             when, n_checked, n_bad, n_pending);
+        fflush(stderr);
     }
 
     // hot spare mode: write the resident experts, then the other experts with a score, best first, in the format of --moe-cache-hot
@@ -2821,6 +2823,10 @@ struct llama_moe_cache::impl {
             return false;
         }
         device & d = *dp;
+        if (offload_st.uploads == 0 && getenv("LLAMA_MOE_CACHE_VERIFY")) {
+            fprintf(stderr, "llama_moe_cache: LLAMA_OFFLOAD_FAST: the first offload copy, %s, %zu bytes at %zu\n", ggml_get_name(dst), size, offset);
+            fflush(stderr);
+        }
         join_installer();
         // the uploads run on the transfer queue and wait for nothing the backend computes, while dst is the scheduler's
         // copy in the compute buffer, whose memory the graph's earlier tensors (the previous splits, still running) may
