@@ -1,6 +1,26 @@
 # MoE hot spare: run the CPU's experts beside the GPU's recording (design)
 
-Status: shelved after phase 0 (below), nothing implemented.
+Status: shelved after phase 0 (below), nothing implemented. Re-estimated on 2026-11-04 (below): still not worth building.
+
+## Re-estimate (2026-11-04, `~/traces/fn-ops-compute`)
+
+This was redone with the shared expert beside the MoE, on a Q4 verify batch at 1024 tokens of context (drift profile, one
+process per batch size). The time the GPU sits idle in a batch matches the CPU experts' time, to within about 2 ms:
+
+| tokens | wall | GPU busy | GPU idle | CPU experts |
+|---|---|---|---|---|
+| 1 | 44.4 ms | 32.9 ms | 11.5 ms | 9.6 ms |
+| 3 | 60.4 ms | 39.5 ms | 21.0 ms | 24.0 ms |
+| 8 | 110.6 ms | 56.8 ms | 53.9 ms | 53.3 ms |
+
+The Vulkan host's 19–23 ms of recording and submits already runs while the GPU works. The hand-off between the CPU and
+the GPU costs at most about 2 ms a pass. Everything else the GPU waits for is the CPU computing its experts, which the
+layer's next step needs. Submitting ahead against a semaphore can't remove that time, so this design would gain at most
+about 3%.
+
+Strata's in-stream wait looks the same, but its edge is elsewhere. Its CPU experts take 6.5 ms a window of about 3
+tokens, with 92% hits (STRATA_DECODE_TIMING, tail skip off), against our 19–24 ms. The lever is the CPU experts: fewer
+misses, and less time per miss.
 
 ## Phase 0 result (2026-10-28, `~/traces/fn-phase0`)
 

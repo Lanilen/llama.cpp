@@ -197,7 +197,7 @@ if __name__ == "__main__":
     t0 = time.time()
     TE = load(te_names)
     bidx = {p: i for i, p in enumerate(BUCKETS)}
-    ck = torch.load(args.load or args.init) if args.load or args.init else None
+    ck = torch.load(args.load or args.init, map_location=dev) if args.load or args.init else None
     if ck is not None:
         prior = ck["prior"].to(dev).view(-1)        # the prior is part of the model
     if not args.load:
