@@ -1977,6 +1977,7 @@ struct llama_moe_cache::impl {
         if (!resize || released) {
             return;
         }
+        verify_resident("before a release");
         // the uploads in flight write to the banks
         finish_submits();
         for (device & d : devices) {
@@ -2432,9 +2433,60 @@ struct llama_moe_cache::impl {
             }
         }
         log_stats();
+        verify_resident("at exit");
         if (!save_path.empty()) {
             save_hot_spare(save_path);
         }
+    }
+
+    // LLAMA_MOE_CACHE_VERIFY=1: read every resident slot back and compare it with the host expert (a diagnostic: slow,
+    // and only once every upload is done), at exit and before each release
+    void verify_resident(const char * when) {
+        static const bool on = getenv("LLAMA_MOE_CACHE_VERIFY") && atoi(getenv("LLAMA_MOE_CACHE_VERIFY")) != 0;
+        if (!on || mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || released) {
+            return;
+        }
+        for (device & d : devices) {
+            if (d.upload_bg != nullptr) {
+                d.upload_bg_done(d.backend, std::max(d.half_ticket[0], d.half_ticket[1]), true);
+            }
+            if (d.backend != nullptr) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        size_t n_checked = 0, n_bad = 0, n_pending = 0;
+        std::vector<uint8_t> back;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_expert = (int32_t) g.ref[0]->ne[2];
+            for (int32_t sl = 0; sl < res_slots(g); ++sl) {
+                const int32_t key = g.key_of_slot[sl];
+                if (key < 0 || lent_slot(g, sl)) {
+                    continue;
+                }
+                layer & l = layers[key / n_expert];
+                const int32_t e = key % n_expert;
+                if (g.slot_pending[sl] || l.slot_of[e] != sl) {
+                    n_pending++;
+                    continue;
+                }
+                bool bad = false;
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const size_t sz = l.experts[ip]->nb[2];
+                    back.resize(sz);
+                    ggml_backend_tensor_get(g.banks[ip], back.data(), (size_t) sl*sz, sz);
+                    bad = bad || memcmp(back.data(), (const uint8_t *) l.experts[ip]->data + (size_t) e*sz, sz) != 0;
+                }
+                n_checked++;
+                if (bad && n_bad++ < 8) {
+                    LLAMA_LOG_WARN("%s: layer %d expert %d in slot %d differs from the host expert\n", __func__, key / n_expert, e, sl);
+                }
+            }
+        }
+        LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_CACHE_VERIFY %s: %zu resident experts read back, %zu differ (%zu still uploading)\n",
+            when, n_checked, n_bad, n_pending);
     }
 
     // hot spare mode: write the resident experts, then the other experts with a score, best first, in the format of --moe-cache-hot
