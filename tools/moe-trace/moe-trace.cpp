@@ -3,6 +3,9 @@
 // LLAMA_MOE_TRACE_HIDDEN=16,32 also saves the inputs of those layers (float16) for every
 // LLAMA_MOE_TRACE_HIDDEN_STRIDE-th prompt token (default 16) and around each generated segment's start:
 // <out>.hid.npy [n_rows, n_layers, n_embd], the rows' positions in the json's "hidden"
+// LLAMA_MOE_TRACE_GATE=1 also saves the gate of the per-layer n-gram embeddings (Qwen3.8-Flash-Next's engram, the
+// "ple_gate" tensor: how much of its lookup each token mixes in, one value per hyper-connection stream) for every token:
+// <out>.gate.npy float32 [n_tokens, n_ple_layers, n_streams]
 
 #include "arg.h"
 #include "chat.h"
@@ -40,6 +43,9 @@ struct moe_trace_data {
     int64_t n_expert_used = 0;
     std::map<int, moe_layer_info> layers;
     std::vector<int32_t> buf;
+    bool gate = false;                       // LLAMA_MOE_TRACE_GATE
+    std::map<int, std::vector<float>> gates; // PLE layer -> [n_tokens, n_streams]
+    int64_t n_streams = 0;
 };
 
 // parse the layer index of a "name-il" tensor
@@ -61,6 +67,8 @@ static bool moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
 
     int il = -1;
     const bool is_topk = moe_trace_layer(t->name, "ffn_moe_topk", il);
+    int il_gate = -1;
+    const bool is_gate = data->gate && moe_trace_layer(t->name, "ple_gate", il_gate);
 
     if (ask) {
         // the expert tensors are seen when the graph is planned, their data is not needed
@@ -86,7 +94,18 @@ static bool moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
                 info.types[name] = ggml_type_name(w->type);
             }
         }
-        return is_topk;
+        return is_topk || is_gate;
+    }
+
+    if (is_gate) {
+        // [1, n_streams, n_tokens] f32
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[0] == 1 && ggml_is_contiguous(t));
+        data->n_streams = t->ne[1];
+        auto & g = data->gates[il_gate];
+        const size_t start = g.size();
+        g.resize(start + t->ne[1]*t->ne[2]);
+        ggml_backend_tensor_get(t, g.data() + start, 0, ggml_nbytes(t));
+        return true;
     }
 
     if (!is_topk) {
@@ -157,6 +176,7 @@ int main(int argc, char ** argv) {
     // LLAMA_MOE_TRACE_OFF=1 runs the same generation without observing the graph, to check that tracing does not change it and to time it
     moe_trace_data data;
     data.enabled = getenv("LLAMA_MOE_TRACE_OFF") == nullptr;
+    data.gate = getenv("LLAMA_MOE_TRACE_GATE") != nullptr && atoi(getenv("LLAMA_MOE_TRACE_GATE")) != 0;
 
     // without tracing the callback is not set: with one, the scheduler waits for each split to finish
     if (data.enabled) {
@@ -447,6 +467,28 @@ int main(int argc, char ** argv) {
             }
         }
         meta["pruned_layers"] = pruned;
+        if (!data.gates.empty()) {
+            json gl = json::array();
+            std::vector<float> g;
+            g.reserve(n_tokens*data.gates.size()*data.n_streams);
+            for (const auto & [il, v] : data.gates) {
+                if (v.size() != (size_t) n_tokens*data.n_streams) {
+                    LOG_ERR("%s: the gate of layer %d has %zu values, expected %d x %lld\n", __func__, il, v.size(), n_tokens, (long long) data.n_streams);
+                    return 1;
+                }
+                gl.push_back(il);
+            }
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                for (const auto & [il, v] : data.gates) {
+                    g.insert(g.end(), v.begin() + t*data.n_streams, v.begin() + (t + 1)*data.n_streams);
+                }
+            }
+            meta["gate"] = { { "layers", gl }, { "streams", data.n_streams } };
+            if (!write_npy(params.out_file + ".gate.npy", "<f4", g.data(), sizeof(float), { (size_t) n_tokens, data.gates.size(), (size_t) data.n_streams })) {
+                LOG_ERR("%s: failed to write %s.gate.npy\n", __func__, params.out_file.c_str());
+                return 1;
+            }
+        }
         if (!write_npy(params.out_file + ".npy", "<i2", out.data(), sizeof(int16_t), { (size_t) n_tokens, moe_layers.size(), n_used })) {
             LOG_ERR("%s: failed to write %s.npy\n", __func__, params.out_file.c_str());
             return 1;
