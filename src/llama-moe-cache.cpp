@@ -1978,8 +1978,16 @@ struct llama_moe_cache::impl {
             return;
         }
         verify_resident("before a release");
-        // the uploads in flight write to the banks
+        // the uploads in flight write to the banks; so do the ones recorded and not submitted yet, with their copies to
+        // the staging memory: they go now, before the banks are freed (left recorded, the next submission ran them into
+        // whatever took the banks' memory, with staging the next uploads had filled - the compute buffer of a released
+        // prompt, whose first submission is LLAMA_OFFLOAD_FAST's: fn-drift-ctx)
         finish_submits();
+        for (device & d : devices) {
+            if (d.bg_recorded) {
+                submit_bg(d);
+            }
+        }
         for (device & d : devices) {
             if (!d.buf) {
                 continue;
