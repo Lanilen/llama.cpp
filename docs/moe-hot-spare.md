@@ -200,8 +200,11 @@ presets, two passes each):
 
 The answers after them generated as fast. `LLAMA_OFFLOAD_FAST_CHECK=1` reads every part back after its upload and
 compares it with the host weights: all 29,104 parts of a run were the same. Two of seven answers came out with other
-text than today's, the same in every run with it. They were also the same with the check on, which waits for every
-upload, so they don't come from the copied data.
+text than today's, the same in every run with it: the faster copies change the timing of the cache's own uploads, so a
+few other experts are resident afterwards (hit rates 85.11% against 84.96%), and where an answer's experts run changes
+its rounding. A long greedy answer read again in batches of 1 agrees with itself as well with the faster copies as
+without them (llama-moe-logit-drift, 512 tokens after a released 1,075-token prompt: 91.4% of the top tokens the same,
+mean KL 0.0529, against 92.0% and 0.0530).
 
 With the faster copies, releasing the cache pays off sooner, and the split's best limit moves down. On the R9700,
 kept 2.3k-token prompts read at 249-251 tok/s against 204 released, and 3.6k-token prompts at 256 against 298 released.
