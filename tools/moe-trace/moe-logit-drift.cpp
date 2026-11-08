@@ -373,6 +373,9 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // LLAMA_DRIFT_SEGMENTS=N: each round also reports its flips and mean KL in N equal spans of the answer's positions
+    const int n_seg = std::max(0, atoi(getenv("LLAMA_DRIFT_SEGMENTS") ? getenv("LLAMA_DRIFT_SEGMENTS") : "0"));
+
     for (const auto & r : rounds) {
         const bool reject = r[0] == 'r';
         const int L = atoi(r.c_str() + (reject ? 1 : 0));
@@ -388,14 +391,23 @@ int main(int argc, char ** argv) {
         std::vector<double> dm;
         int flips = 0, read = 0;
         double sum_kl = 0;
+        std::vector<int> seg_n(n_seg), seg_flips(n_seg);
+        std::vector<double> seg_kl(n_seg);
         auto compare = [&](int pos, const float * l) {
             int a, b, c, d;
             top2(base.at(pos), n_vocab, a, b);
             top2(l, n_vocab, c, d);
             flips += c != a;
             dm.push_back(std::fabs((l[a] - l[b]) - (base.at(pos)[a] - base.at(pos)[b])));
-            sum_kl += kl(base.at(pos), l, n_vocab);
+            const double k = kl(base.at(pos), l, n_vocab);
+            sum_kl += k;
             read++;
+            if (n_seg > 0) {
+                const int sg = std::min(n_seg - 1, (int) ((int64_t) pos * n_seg / n));
+                seg_n[sg]++;
+                seg_flips[sg] += c != a;
+                seg_kl[sg] += k;
+            }
         };
         compare(0, llama_get_logits_ith(ctx, -1));
 
@@ -430,6 +442,12 @@ int main(int argc, char ** argv) {
         }
         printf("%-6s | %5d | %5d | %6.2f%% | %9.6f | %27.4f %7.4f %7.4f | %7.1f\n", r.c_str(), read, flips, 100.0 * (read - flips) / read,
                 sum_kl / read, pct(dm, .5), pct(dm, .9), pct(dm, 1.0), pct(t_batches, .5));
+        for (int sg = 0; sg < n_seg; ++sg) {
+            // the positions of the context the span covers (the prompt's tokens come first)
+            const int p0 = (int) prompt.size() + (int) ((int64_t) sg * n / n_seg), p1 = (int) prompt.size() + (int) ((int64_t) (sg + 1) * n / n_seg);
+            printf("  ctx %5d-%5d | %5d | %5d | %6.2f%% | %9.6f\n", p0, p1 - 1, seg_n[sg], seg_flips[sg],
+                    seg_n[sg] ? 100.0 * (seg_n[sg] - seg_flips[sg]) / seg_n[sg] : 0.0, seg_n[sg] ? seg_kl[sg] / seg_n[sg] : 0.0);
+        }
         fflush(stdout);
     }
 
