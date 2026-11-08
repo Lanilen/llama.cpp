@@ -18,19 +18,22 @@ llama-server -m model.gguf -ngl 99 --n-cpu-moe 48 \
     --moe-cache-mode hot-spare --moe-cache-mib 8600
 ```
 
-On the 2x RX 480 machine generation went from 11.7 to 14.5 tok/s with MTP, and a 9.6k-token prompt from 36.5 to 86
-tok/s with `--moe-cache-resize` ([Measured](#measured)). On the R9700, Flash-Next UD-Q4_K_XL went from 16.8 to 25.9 tok/s
-with the cache alone, and to 41 tok/s with everything in this guide and the [predictor](moe-predictor.md)
-([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups)).
+On the 1920X + RX480x2 generation went from 11.7 to 14.5 tok/s with MTP, and a 9.6k-token prompt from 36.5 to 86
+tok/s with `--moe-cache-resize` ([Measured](#measured)). On the 1920X + R9700, Flash-Next UD-Q4_K_XL went from 16.8 to
+25.9 tok/s with the cache alone, and to 42.34 tok/s (by the balance of the tuning script's requests) with everything in
+this guide and the [predictor](moe-predictor.md)
+([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
 
 ## Contents
 
 - [How it works](#how-it-works): [the hot spare](#the-hot-spare), [choosing the resident experts](#choosing-the-resident-experts),
   [the predictor](#a-learned-predictor---moe-cache-predictor), [the two branches at the same time](#the-two-branches-at-the-same-time),
   [work beside the MoE](#work-beside-the-moe), [faster copies to the CPU](#faster-copies-to-the-cpu),
-  [prompts](#prompts---moe-cache-resize), [medium prompts](#medium-prompts---moe-cache-jit),
   [the CPU's experts](#the-cpus-experts), [Vulkan submits](#vulkan-submits),
   [changes that apply without any option](#changes-that-apply-without-any-option)
+- [Prompts](#prompts---moe-cache-resize): [which batches keep the cache](#which-batches-keep-the-cache---moe-cache-batch),
+  [medium prompts](#medium-prompts---moe-cache-jit), [splitting a prompt](#splitting-a-prompt-llama_moe_resize_split),
+  [released prompts](#released-prompts-the-fast-expert-copies)
 - [Reference](#reference): [options](#options), [environment variables](#environment-variables), [tuning](#tuning)
 - [Sizing the cache](#sizing-the-cache)
 - [Speculative decoding with MTP](#speculative-decoding-with-mtp)
@@ -43,8 +46,8 @@ with the cache alone, and to 41 tok/s with everything in this guide and the [pre
 
 With the experts in host memory, every MoE layer of a generated token goes: attention and router on the GPU, the layer's
 input copied to the CPU, about ten selected experts computed on the CPU from system memory, the result copied back, and the
-next layer on the GPU. The GPUs wait while the CPU works; on the RX 480 machine the CPU's experts were about 45 of the 100 ms
-of a token.
+next layer on the GPU. The GPUs wait while the CPU works; on the 1920X + RX480x2 the CPU's experts were about 45 of the
+100 ms of a token.
 
 Upstream's MoE cache (`--moe-cache-mode lru`, the default mode) keeps experts in VRAM and uploads every selected expert that
 is missing before the layer runs on the GPU. The RX 480s sit on PCIe 3.0 x8 and x16, at 5.7-11 GB/s: uploading a 2.3 MiB
@@ -63,8 +66,8 @@ output, which is then weighted and summed as usual. The result matches running a
 floating-point rounding: the GPU computes the resident experts with its own kernels, which round differently from the
 CPU's, and the weighting and sum can run on another device, in another order. Results can differ in the last bits, and
 greedy generations can drift apart over long outputs. Small per-layer maps (one in host memory for the CPU
-branch, two on the GPU) say which branch owns each expert. Batches of more than 32 tokens, prompts, use most experts of a
-layer and run as before.
+branch, two on the GPU) say which branch owns each expert. Larger batches, prompts, use most experts of a layer; how they
+run is in [Prompts](#prompts---moe-cache-resize).
 
 By default each layer's experts are cached on the GPU of that layer, so that its activations never travel between GPUs;
 `--moe-cache-mib N1,N2` gives each GPU its own size.
@@ -76,6 +79,14 @@ A small CPU operation counts each layer's selections. Between ubatches the cache
 `--moe-cache-margin`, up to `--moe-cache-budget` MiB of uploads per token; empty slots are filled without counting. After a
 prompt it rebalances once without a budget, unless it started from a hot file, and after the first `--moe-cache-refill`
 generated tokens once more from those tokens alone.
+
+The refill moves up to the whole cache in one step, and the generation waits for its copies
+(`LLAMA_MOE_CACHE_REFILL_BG=1` spreads it over the next ubatches instead). It pays on long sessions (14.1 against
+13.9 tok/s over the [5-turn session](#measured)); on a single short answer `--moe-cache-refill 0` can be faster. With a
+predictor the refill is off by default.
+
+A saved set from one kind of work (code, chat, a language) is a good start for the same kind of work: run once with
+`--moe-cache-save code.hot`, then start later runs with `--moe-cache-hot code.hot`.
 
 Uploads do not stop generation: the generation thread records them into a background batch on the GPU's transfer queue,
 from pinned staging memory of that GPU, and a worker thread copies the experts into the staging memory. The batch is
@@ -94,9 +105,10 @@ the selections so far. With one:
   instead of the scores;
 - **the refill is off** unless set (`--moe-cache-refill N`);
 - **`--moe-cache-predictor-answer-cap N`** limits the answer's start to the N best swaps and leaves the rest to the
-  budget. A full rebalance buys about a point of hits with uploads that cost more than it saves. On Flash-Next with
-  the 1920X + R9700, 1000 sped up agent turns by 8–12% for up to 2.6% of the usual answers, and the tuning script found
-  500 better still: agent turns 46.8 tok/s against 44.2 at 1000, the usual answers the same;
+  budget. A full rebalance buys about a point of hits with uploads that cost more than it saves. On Flash-Next Q4_K_XL
+  with the 1920X + R9700, 1000 sped up agent turns by 8–12% for up to 2.6% of the usual answers, and 500 was better
+  still: agent turns 46.8 tok/s against 44.2 at 1000, the usual answers the same. The tuning script picks 500 for Q4_K_XL
+  and 125 for Q6_K_XL there ([Tuning](#tuning));
 - **`--moe-cache-predictor-start FILE`**, a second file, predicts from a turn's text before its prompt runs, so its
   experts upload while a short prompt computes.
 
@@ -122,8 +134,9 @@ computes them in that wait rather than after the CPU's experts.
   where they are first used, as before.
 - The kernels and their inputs don't change, so neither do the logits (`LLAMA_MOE_SIDE=0` turns it off, to compare).
 
-On the R9700 with the setup in [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) at the time (`llama-server`, MTP with 2 drafts, temperature 0,
-four runs each), a pass of the model took 3.2 ms less with both quants:
+On the 1920X + R9700 (`llama-server` with the setup in
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups), MTP with 2 drafts, temperature 0, four
+runs each), a pass of the model took 3.2 ms less with both quants:
 
 | | answers | agent turns | a pass of the model |
 | --- | --- | --- | --- |
@@ -138,167 +151,12 @@ positions gave the same flips and the same KL with and without it.
 
 ### Faster copies to the CPU
 
-Every split that runs on the CPU first reads its inputs from the GPUs. These reads were synchronous, a submission and a
-fence wait each, about 140 us on the RX 480's driver, 49 times per token. The scheduler now queues them as asynchronous
-reads and waits once per GPU; with the overlap, the reads are queued before the event, so the event wait delivers them.
-On Vulkan, an asynchronous read into memory that is not pinned for that GPU now gets its own part of a staging ring, and its
-copy runs when the GPU or the event is synchronized (`GGML_SCHED_ASYNC_READS=0` restores the synchronous reads).
-
-### Prompts: `--moe-cache-resize`
-
-A prompt batch copies the experts of every layer to the GPU once, so larger ubatches make prompts faster (on the RX 480
-machine a 9.7k-token prompt read at 40 tok/s with `-ub 512` and 84 tok/s with `-ub 2048`), but their compute buffers grow
-too. With `--moe-cache-resize` the cache and those buffers take turns:
-
-- **A large batch** waits for the cache's uploads, frees its GPU memory (keeping the scores and the resident set), waits
-  until the driver reports that memory free, and reserves the compute buffers for `-ub` tokens.
-- **The next small batch** frees those buffers, allocates the cache again, uploads its experts in the background and
-  reserves compute buffers for the small batches.
-
-**Which batches keep the cache** (`--moe-cache-batch N`, default 512, 0 = `-ub`). After the cache comes back the first
-time and 64 tokens have been generated (until then the free memory that RADV reports can still drop by about a GB), the
-context measures the compute buffers of a reserve for N tokens without allocating them. It reserves them if they fit in
-the free GPU memory with 256 MiB to spare, and otherwise tries half the size, down to 32. Batches up to the size that
-fits keep the cache and run on the hot spare, so a medium prompt such as a tool output neither copies every expert to
-the GPU nor uploads the cache again. The log says `MoE cache resize: batches of up to N tokens keep the cache`.
-
-**With an MTP draft context**, the two share what's left. The main context measures its buffers for each size and waits
-at 32 tokens, the draft picks the largest size that fits both, and the main context takes its share. If either then
-finds less room, the other follows it down. (The draft's buffers for a batch can be larger than the main context's: on
-the R9700, 2048-token reserves for both spilled into system memory and generation fell from 26 to 8.5 tok/s.) On the
-R9700 this fit kept the cache for prompts of up to 1024 tokens: follow-up turns took 51.5 s instead of 127 on Q4 and 57
-instead of 158 on Q6. On the RTX 4070 Ti (a 35B model with a 3000 MiB cache and a 9B draft, follow-ups of about
-350 tokens), it kept 1024 tokens instead of 128, and those prompts took 1.8–2.0 s instead of 3.2–3.7.
-
-**Larger batches that keep the cache anyway** (`LLAMA_MOE_RESIZE_SPLIT=N`). A batch of up to N tokens that is too large
-for the buffers that fit keeps the cache all the same and runs in ubatches of that size, instead of releasing it. Its
-experts then come from the cache, the jit and the CPU, not from a copy of every expert, and the restore after it goes.
-The MTP draft's context follows the same rule, so its buffers stay small too. On the R9700 with a 20900 MiB cache
-(batches of up to 1024 tokens fit), `LLAMA_MOE_RESIZE_SPLIT=4096` made prompts of 1.9k–2.3k tokens 14–69% faster on Q4
-(turn1 125 → 211 tok/s) and 23–76% faster on Q6 (97 → 172). Generation was as fast or faster, and a set of requests
-with agent turns took 14 s less on Q4 and 27 s less on Q6. Prompts of 13k tokens and more still release the cache, at
-the same speed as before. 8192 measured the same as 4096, since no request fell between the two.
-
-**Faster copies for large batches** (`LLAMA_OFFLOAD_FAST=1`). A batch that releases the cache runs its experts from
-copies the scheduler makes of the host weights, every used expert of every layer, about 67 GiB per ubatch for
-Flash-Next Q4. The weights are mmapped, which isn't memory the GPU can read directly. So the Vulkan backend copies
-each part on one thread into a staging buffer, uploads it, and waits for the device before the next. On the R9700,
-released prompts of 5k-13k tokens spent 58 of their 88 s in those copies, at 5.8 GiB/s, with the GPU idle meanwhile.
-With `LLAMA_OFFLOAD_FAST=1` the copies go through the cache's own pinned staging memory and background uploads: the
-copy threads fill one half while the other half uploads, and the next graph waits for the uploads on the device. The
-same copies then took 21 s instead of 93 (26 GiB/s while copying). Prompts that release the cache (Q4, Local Coder's
-presets, two passes each):
-
-| prompt | today | `LLAMA_OFFLOAD_FAST=1` |
-| --- | --- | --- |
-| 4.8k tokens | 255 tok/s | 352 (+38%) |
-| 6.7k | 329 | 435 (+32%) |
-| 9.3k | 405 | 522 (+29%) |
-| 12.3k | 472 | 599 (+27%) |
-| 19.0k | 466 | 534 (+15%) |
-| 31.4k | 547 | 661 (+21%) |
-
-The answers after them generated as fast. `LLAMA_OFFLOAD_FAST_CHECK=1` reads every part back after its upload and
-compares it with the host weights: all 29,104 parts of a run were the same. Two of seven answers came out with other
-text than today's, the same in every run with it: the faster copies change the timing of the cache's own uploads, so a
-few other experts are resident afterwards (hit rates 85.11% against 84.96%), and where an answer's experts run changes
-its rounding. A long greedy answer read again in batches of 1 agrees with itself as well with the faster copies as
-without them (llama-moe-logit-drift, 512 tokens after a released 1,075-token prompt: 91.4% of the top tokens the same,
-mean KL 0.0529, against 92.0% and 0.0530).
-
-With the faster copies, releasing the cache pays off sooner, and the split's best limit moves down. On the R9700,
-kept 2.3k-token prompts read at 249-251 tok/s against 204 released, and 3.6k-token prompts at 256 against 298 released.
-`LLAMA_MOE_RESIZE_SPLIT=3072` made a run of prompts of 1.3k-3.6k tokens 4% shorter on Q4 and 5% on Q6 than 4096.
-
-**The backends' own memory.** Backends keep memory of their own between graphs, sized by the largest graph so far and
-outside the scheduler's buffers: the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch
-grows them a lot (the sparse attention top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at
-59k cells and `-ub 8192`). With the cache back on top of them, the GPU was overcommitted: the driver moved memory to the
-host and generation stayed at 7 tok/s instead of 20. So when large batches end, and at the next small batch after a
-medium one, the context gives them back (`ggml_backend_release_scratch`, Vulkan only) before the cache comes back.
-
-**Host weights stay on the host.** The CPU branch is pinned to the CPU and the small reserve does not offload host
-weights, so a small batch never copies a layer's experts to the GPU. A context without the cache, such as an MTP draft,
-follows the same option with its compute buffers only: it reserves for 31 tokens (below the 32 at which ggml offloads an
-operation on host weights to a GPU), or for the main context's small batches once it has measured them, and holds its
-large buffers only while each of its large batches runs.
-
-### Medium prompts: `--moe-cache-jit`
-
-A batch of more than 32 tokens that keeps the cache (up to the size that fits, see above) runs on the hot spare but
-doesn't swap: its resident experts were picked for generation. On Flash-Next Q4_K_XL with a 20900 MiB cache, 57-70% of
-such a batch's selections hit, and the CPU's experts were about 80% of its time. With `--moe-cache-jit N`, each layer of
-such a batch, just before its cache branch runs:
-
-- reads the experts its tokens selected (the router's output, which the CPU branch waits for anyway);
-- picks the ones that aren't resident and that at least N of its tokens select, the most selected first, up to
-  `LLAMA_MOE_CACHE_JIT_SLOTS` (64);
-- copies them into pinned staging memory on worker threads and uploads them in the background, into slots after the
-  resident ones that all the layers of a group share;
-- points its maps at them: the CPU branch skips those experts and the cache branch runs them.
-
-Only the cache branch waits for those uploads, on the GPU (`ggml_backend_upload_bg_require`), and the device maps are
-written from pinned memory, so the CPU starts its experts without waiting. Without that, each layer's upload finished
-before its CPU experts started, which gave back most of the gain (at 512 tokens and N=4, -6.8% instead of -29.7%). The slots come
-out of the cache: 64 per group of layers with the same expert layout (Flash-Next has four: 256 slots, 4-5% of the resident
-experts), and generation's hit rate dropped by under a point. It's off by default: the best N depends on the link and the CPU (an expert
-is worth uploading when its tokens cost the CPU more than its copy and upload), and it hasn't been measured on the RX 480s.
-
-On the R9700 (PCIe 3.0 x16), a prompt in batches of S tokens after 96 generated ones (`llama-moe-logit-drift` with
-`LLAMA_DRIFT_PROMPT`), ms per batch:
-
-| S | Q4_K_XL, off | `--moe-cache-jit 8` | Q6_K_XL, off | `--moe-cache-jit 8` |
-| --- | --- | --- | --- | --- |
-| 64 | 548 | 538 (-1.8%) | | |
-| 128 | 977 | 849 (-13%) | 1304 | 1118 (-14%) |
-| 256 | 1861 | 1412 (-24%) | | |
-| 512 | 3520 | 2553 (-27%) | 4294 | 3172 (-26%) |
-| 1024 | 6741 | 4817 (-29%) | | |
-| 2048 | | | 15413 | 10766 (-30%) |
-
-N=4 was 2-3 points better from 512 tokens up, where every layer fills its 64 slots. N=2 made small batches slower (+59%
-at 64 tokens, +35% at 128): too many experts to copy for the tokens they take from the CPU. In `llama-server` with an MTP
-draft (batches of up to 1024 tokens keep the cache there) and the requests of a coding session, two passes each (Q6's
-off runs read one 324-token prompt more, about 3 s, after a miss of the prompt cache):
-
-| | prompts of 33-1024 tokens | generation, answers / agent turns | hits in generation | whole run |
-| --- | --- | --- | --- | --- |
-| Q4_K_XL, off | 91.7 tok/s | 32.5 / 29.2 tok/s | 84.0% | 300 s |
-| Q4_K_XL, `--moe-cache-jit 8` | 120.3 tok/s | 33.1 / 28.7 tok/s | 83.2% | 289 s |
-| Q6_K_XL, off | 78.7 tok/s | 27.5 / 24.8 tok/s | 73.3% | 362 s |
-| Q6_K_XL, `--moe-cache-jit 8` | 98.3 tok/s | 27.3 / 24.3 tok/s | 72.6% | 349 s |
-
-The output is the same up to rounding, as for the resident experts: read again in batches of 64-256 tokens, the
-positions of a greedy answer in batches of 1 move by a mean KL of 0.0011-0.0012 with or without it (Q4, also with N=1). With `-v`
-the cache's statistics at exit add a line for it: experts uploaded per layer run, how many were left out for want of
-slots, the share of the misses' selections they took from the CPU, and its time per layer run.
-
-With the settings of the tuning script's search on the 1920X + R9700 (Q4, 3 drafts, an answer cap of 500), 4 and 8 gave
-the same whole agent turns, 8% faster than without. 4 cost less generation: 41.87 tok/s against 41.53, and 43.57
-without. So the search picked 4.
-
-**Slots shared with the resident set** (`LLAMA_MOE_CACHE_JIT_SHARE=1`). By default the jit's slots come out of the
-cache, so generation gives them up for good: 2-3% of Q4's generation at N=4 on the R9700. Shared, they are resident slots
-too, and a batch that uses the jit borrows slots only while it runs. Before such a batch (and before the cache is
-restored for it), each group lends the jit the slots of its weakest residents: empty slots first, none that an upload is
-writing to. The experts in them leave the resident set, and the jit uploads into those slots, wherever they are. When
-the next batch that doesn't use the jit comes, the slots come back empty, and the refreshes fill them; those fills don't
-count against the answer cap, since the cache had them before. Lending the fixed jit slots instead was slower:
-the refill after a batch puts the best missing experts into the empty slots first, so the next lend evicted strong
-experts, and prompts of 150-350 tokens ran 7-17% slower.
-
-With sharing, more slots cost generation little, but a small batch gains nothing from them.
-`LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N` caps a layer's uploads, and the slots lent, at one per N tokens of the ubatch,
-with a floor of 64. On the R9700 with `LLAMA_MOE_RESIZE_SPLIT=4096` (fn-share2: Local Coder's presets, two passes, against
-the split alone), 128 slots with N=8 gave:
-
-| | prompts of 1.9k-2.3k tokens | prompts of 150-350 tokens | generation: short answers / follow-ups / agent turns | whole run |
-| --- | --- | --- | --- | --- |
-| Q4_K_XL | 162-209 → 218-270 tok/s (+29-31%) | -1 to -5% | -0.79 / -0.45 / +0.35 tok/s | 235.6 → 218.8 s |
-| Q6_K_XL | | | -0.09 / -0.77 / -0.09 tok/s | 286.1 → 272.8 s |
-
-256 slots were no better than 128. The jit's own check (`LLAMA_MOE_CACHE_JIT_CHECK=1`: every upload read back, the maps
-checked) found no difference in 180,360 uploads.
+Every split that runs on the CPU first reads its inputs from the GPUs. Done as synchronous reads, each is a submission
+and a fence wait, about 140 µs on the RX 480's driver, 49 times per token. The scheduler queues them as asynchronous
+reads instead and waits once per GPU; with the overlap, the reads are queued before the event, so the event wait
+delivers them. On Vulkan, an asynchronous read into memory that is not pinned for that GPU gets its own part of a
+staging ring, and its copy runs when the GPU or the event is synchronized (`GGML_SCHED_ASYNC_READS=0` restores the
+synchronous reads).
 
 ### The CPU's experts
 
@@ -316,7 +174,8 @@ things held them back:
   `GGML_CPU_MMID_FLAT=C` lines up the rows of all active experts and hands them out in chunks of C rows, taken
   dynamically, for up to 8 tokens per expert. The logits don't change.
 
-On the R9700 setup of [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups), with both against without (two passes each):
+On the 1920X + R9700 with the setup of [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups),
+with both against without (two passes each):
 
 | | usual answers | follow-up turns | agent turns | whole run |
 | --- | --- | --- | --- | --- |
@@ -325,11 +184,10 @@ On the R9700 setup of [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polari
 
 By verify batch size (`llama-moe-logit-drift`, 1/3/8 tokens), `GGML_CPU_MMID_FLAT` 128 was the best of 64–512 (512 was
 7–16% slower), and the spin was worth as much as `OMP_WAIT_POLICY=active`, which spins forever. The chunks don't suit every
-CPU: on an i5-14600KF (6 performance and 8 efficiency cores, 10 threads), Qwen3-Coder-30B-A3B entirely on the CPU wrote
-the same text at 6.36 tok/s with 128 against 7.07 without (one run each). `moe-cache-tune.py`'s `cpu-chunks` stage
-keeps them off where they lose. `GGML_CPU_OP_STATS=1`
-prints, per batch size at exit, each CPU op's wall time, its threads' work and the time before they start, and
-MUL_MAT_ID's experts and GB/s by weight type.
+CPU: on the 14600KF + RTX 4070 Ti (6 performance and 8 efficiency cores, 10 threads), Qwen3-Coder-30B-A3B entirely on
+the CPU wrote the same text at 6.36 tok/s with 128 against 7.07 without (one run each). `moe-cache-tune.py`'s
+`cpu-chunks` stage keeps them off where they lose. `GGML_CPU_OP_STATS=1` prints, per batch size at exit, each CPU op's
+wall time, its threads' work and the time before they start, and MUL_MAT_ID's experts and GB/s by weight type.
 
 ### Vulkan submits
 
@@ -338,9 +196,9 @@ cuts at 1/40 of the previous graph's flops (doubling for the first three submits
 many splits that alternate large and small, so a large split is cut by a small one's measure: on Flash-Next, 5.4
 submits of ~20 µs each per split. `GGML_VK_FLOPS_PER_SUBMIT=N` sets a fixed target instead (0 = not by flops).
 
-On the R9700, a 3-token verify pass of Q4 was 21.1 ms of recording and submitting, 2.1 ms of copies, 5.1 ms waiting for
-the GPU and 20.9 ms of CPU experts (`GGML_SCHED_TIMING=1`, `GGML_VK_HOST_TIMING=1`). One submit per split saved 8 ms of
-recording but the GPU started 10 ms later, 2–3% slower. A fixed target, end to end with the setup of
+On the 1920X + R9700, a 3-token verify pass of Q4 was 21.1 ms of recording and submitting, 2.1 ms of copies, 5.1 ms
+waiting for the GPU and 20.9 ms of CPU experts (`GGML_SCHED_TIMING=1`, `GGML_VK_HOST_TIMING=1`). One submit per split
+saved 8 ms of recording but the GPU started 10 ms later, 2–3% slower. A fixed target, end to end with the setup of
 [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) (two passes each):
 
 | | usual answers | agent turns |
@@ -368,13 +226,238 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: split_k also for a matrix multiplication with fewer columns than a tile (9-31 tokens), not only from a whole tile | all Vulkan GPUs | `GGML_VK_SPLIT_K_SMALL_N=0` |
 | Vulkan: a mat-vec MUL_MAT followed by SCALE and SiLU or sigmoid runs as one dispatch, the two in its store (`moe-tuning`) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1` |
 
-On the RTX 4070 Ti, a model with its experts on the CPU and no cache generated 29.2 instead of 26.6 tok/s with the first
-four.
+On the 14600KF + RTX 4070 Ti, a model with its experts on the CPU and no cache generated 29.2 instead of 26.6 tok/s
+with the first four.
 
 The split_k change: a 4x10240 f32 weight times 9-31 tokens ran on one workgroup (0.9-1.1 ms on the R9700, against 0.15
 ms at 32 tokens split 8 ways), about 90 ms of a 9-24 token batch of Flash-Next; batches of 9, 16 and 24 tokens (short
 prompts and tool outputs) went from 273, 339 and 427 ms to 168, 218 and 275 on Q4_K_XL. `test-backend-ops -o MUL_MAT` has
 cases for it. The store fusion: see [Fusion](#fusion).
+
+## Prompts: `--moe-cache-resize`
+
+A prompt batch of more than 32 tokens uses most experts of each layer. Without `--moe-cache-resize` it runs as without
+the cache: the scheduler copies every expert the batch uses from host memory to the GPU, layer by layer, and the cache
+stays as it is. Larger ubatches make that faster, since each ubatch copies the experts once (on the 1920X + RX480x2 a
+9.7k-token prompt read at 40 tok/s with `-ub 512` and 84 tok/s with `-ub 2048`), but their compute buffers grow too.
+With `--moe-cache-resize` the cache and those buffers take turns, and a batch runs one of four ways, by its size:
+
+| batch | the cache | its experts | set by |
+| --- | --- | --- | --- |
+| up to 32 tokens: generation, verify passes | kept | the resident ones on the GPU, the others on the CPU ([the hot spare](#the-hot-spare)) | |
+| up to the size whose compute buffers fit next to the cache: short prompts, tool outputs | kept | the same, plus those that `--moe-cache-jit` uploads for the batch | [`--moe-cache-batch`](#which-batches-keep-the-cache---moe-cache-batch), [`--moe-cache-jit`](#medium-prompts---moe-cache-jit) |
+| larger, up to `LLAMA_MOE_RESIZE_SPLIT` tokens | kept, the batch runs in ubatches of the size that fits | the same | [`LLAMA_MOE_RESIZE_SPLIT`](#splitting-a-prompt-llama_moe_resize_split) |
+| larger still | released while the batch runs | every used expert on the GPU, from copies of the host weights | `-ub`, [`LLAMA_OFFLOAD_FAST`](#released-prompts-the-fast-expert-copies) |
+
+On the 1920X + R9700 with the setup of [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) (a
+20900 MiB cache, `-ub 16384`, an MTP draft), batches of up to 1024 tokens keep the cache, the split keeps it up to 3072
+tokens, and longer prompts release it.
+
+**Releasing and restoring the cache.**
+
+- **A batch that releases the cache** waits for the cache's uploads, frees its GPU memory (keeping the scores and the
+  resident set), waits until the driver reports that memory free, and reserves the compute buffers for `-ub` tokens.
+- **The next batch that keeps it** frees those buffers, allocates the cache again, uploads its experts in the background
+  (the resident set if it came from `--moe-cache-hot`, the predicted set with a predictor, otherwise the refresh fills
+  the slots from the scores) and reserves compute buffers for the batches that keep the cache. Each switch back costs one
+  upload of the cache, about a second for 7 GB.
+
+It is meant for one sequence at a time (`-np 1`): with several, prompt chunks and generation mix and every mixed batch
+switches. How to size the cache with it: [Sizing with `--moe-cache-resize`](#sizing-with---moe-cache-resize).
+
+**The backends' own memory.** Backends keep memory of their own between graphs, sized by the largest graph so far and
+outside the scheduler's buffers: the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch
+grows them a lot (the sparse attention top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at
+59k cells and `-ub 8192`). With the cache back on top of them, the GPU was overcommitted: the driver moved memory to the
+host and generation stayed at 7 tok/s instead of 20. So when large batches end, and at the next small batch after a
+medium one, the context gives them back (`ggml_backend_release_scratch`, Vulkan only) before the cache comes back.
+
+**Host weights stay on the host.** The CPU branch is pinned to the CPU and the small reserve does not offload host
+weights, so a batch that keeps the cache never copies a layer's experts to the GPU. A context without the cache, such as
+an MTP draft, follows the same option with its compute buffers only: it reserves for 31 tokens (below the 32 at which
+ggml offloads an operation on host weights to a GPU, `GGML_OP_OFFLOAD_MIN_BATCH`), or for the main context's small
+batches once it has measured them, and holds its large buffers only while each of its large batches runs. The draft can
+then read prompts in large ubatches (`--spec-draft-n-ubatch`) without keeping their buffers during generation, and it
+is small again before the cache of the main context comes back, whatever the order of the calls.
+
+### Which batches keep the cache: `--moe-cache-batch`
+
+`--moe-cache-batch N` (default 512, 0 = `-ub`) is the most it tries. After the cache comes back the first time and 64
+tokens have been generated (until then the free memory that RADV reports can still drop by about a GB), the context
+measures the compute buffers of a reserve for N tokens without allocating them. It reserves them if they fit in the free
+GPU memory with 256 MiB to spare, and otherwise tries half the size, down to 32. Batches up to the size that fits keep
+the cache and run on the hot spare, so a medium prompt such as a tool output neither copies every expert to the GPU nor
+uploads the cache again. The log says `MoE cache resize: batches of up to N tokens keep the cache`.
+
+**With an MTP draft context**, the two share what's left. The main context measures its buffers for each size and waits
+at 32 tokens, the draft picks the largest size that fits both, and the main context takes its share. If either then
+finds less room, the other follows it down. (The draft's buffers for a batch can be larger than the main context's: on
+the R9700, 2048-token reserves for both spilled into system memory and generation fell from 26 to 8.5 tok/s.)
+
+Measured:
+
+- On the 1920X + R9700 this fit kept the cache for prompts of up to 1024 tokens: follow-up turns took 51.5 s instead of
+  127 on Q4 and 57 instead of 158 on Q6.
+- On the 14600KF + RTX 4070 Ti, with a 35B model, a 3000 MiB cache and a 9B draft (follow-ups of about 350 tokens), it
+  kept 1024 tokens instead of 128, and those prompts took 1.8–2.0 s instead of 3.2–3.7.
+- On the 14600KF + RTX 4070 Ti with Qwen3-Coder-30B Q4_K_XL, 8000 MiB and `-ub 2048`, `--moe-cache-batch 0` kept the cache
+  up to 1024 tokens. Follow-ups of 193, 349 and 749 tokens read at 458, 413 and 556 tok/s when they kept the cache,
+  against 111, 186 and 356 when they released it, and the generation after them ran at 51-59 tok/s against 30-34, while
+  the cache filled again.
+
+### Medium prompts: `--moe-cache-jit`
+
+A batch of more than 32 tokens that keeps the cache runs on the hot spare but doesn't swap: its resident experts were
+picked for generation. On Flash-Next Q4_K_XL with a 20900 MiB cache, 57-70% of such a batch's selections hit, and the
+CPU's experts were about 80% of its time. With `--moe-cache-jit N`, each layer of such a batch, just before its cache
+branch runs:
+
+- reads the experts its tokens selected (the router's output, which the CPU branch waits for anyway);
+- picks the ones that aren't resident and that at least N of its tokens select, the most selected first, up to
+  `LLAMA_MOE_CACHE_JIT_SLOTS` (64);
+- copies them into pinned staging memory on worker threads and uploads them in the background, into slots that all the
+  layers of a group share;
+- points its maps at them: the CPU branch skips those experts and the cache branch runs them.
+
+Only the cache branch waits for those uploads, on the GPU (`ggml_backend_upload_bg_require`), and the device maps are
+written from pinned memory, so the CPU starts its experts without waiting. When each layer's upload had to finish before
+its CPU experts started, most of the gain went (at 512 tokens and N=4, -6.8% instead of -29.7%). The output is the same
+up to rounding, as for the resident experts: read again in batches of 64-256 tokens, the positions of a greedy answer in
+batches of 1 move by a mean KL of 0.0011-0.0012 with or without it (Q4, also with N=1).
+
+It's off by default: the best N depends on the link and the CPU (an expert is worth uploading when its tokens cost the
+CPU more than its copy and upload), and it hasn't been measured on the RX 480s. N=4 was 2-3 points better than 8 from
+512 tokens up, where every layer fills its 64 slots; N=2 made small batches slower (+59% at 64 tokens, +35% at 128): too
+many experts to copy for the tokens they take from the CPU. With the shared slots below, the tuning script picks 8 for
+both quants on the 1920X + R9700 ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)),
+whose setup runs
+
+```bash
+LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 \
+llama-server ... --moe-cache-resize --moe-cache-jit 8
+```
+
+**The slots.** By default they come out of the cache: 64 per group of layers with the same expert layout (Flash-Next
+has four: 256 slots, 4-5% of the resident experts), so generation gives them up for good: its hit rate dropped by under
+a point, 2-3% of Q4's generation at N=4 on the R9700. *On the `moe-tuning` branch*, `LLAMA_MOE_CACHE_JIT_SHARE=1` makes
+them resident slots too, and a batch that uses the jit borrows slots only while it runs:
+
+- Before such a batch (and before the cache is restored for it), each group lends the jit the slots of its weakest
+  residents: empty slots first, none that an upload is writing to. The experts in them leave the resident set, and the
+  jit uploads into those slots, wherever they are.
+- When the next batch that doesn't use the jit comes, the slots come back empty, and the refreshes fill them; those
+  fills don't count against the answer cap, since the cache had them before.
+- With sharing, more slots cost generation little, but a small batch gains nothing from them.
+  `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N` caps a layer's uploads, and the slots lent, at one per N tokens of the
+  ubatch, with a floor of 64.
+
+Lending the fixed jit slots instead was slower: the refill after a batch puts the best missing experts into the empty
+slots first, so the next lend evicted strong experts, and prompts of 150-350 tokens ran 7-17% slower.
+
+**Measured,** on the 1920X + R9700 (PCIe 3.0 x16). A prompt in batches of S tokens after 96 generated ones
+(`llama-moe-logit-drift` with `LLAMA_DRIFT_PROMPT`), with the slots out of the cache, ms per batch:
+
+| S | Q4_K_XL, off | `--moe-cache-jit 8` | Q6_K_XL, off | `--moe-cache-jit 8` |
+| --- | --- | --- | --- | --- |
+| 64 | 548 | 538 (-1.8%) | | |
+| 128 | 977 | 849 (-13%) | 1304 | 1118 (-14%) |
+| 256 | 1861 | 1412 (-24%) | | |
+| 512 | 3520 | 2553 (-27%) | 4294 | 3172 (-26%) |
+| 1024 | 6741 | 4817 (-29%) | | |
+| 2048 | | | 15413 | 10766 (-30%) |
+
+In `llama-server` with an MTP draft (batches of up to 1024 tokens keep the cache there), the slots out of the cache, and
+the requests of a coding session, two passes each (Q6's off runs read one 324-token prompt more, about 3 s, after a miss
+of the prompt cache):
+
+| | prompts of 33-1024 tokens | generation, answers / agent turns | hits in generation | whole run |
+| --- | --- | --- | --- | --- |
+| Q4_K_XL, off | 91.7 tok/s | 32.5 / 29.2 tok/s | 84.0% | 300 s |
+| Q4_K_XL, `--moe-cache-jit 8` | 120.3 tok/s | 33.1 / 28.7 tok/s | 83.2% | 289 s |
+| Q6_K_XL, off | 78.7 tok/s | 27.5 / 24.8 tok/s | 73.3% | 362 s |
+| Q6_K_XL, `--moe-cache-jit 8` | 98.3 tok/s | 27.3 / 24.3 tok/s | 72.6% | 349 s |
+
+With the tuning script's settings (Q4, 3 drafts, an answer cap of 500) and the slots out of the cache, 4 and 8 gave the
+same whole agent turns, 8% faster than without; 4 cost less generation: 41.87 tok/s against 41.53, and 43.57 without.
+
+The shared slots, with `LLAMA_MOE_RESIZE_SPLIT=4096` and the setup of FORK.md (two passes, against the split alone):
+128 slots with `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8` gave
+
+| | prompts of 1.9k-2.3k tokens | prompts of 150-350 tokens | generation: short answers / follow-ups / agent turns | whole run |
+| --- | --- | --- | --- | --- |
+| Q4_K_XL | 162-209 → 218-270 tok/s (+29-31%) | -1 to -5% | -0.79 / -0.45 / +0.35 tok/s | 235.6 → 218.8 s |
+| Q6_K_XL | | | -0.09 / -0.77 / -0.09 tok/s | 286.1 → 272.8 s |
+
+256 slots were no better than 128. The jit's own check (`LLAMA_MOE_CACHE_JIT_CHECK=1`: every upload read back, the maps
+checked) found no difference in 180,360 uploads. With `-v` the cache's statistics at exit add lines for it: experts
+uploaded per layer run, how many were left out for want of slots, the share of the misses' selections they took from the
+CPU, its time per layer run, and with shared slots how often they were lent.
+
+### Splitting a prompt: `LLAMA_MOE_RESIZE_SPLIT`
+
+*On the `moe-tuning` branch.*
+
+`LLAMA_MOE_RESIZE_SPLIT=N`: a batch of up to N tokens that is too large for the buffers that fit keeps the cache all the
+same and runs in ubatches of the size that fits, instead of releasing it. Its experts then come from the cache, the jit
+and the CPU, not from a copy of every expert, and the restore after it goes. The MTP draft's context follows the same
+rule, so its buffers stay small too. It applies once batches larger than 32 tokens fit next to the cache
+([`--moe-cache-batch`](#which-batches-keep-the-cache---moe-cache-batch)); it is off by default.
+
+Where the split should stop is where a released prompt becomes faster than a kept one, so it depends on how fast the
+released prompt copies its experts. With the [fast copies](#released-prompts-the-fast-expert-copies), on the R9700 with
+a 20900 MiB cache (batches of up to 1024 tokens fit), kept 2.3k-token prompts read at 249-251 tok/s against 204
+released, and 3.6k-token prompts at 256 against 298 released. `LLAMA_MOE_RESIZE_SPLIT=3072` made a run of prompts of
+1.3k-3.6k tokens 4% shorter on Q4 and 5% on Q6 than 4096.
+
+With the backend's own copies, releasing costs more, and 4096 was the better limit: against no split, it made prompts of
+1.9k–2.3k tokens 14–69% faster on Q4 (turn1 125 → 211 tok/s) and 23–76% faster on Q6 (97 → 172). Generation was as fast
+or faster, and a set of requests with agent turns took 14 s less on Q4 and 27 s less on Q6. Prompts of 13k tokens and
+more still released the cache, at the same speed as without the split. 8192 measured the same as 4096, since no request
+fell between the two.
+
+### Released prompts: the fast expert copies
+
+*On the `moe-tuning` branch.*
+
+A batch that releases the cache runs its experts from copies the scheduler makes of the host weights, every used expert
+of every layer, about 67 GiB per ubatch for Flash-Next Q4. The weights are mmapped, which isn't memory the GPU can read
+directly, so the Vulkan backend's own copy takes each part on one thread into a staging buffer, uploads it, and waits
+for the device before the next. On the R9700, released prompts of 5k-13k tokens spent 58 of their 88 s in those copies,
+at 5.8 GiB/s, with the GPU idle meanwhile.
+
+`LLAMA_OFFLOAD_FAST=1` sends these copies through the cache's own pinned staging memory and background uploads, in hot
+spare mode on a GPU that has them (Vulkan). For each expert tensor the scheduler copies, it first waits for the
+backend's earlier work, as the backend's own copy does, since the copy's destination shares the compute buffer with
+tensors that earlier splits may still use. Then the copy threads fill one half of the staging memory while the other
+half uploads, and the next graph waits for the uploads on the device, not on the host. The same copies took 21 s
+instead of 93 (26 GiB/s while copying). The staging copies run on the cache's copy threads, which the first fast copy
+starts if the cache hasn't yet (or it copies inline without them). Prompts that release the cache (Q4, the setup of
+FORK.md, two passes each):
+
+| prompt | the backend's copies | `LLAMA_OFFLOAD_FAST=1` |
+| --- | --- | --- |
+| 2.5k tokens | 151 tok/s | 212 (+40%) |
+| 4.8k | 258 | 350 (+36%) |
+| 6.7k | 332 | 435 (+31%) |
+| 9.3k | 404 | 518 (+28%) |
+| 12.3k | 470 | 596 (+27%) |
+| 19.0k | 460 | 525 (+14%) |
+| 31.4k | 539 | 657 (+22%) |
+
+A run of all seven took 178.2 s instead of 218.7, and generation after them was within a run's spread (35.9 against
+36.8 tok/s). `LLAMA_OFFLOAD_FAST_CHECK=1` reads every part back after its upload and
+compares it with the host weights: all 29,104 parts of a run were the same. Two of seven answers came out with other
+text than with the backend's copies, the same in every run of each: the fast copies change the timing of the cache's own
+uploads, so a few other experts are resident afterwards (hit rates 85.11% against 84.96%), and where an answer's experts
+run changes its rounding. A long greedy answer read again in batches of 1 agrees with itself as well with the fast
+copies as without them (llama-moe-logit-drift, 512 tokens after a released 1,075-token prompt: 91.4% of the top tokens
+the same, mean KL 0.0529, against 92.0% and 0.0530).
+
+To check or time the copies: `LLAMA_OFFLOAD_COPY_STATS=1` prints at exit the time the scheduler's expert copies took and
+the bytes they uploaded, with or without the fast copies; with `-v` the cache's statistics add the fast copies' GiB,
+uploads and waits. `LLAMA_MOE_CACHE_VERIFY=1` reads every resident expert of the cache back at exit and before each
+release and compares it with the host weights, once every upload is done (slow, a diagnostic); it prints how many were
+read back, how many differ and how many were still uploading.
 
 ## Reference
 
@@ -432,13 +515,91 @@ The help text of the options (`llama-server --help`, `llama-cli --help`):
 
 `--moe-cache-mib` and the LRU mode come from upstream; this fork adds the list form, the hot spare mode and the other
 options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predictor-start`, `--moe-cache-predictor-device`,
-`--moe-cache-predictor-answer-cap`) are in [docs/moe-predictor.md](moe-predictor.md). `llama-moe-trace` also takes `--trace-conversation FNAME`, see [tools/moe-trace](../tools/moe-trace/README.md).
+`--moe-cache-predictor-answer-cap`) are in [docs/moe-predictor.md](moe-predictor.md). `llama-moe-trace` also takes
+`--trace-conversation FNAME`, see [tools/moe-trace](../tools/moe-trace/README.md).
 
-A saved set from one kind of work (code, chat, a language) is a good start for the same kind of work: run once with
-`--moe-cache-save code.hot`, then start later runs with `--moe-cache-hot code.hot`.
+### Environment variables
 
-The refill moves up to the whole cache in one step, and the generation waits for its copies. It pays on long sessions
-(14.1 against 13.9 tok/s over the 5-turn session below); on a single short answer `--moe-cache-refill 0` can be faster. With a predictor the refill is off by default.
+**The cache's uploads**
+
+| Variable | Effect |
+| --- | --- |
+| `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
+| `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
+| `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
+| `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on the Threadripper 1920X 29.5 GB/s instead of 20) |
+| `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done |
+| `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each, and 512 MiB each with `LLAMA_MOE_CACHE_REFILL_BG=1` or a predictor) |
+
+**Prompts** (*`moe-tuning`*)
+
+| Variable | Effect |
+| --- | --- |
+| `LLAMA_MOE_RESIZE_SPLIT=N` | with `--moe-cache-resize`: batches of up to N tokens keep the cache and run in ubatches of the size that fits next to it, instead of releasing it (default 0, off; 3072 on the 1920X + R9700) ([Splitting a prompt](#splitting-a-prompt-llama_moe_resize_split)) |
+| `LLAMA_OFFLOAD_FAST=1` | in hot spare mode, the scheduler's copies of host experts to a GPU (prompts that release the cache) go through the cache's pinned staging memory and background uploads ([Released prompts](#released-prompts-the-fast-expert-copies)) |
+
+**`--moe-cache-jit`**
+
+| Variable | Effect |
+| --- | --- |
+| `LLAMA_MOE_CACHE_JIT_SLOTS=N` | the most experts a layer uploads, and the slots of each group: taken from the cache, or with `LLAMA_MOE_CACHE_JIT_SHARE=1` the most it lends (default 64) |
+| `LLAMA_MOE_CACHE_JIT_SHARE=1` | the jit's slots hold resident experts while no batch uses the jit, and are lent to a batch that does (*`moe-tuning`*) |
+| `LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=N` | a layer of a ubatch uploads at most one expert per N of its tokens, at least 64, and a group lends as many slots (*`moe-tuning`*) |
+| `LLAMA_MOE_CACHE_JIT_THREADS=N` | the threads that copy its experts to the staging memory (default 4) |
+
+**The predictor**
+
+| Variable | Effect |
+| --- | --- |
+| `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
+| `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
+| `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
+| `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them); `--moe-cache-predictor-answer-cap` overrides it |
+
+**The scheduler, the CPU and Vulkan**
+
+| Variable | Effect |
+| --- | --- |
+| `GGML_SCHED_OVERLAP=0` | the cache branch no longer runs while the CPU computes the misses |
+| `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU are synchronous reads again |
+| `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
+| `GGML_CPU_MMID_FLAT=C` | the CPU's MUL_MAT_ID (the missed experts) hands out the rows of all active experts in C-row chunks instead of a slice of each expert per thread, for up to 8 tokens per expert ([The CPU's experts](#the-cpus-experts); 128 on the 1920X + R9700) |
+| `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the 1920X + R9700 ([The CPU's experts](#the-cpus-experts)) |
+| `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
+| `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the 1920X + R9700) |
+| `GGML_VK_ASYNC_TRANSFER_MIN=N` | Vulkan, with the cache's background uploads: asynchronous writes smaller than N bytes go through the compute queue, so they don't wait behind the uploads on the transfer queue; larger ones stay there (default 1048576) |
+| `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
+| `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid in the mat-vec's store |
+| `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan (upstream): no fused adds |
+| `GGML_VK_DISABLE_FUSION=1` | Vulkan (upstream): no fused operations at all, to measure what fusion is worth on a GPU |
+
+**Diagnostics**
+
+| Variable | Effect |
+| --- | --- |
+| `LLAMA_MOE_CACHE_VERIFY=1` | read every resident expert back at exit and before each release, once every upload is done, and compare it with the host weights; prints the count to stderr (slow) |
+| `LLAMA_OFFLOAD_FAST_CHECK=1` | with `LLAMA_OFFLOAD_FAST=1`: wait for the fast copies' uploads, read every part back and compare it with the host weights, report at exit (slow) |
+| `LLAMA_OFFLOAD_COPY_STATS=1` | at exit, the time the scheduler's expert copies took and the GiB they uploaded |
+| `LLAMA_MOE_CACHE_JIT_CHECK=1` | `--moe-cache-jit`: read every upload back and compare it with the host expert, check every map entry, report at exit (slow) |
+| `LLAMA_MOE_CACHE_JIT_SYNC=1` | `--moe-cache-jit`: wait for each layer's uploads before its cache branch, a test of their ordering |
+| `LLAMA_MOE_CACHE_JIT_MODE=resident` | `--moe-cache-jit`: move resident experts to the jit slots instead of uploading missing ones, a test of the slots (the output should match off's) |
+| `LLAMA_MOE_CACHE_JIT_BG=0` | `--moe-cache-jit`: uploads on the transfer queue that every synchronization waits for, so the CPU experts wait for them, to compare |
+| `LLAMA_MOE_CACHE_JIT_PINNED_MAPS=0` | `--moe-cache-jit`: the device maps written from the host maps (each write synchronizes the device), to compare |
+| `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
+| `GGML_CPU_OP_STATS=1` | at exit, per batch size, each CPU op's wall time, its threads' work, and MUL_MAT_ID's experts and GB/s by weight type |
+| `GGML_CPU_MMID_PREFETCH=R` | the CPU's MUL_MAT_ID prefetches its weights R rows ahead; slower on a Threadripper 1920X, kept to measure other CPUs |
+| `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
+| `LLAMA_WINDOW_TIMING=1` | `llama-server`: host time of a pass with drafts by step, after each answer and so far |
+| `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
+| `GGML_VK_HOST_DELAY_US=N` | Vulkan: spin N µs at each graph_compute; if a pass slows by all of it, host time on the Vulkan side is on its critical path |
+| `GGML_VK_DMMV_LARGE_M=N` | Vulkan on AMD: large mul_mat_vec workgroups for matrices of up to N rows and at least 1024 columns, as NVIDIA and Intel always choose them |
+| `GGML_VK_DMMV_SUBGROUP=N` | Vulkan: the mul_mat_vec subgroup size, where the device allows it (RDNA reports 64 and allows 32) |
+| `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
+| `GGML_VK_PERF_LOGGER_NODES=1` | Vulkan: the perf logger also keys each timing by the node and its sources' names; `ggml_backend_vk_perf_mark(label)` (proc address) labels the timings from then on, for `llama-moe-logit-drift`'s `LLAMA_DRIFT_PROFILE` |
+
+With `-v`, the cache prints its statistics at exit: hit rate, swaps, MiB uploaded per token, the time of the update between
+ubatches (for batches of up to 32 tokens and larger ones apart), with `--moe-cache-resize` how often it was released,
+with `--moe-cache-jit` its uploads, and with `LLAMA_OFFLOAD_FAST=1` the fast copies.
 
 ### Tuning
 
@@ -446,62 +607,19 @@ The refill moves up to the whole cache in one step, and the generation waits for
 depend on the CPU, the link and the model. `tools/moe-trace/moe-cache-tune.py` searches them with real runs in stages,
 within a time budget, and writes a results file you can share. It covers the cache's settings (predictor, refill,
 answer cap, budget, size, `--moe-cache-jit`, copy threads), the MTP drafts, and the CPU and Vulkan settings above
-(`GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `GGML_VK_FLOPS_PER_SUBMIT`, `-t`). What each stage does:
-[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine); the method and options:
-[tools/moe-trace](../tools/moe-trace/README.md#tuning-a-machine).
+(`GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `GGML_VK_FLOPS_PER_SUBMIT`, `-t`). What each stage does and what it picked on
+the 1920X + R9700: [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine); the method
+and options: [tools/moe-trace](../tools/moe-trace/README.md#tuning-a-machine).
 
 **The refresh, offline.** `tools/moe-trace/hot_spare_sim.py` replays a recorded session through the refresh logic. On the
-5-turn session below (simulated hit rates within 1 point of the measured ones):
+[5-turn session](#measured) on the 1920X + RX480x2 (simulated hit rates within 1 point of the measured ones):
 
 - half-life 16 to 512 and refill 32 to 256 all give 54.4-56.4% hits; the defaults (64, 128) are 0.6 points from the best.
   Very short or very long memories (8, 1024), no refill, and a fixed set (30%, a set saved from another prompt) are worse.
 - the upload budget raises the hit rate (5 MiB/token: 56.6%, 20: 59.0%, 40: 62.8% measured) but not the speed: 14.11,
-  13.95 and 13.76 tok/s. The copies and uploads cost about what the extra hits save. Keep the budget at 5-10.
+  13.95 and 13.76 tok/s. The copies and uploads cost about what the extra hits save. Keep the budget at 5-10 on a link
+  like that one; the tuning script picks 10 for Q4_K_XL and 20 for Q6_K_XL on the R9700's PCIe 3.0 x16.
 - the margin hardly matters.
-
-### Environment variables
-
-| Variable | Effect |
-| --- | --- |
-| `GGML_SCHED_OVERLAP=0` | the cache branch no longer runs while the CPU computes the misses |
-| `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU are synchronous reads again |
-| `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
-| `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
-| `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
-| `LLAMA_MOE_CACHE_COPY_THREADS=N` | the copies to the staging memory spread over N threads (default 4: on a Threadripper 1920X one thread copies at ~9 GB/s and 4 reach the RAM's ~20 GB/s) |
-| `LLAMA_MOE_CACHE_COPY_NT=0` | the copies to the staging memory use memcpy instead of non-temporal stores (the default: they skip reading the destination lines and leave the caches to the CPU experts; on the Threadripper 1920X 29.5 GB/s instead of 20) |
-| `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
-| `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
-| `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
-| `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them); `--moe-cache-predictor-answer-cap` overrides it |
-| `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
-| `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
-| `GGML_CPU_MMID_FLAT=C` | the CPU's MUL_MAT_ID (the missed experts) hands out the rows of all active experts in C-row chunks instead of a slice of each expert per thread, for up to 8 tokens per expert ([The CPU's experts](#the-cpus-experts); 128 on the R9700 machine) |
-| `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the R9700 machine ([The CPU's experts](#the-cpus-experts)) |
-| `GGML_CPU_OP_STATS=1` | at exit, per batch size, each CPU op's wall time, its threads' work, and MUL_MAT_ID's experts and GB/s by weight type |
-| `GGML_CPU_MMID_PREFETCH=R` | the CPU's MUL_MAT_ID prefetches its weights R rows ahead; slower on a Threadripper 1920X, kept to measure other CPUs |
-| `LLAMA_MOE_CACHE_JIT_SLOTS=N` | `--moe-cache-jit`: the most experts a layer uploads, and the slots each group takes from the cache (default 64) |
-| `LLAMA_MOE_CACHE_JIT_THREADS=N` | `--moe-cache-jit`: the threads that copy its experts to the staging memory (default 4) |
-| `LLAMA_MOE_CACHE_JIT_BG=0` | `--moe-cache-jit`: uploads on the transfer queue that every synchronization waits for, so the CPU experts wait for them, to compare |
-| `LLAMA_MOE_CACHE_JIT_PINNED_MAPS=0` | `--moe-cache-jit`: the device maps written from the host maps (each write synchronizes the device), to compare |
-| `LLAMA_MOE_CACHE_JIT_SYNC=1` | `--moe-cache-jit`: wait for each layer's uploads before its cache branch, a test of their ordering |
-| `LLAMA_MOE_CACHE_JIT_CHECK=1` | `--moe-cache-jit`: read every upload back and compare it with the host expert, check every map entry, report at exit (slow, a test) |
-| `LLAMA_MOE_CACHE_JIT_MODE=resident` | `--moe-cache-jit`: move resident experts to the jit slots instead of uploading missing ones, a test of the slots (the output should match off's) |
-| `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
-| `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
-| `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
-| `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
-| `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the R9700 machine) |
-| `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid in the mat-vec's store |
-| `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
-| `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
-| `GGML_VK_PERF_LOGGER_NODES=1` | Vulkan: the perf logger also keys each timing by the node and its sources' names; `ggml_backend_vk_perf_mark(label)` (proc address) labels the timings from then on, for `llama-moe-logit-drift`'s `LLAMA_DRIFT_PROFILE` |
-| `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan (upstream): no fused adds |
-| `GGML_VK_DISABLE_FUSION=1` | Vulkan (upstream): no fused operations at all, to measure what fusion is worth on a GPU |
-
-With `-v`, the cache prints its statistics at exit: hit rate, swaps, MiB uploaded per token, the time of the update between
-ubatches (for batches of up to 32 tokens and larger ones apart), with `--moe-cache-resize` how often it was released, and
-with `--moe-cache-jit` its uploads.
 
 ## Sizing the cache
 
@@ -517,7 +635,7 @@ All of these are printed at load with `-v`, one line per device:
 | --- | --- | --- |
 | weights | `load_tensors: Vulkan0 model buffer size` | the dense layers on that card and, on the last card, the output head |
 | KV and recurrent state | `llama_kv_cache: ... KV buffer size`, `llama_memory_recurrent: ... RS buffer size` | grow with the context (`-c`) |
-| compute buffer | `sched_reserve: Vulkan0 compute buffer size` | the first GPU holds the experts of one layer while a prompt batch runs on the GPU (batches of 32 tokens or more, `GGML_OP_OFFLOAD_MIN_BATCH`), about 1 GB below; `--no-op-offload` removes that part, prompts then compute their experts on the CPU, which on the test machine was as fast (42.8 against 40.3 tok/s for a 9.7k-token prompt) |
+| compute buffer | `sched_reserve: Vulkan0 compute buffer size` | the first GPU holds the experts of one layer while a prompt batch runs on the GPU (batches of 32 tokens or more, `GGML_OP_OFFLOAD_MIN_BATCH`), about 1 GB below; `--no-op-offload` removes that part, prompts then compute their experts on the CPU, which on the 1920X + RX480x2 was as fast (42.8 against 40.3 tok/s for a 9.7k-token prompt) |
 | draft model (speculative decoding) | the same lines after `creating MTP draft context` | see below |
 | the cache itself | `impl: Vulkan0 MoE cache size = ... for ... MiB of host experts` | |
 | headroom | | see below |
@@ -558,29 +676,14 @@ done | awk '{ if ($2 > v[$1]) v[$1] = $2; if ($3 > g[$1]) g[$1] = $3 } END { for
 
 ### Sizing with `--moe-cache-resize`
 
-A prompt with the experts in host memory is faster with large ubatches, because each ubatch copies the experts of every
-layer to the GPU once (`-ub 2048` read a 9.7k-token prompt at 84 tok/s on the RX 480 machine, `-ub 512` at 40), but the
-compute buffers grow with the ubatch (1.8 and 2.4 GB on the two GPUs at 2048 against 1.0 and 0.5 at 512). With
-`--moe-cache-resize` the two take turns:
+With `--moe-cache-resize` ([Prompts](#prompts---moe-cache-resize)) the cache and the compute buffers of large batches
+take turns, so size the cache for generation and check that the prompt phase fits without it: weights, KV, the compute
+buffers of `-ub` tokens and a draft model. The compute buffers grow with the ubatch (1.8 and 2.4 GB on the two RX 480s
+at 2048 against 1.0 and 0.5 at 512). During generation they are tiny (a few MiB on the test machines), so the cache gets
+nearly all the memory that the prompt's compute buffers take, minus what the batches that keep the cache need; note
+that `-ub` is capped by `-b`.
 
-- a large batch frees the cache's GPU memory, and the compute buffers are reserved for `-ub` tokens;
-- the next small batch reserves compute buffers for the small batches, allocates the cache again and uploads its experts:
-  the resident set if it came from `--moe-cache-hot`, otherwise the refresh fills the slots from the scores.
-
-Small batches are those of up to the `--moe-cache-batch` size whose compute buffers fit next to the cache (see
-[Prompts](#prompts---moe-cache-resize)). On the RTX 4070 Ti (Qwen3-Coder-30B Q4_K_XL, 8000 MiB, `-ub 2048`), follow-ups
-of 193, 349 and 749 tokens read at 458, 413 and 556 tok/s when they kept the cache, against 111, 186 and 356 when they
-released it, and the generation after them ran at 51-59 tok/s against 30-34, while the cache filled again; `--moe-cache-batch 0`
-kept the cache up to 1024 tokens there.
-
-Size the cache for generation and check that the prompt phase fits without it: weights, KV, the compute buffers of `-ub`
-tokens and a draft model. During generation the compute buffers are tiny (a few MiB on the test machines), so the
-cache gets nearly all the memory that the prompt's compute buffers take, minus what the small batches keep; note that
-`-ub` is capped by `-b`. Each switch back costs one upload of the cache, about a second for 7 GB.
-It is meant for one sequence at a time (`-np 1`): with several, prompt chunks and generation mix and every mixed batch
-switches.
-
-On the 2x RX 480 machine (5-turn session below, MTP, `-c 16384`), the cache grew from `3350,4050` to `5000,4200`:
+On the 1920X + RX480x2 ([5-turn session](#measured), MTP, `-c 16384`), the cache grew from `3350,4050` to `5000,4200`:
 
 | | prompt (9.6k tokens) | generation | hit rate | session |
 | --- | --- | --- | --- | --- |
@@ -591,13 +694,6 @@ On the 2x RX 480 machine (5-turn session below, MTP, `-c 16384`), the cache grew
 
 With `-ub 4096` the pinned host compute buffer doubles (233 MiB), which shows in `mem_info_gtt_used` without slowing
 anything.
-
-A context without the cache, such as the MTP draft context, also follows `--moe-cache-resize`: its compute buffers are
-reserved for 31 tokens (below 32, `GGML_OP_OFFLOAD_MIN_BATCH`, nothing copies host weights to a device), or for the main
-context's small batches without offloading host weights, and grow only while it reads a large batch, when the cache of the
-main context is released. The draft can then read prompts in large ubatches
-(`--spec-draft-n-ubatch`) without keeping their buffers during generation. It keeps them only while each of its large
-batches runs, so it is small again before the cache of the main context comes back, whatever the order of the calls.
 
 ### Worked example
 
@@ -648,12 +744,12 @@ that borrows the main model's embedding and output head). The draft context has 
 
 - Put the draft on the GPU with the most room (`-ngld 99 -devd Vulkan0`). A draft on the CPU (`-ngld 0`) reads its
   output head for every drafted token and is slower than no draft. Its experts on the GPU too, at the cost of cache
-  space, were faster on the R9700 (2550 MiB: usual answers 31.5 → 32.6 tok/s, agent turns 27.9 → 28.6). On the RX
-  480s, short of memory, they stay on the CPU (`-cmoed`).
+  space, were faster on the 1920X + R9700 (2550 MiB: usual answers 31.5 → 32.6 tok/s, agent turns 27.9 → 28.6). On the
+  RX 480s, short of memory, they stay on the CPU (`-cmoed`).
 - The draft's compute buffers are sized for its batch, 980 MiB at the default `-ub 512`, 8 MiB at 16. With
-  `--moe-cache-resize` the draft keeps its large buffers only while it reads a prompt, so `--spec-draft-n-ubatch 2048` reads
-  prompts faster at no cost during generation; without it, use `--spec-draft-n-ubatch 16` (or 31, the largest that stays
-  small).
+  `--moe-cache-resize` the draft keeps its large buffers only while it reads a prompt
+  ([Prompts](#prompts---moe-cache-resize)), so `--spec-draft-n-ubatch 2048` reads prompts faster at no cost during
+  generation; without it, use `--spec-draft-n-ubatch 16` (or 31, the largest that stays small).
 - Size the cache per GPU around the draft, with the headroom above for the compute buffer that is reserved again.
 - Each drafted token makes the CPU compute the experts of one more token per pass, so the best count depends on how
   much that costs. One (`--spec-draft-n-max 1`) was best on the 1920X + RX480x2. On the 1920X + R9700, with the CPU's
@@ -671,17 +767,17 @@ The switches and timing tools are in [Environment variables](#environment-variab
 A mat-vec MUL_MAT followed by a SCALE and a SiLU or sigmoid runs as one dispatch, the scale and the activation in the
 mat-vec's store (`mm_post` in the shaders). Flash-Next has 97 of them a pass, the down projections of its
 hyper-connections. The fused path gives the same logits as the unfused one, and `test-backend-ops -o MUL_MAT_SCALE_UNARY`
-checks it. On the R9700 it saved 194 dispatch groups a pass, within noise at the usual settings, and 1.5–2.7% where the
-GPU's work is exposed (one submit per split). `GGML_VK_DISABLE_MM_POST=1` turns it off.
+checks it. On the 1920X + R9700 it saved 194 dispatch groups a pass, within noise at the usual settings, and 1.5–2.7%
+where the GPU's work is exposed (one submit per split). `GGML_VK_DISABLE_MM_POST=1` turns it off.
 
 ### On GPUs without fp16
 
-Vulkan fuses chains of f32 adds (the sum of the experts' outputs, adds before an RMS norm) into one dispatch. It used to
-require `shaderRoundingModeRTEFloat16`, which GPUs without fp16 arithmetic (GCN cards such as the RX 480) lack; the f32
-variants use no rounding mode, so this branch enables them there. `test-backend-ops -o ADD`, `-o ADD_ID` and
+Vulkan fuses chains of f32 adds (the sum of the experts' outputs, adds before an RMS norm) into one dispatch. Upstream
+requires `shaderRoundingModeRTEFloat16` for it, which GPUs without fp16 arithmetic (GCN cards such as the RX 480) lack;
+the f32 variants use no rounding mode, so this branch enables them there. `test-backend-ops -o ADD`, `-o ADD_ID` and
 `-p multi_add=1` pass on the RX 480 and on an RTX 4070 Ti with `GGML_VK_DISABLE_F16=1`.
 
-On the 2x RX 480 machine (MTP + hot spare, the layout above) fused adds gave 14.44 -> 14.57 tok/s, and all fusions
+On the 1920X + RX480x2 (MTP + hot spare, the layout above) fused adds gave 14.44 -> 14.57 tok/s, and all fusions
 together 13.82 -> 14.60 tok/s: there the GPU time is in the dense matrix-vector products, not in the number of dispatches.
 Other GPUs may differ: compare a run with `GGML_VK_DISABLE_FUSION=1` or `GGML_VK_DISABLE_MULTI_ADD=1` against one without.
 
@@ -693,14 +789,15 @@ here), and the matmul+add patterns do not occur in this model's graph.
 
 ## Measured
 
-On the 2x RX 480 machine and the RTX 4070 Ti. The R9700's numbers are in the sections above and in
-[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md). Greedy decoding of one coding prompt, 256 tokens, and a 5-turn coding session with `session-bench.py` (a 9.6k-token
-paste of a source file, then four turns of up to 1024 tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes (overlapping
-splits, asynchronous reads), which also speed up a model with its experts on the CPU and no cache.
+On the 1920X + RX480x2 and the 14600KF + RTX 4070 Ti. The 1920X + R9700's numbers are in the sections above and in
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md). Greedy decoding of one coding prompt, 256 tokens,
+and a 5-turn coding session with `session-bench.py` (a 9.6k-token paste of a source file, then four turns of up to 1024
+tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes
+(overlapping splits, asynchronous reads), which also speed up a model with its experts on the CPU and no cache.
 
 | Machine | Setup | tok/s |
 | --- | --- | --- |
-| 2x RX 480 8 GB, Threadripper 1920X, Qwen3.8-Flash-Next UD-IQ4_XS | experts on the CPU, before | 9.8 |
+| 1920X + RX480x2 (2x RX 480 8 GB), Qwen3.8-Flash-Next UD-IQ4_XS | experts on the CPU, before | 9.8 |
 | | hot spare 8600 MiB | 12.2 |
 | | MTP, 1 drafted token, before | 11.7 |
 | | MTP + hot spare 4600,4300 MiB, `--no-op-offload` | 14.3 |
@@ -708,6 +805,6 @@ splits, asynchronous reads), which also speed up a model with its experts on the
 | | 5-turn session, MTP + hot spare 3350,4050 MiB (`-c 16384`) | 14.1 |
 | | 5-turn session, MTP + hot spare 5000,4200 MiB, `-ub 4096 --moe-cache-resize` | 14.6, prompt 80.5 tok/s |
 | | same, cache 5000,4150, `--spec-draft-n-ubatch 2048` | 14.5, prompt 86.0 tok/s |
-| RTX 4070 Ti 12 GB, i5-14600KF, Qwen3-Coder-30B-A3B UD-Q4_K_XL | experts on the CPU, before | 26.6 |
+| 14600KF + RTX 4070 Ti 12 GB, Qwen3-Coder-30B-A3B UD-Q4_K_XL | experts on the CPU, before | 26.6 |
 | | experts on the CPU | 29.2 |
 | | hot spare 3000 MiB | 43.3 |
