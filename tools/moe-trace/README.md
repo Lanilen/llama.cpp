@@ -38,6 +38,11 @@ For the [expert predictor](../../docs/moe-predictor.md) a trace also needs:
   (default 16) and around each answer's start, in `trace.hid.npy` `[rows, layers, n_embd]`, their positions in
   `trace.json` (`hidden`).
 
+On models with per-layer n-gram embeddings (Qwen3.8-Flash-Next's engram, read at layer 1),
+`LLAMA_MOE_TRACE_GATE=1` also saves their gate for every token: how much of the n-gram lookup the model mixes in, one
+value per hyper-connection stream, in `trace.gate.npy` float32 `[tokens, n-gram layers, streams]` (the layers and
+streams in `trace.json`, `gate`).
+
 The router selections are the `ffn_moe_topk-<il>` tensors, read with the eval callback. Reading them adds a sync per
 layer, so traced runs are slower, but routing does not change: `LLAMA_MOE_TRACE_OFF=1` runs the same generation without
 the callback for comparison. Routing does depend slightly on the batch sizes (`-b`, `-ub`), because different kernels
