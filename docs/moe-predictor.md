@@ -118,6 +118,8 @@ In short, for Flash-Next on the R9700:
   after a large prompt. With it the refill isn't worth having.
 - **At the answer's start**, a cap of 1000 swaps speeds agent turns up by 11.7% (Q4) and 8.1% (Q6) for 2.6% and 0.8%
   on the usual answers. The text start saves more uploads but is slower overall.
+- **With more traces** from a second machine, agent-heavy, the predictor gains a little more, mostly on agent turns
+  and chat ([More traces](#more-traces)).
 
 These results are for one machine. To find the settings for yours, use
 [`moe-cache-tune.py`](../tools/moe-trace/README.md#tuning-a-machine).
@@ -257,6 +259,35 @@ and 76.7% for the decayed score at the answer's start.
 through both, Q6 selects 93.8% of the same experts at each token and layer, and most of the differences are in the
 router's lowest-ranked picks (99.4% agree on the first pick, 71.5% on the tenth). A predictor that had seen none of those
 conversations scored 84.1% on both, at the same cache size. Other kinds of quant (such as IQ4_XS) are untested.
+
+### More traces
+
+The predictor was trained again on 945 of the 948 traces above plus 236 traced on a 14600KF + RTX 4070 Ti: 7.9M more
+tokens of public conversations, 36% of them agent turns, none of them the same conversations. Both predictors are
+scored on the same held-out answers (every 5th trace of each source, 6828 answers), at the answer's start:
+
+| cache | decayed score | trained on 948 traces | trained on 1,181 |
+|---|---|---|---|
+| Q4_K_XL, 164 per layer | 75.8% | 86.4% | **86.7%** |
+| Q6_K_XL, 115 per layer | 65.8% | 77.9% | **78.2%** |
+
+By source, over the points from the answer's start to 512 tokens in, the new one is level or better on 55 of 64. It
+gains most on agent turns (+1.2 to +1.3 points on one coding agent's runs) and multilingual chat (+3.3, +6 at the
+answer's start). It loses up to 6 points on long-context fills, 256 tokens into the answer, where the decayed scores
+beat both predictors anyway.
+
+Live on the R9700, against the predictor trained on 948 traces (the setup of
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups), two passes each):
+
+| | Q4_K_XL | Q6_K_XL |
+|---|---|---|
+| usual answers | 40.82 → 40.62 tok/s (−0.5%) | 31.75 → 31.85 (+0.3%) |
+| follow-up turns | 44.67 → 47.34 (+6.0%) | 34.34 → 35.03 (+2.0%) |
+| agent turns | 45.50 → 45.17 (−0.7%) | 35.10 → 35.76 (+1.9%) |
+| the whole run | 205.2 → 203.4 s | 248.7 → 247.0 s |
+| hits | 81.13% → 81.18% | 71.27% → 72.03% |
+
+The setups use the predictor trained on 1,181 traces for both quants.
 
 ## The model
 
