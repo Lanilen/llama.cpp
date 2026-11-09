@@ -442,6 +442,7 @@ struct llama_moe_cache::impl {
         uint8_t * staging      = nullptr;
         size_t    staging_size = 0;
         ggml_backend_buffer_ptr jit_pinned; // --moe-cache-jit: the staging memory of one layer's uploads, pinned
+        std::vector<ggml_backend_buffer_ptr> pin_test; // LLAMA_MOE_CACHE_PIN_TEST_MIB: pinned memory that holds nothing
         uint8_t * jit_staging = nullptr;
         size_t    staging_used = 0;
         bool      pending      = false; // uploads were queued since the last synchronization
@@ -1159,6 +1160,22 @@ struct llama_moe_cache::impl {
             uint8_t * base = nullptr;
             if (buft_pinned != nullptr) {
                 d.pinned.reset(ggml_backend_buft_alloc_buffer(buft_pinned, maps_size + d.staging_size));
+            }
+            // LLAMA_MOE_CACHE_PIN_TEST_MIB=N (a probe): N MiB more of the same pinned memory, in pieces of 4 GiB, unused, to
+            // see whether the device runs as before with that much of its GTT window held, ahead of a pinned tier of experts
+            if (const char * env = getenv("LLAMA_MOE_CACHE_PIN_TEST_MIB"); env != nullptr && buft_pinned != nullptr) {
+                size_t left = (size_t) (atof(env)*1024*1024), done = 0;
+                while (left > 0) {
+                    const size_t n = std::min(left, (size_t) 4 << 30);
+                    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft_pinned, n);
+                    if (b == nullptr) {
+                        break;
+                    }
+                    d.pin_test.emplace_back(b);
+                    done += n; left -= n;
+                }
+                LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_PIN_TEST_MIB: %.0f MiB of %s held unused\n", __func__, done/1048576.0,
+                    ggml_backend_buft_name(buft_pinned));
             }
             if (d.pinned) {
                 base = (uint8_t *) ggml_backend_buffer_get_base(d.pinned.get());
