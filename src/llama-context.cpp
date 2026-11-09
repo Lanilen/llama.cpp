@@ -3298,6 +3298,24 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
     };
 
+    // the experts a..b-1 from their host copies (the MoE cache's pinned tier holds some elsewhere), consecutive copies
+    // together; padding after the last if it is read from src
+    auto upload_run = [&](int64_t a, int64_t b, size_t padding) {
+        while (a < b) {
+            const uint8_t * p = lctx->moe_cache ? (const uint8_t *) lctx->moe_cache->host_expert(src, a) : (const uint8_t *) src->data + a*expert_size;
+            int64_t c = a + 1;
+            while (c < b && lctx->moe_cache && (const uint8_t *) lctx->moe_cache->host_expert(src, c) == p + (c - a)*expert_size) {
+                c++;
+            }
+            const bool own = p == (const uint8_t *) src->data + a*expert_size;
+            const size_t size = (c - a)*expert_size + (c == b && own ? padding : 0);
+            upload(p, a*expert_size, size);
+            cst.bytes += copy_stats ? size : 0;
+            cst.calls += copy_stats;
+            a = c;
+        }
+    };
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3318,23 +3336,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                upload((const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-                cst.bytes += copy_stats ? (e - next)*expert_size : 0;
-                cst.calls += copy_stats;
+                upload_run(next, e, 0);
             }
             e   += n;
             next = e;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            upload((const uint8_t *) src->data + offset, offset, size);
-            cst.bytes += copy_stats ? size : 0;
-            cst.calls += copy_stats;
-        }
+        upload_run(next, last + 1, padding);
 
         first = last + 1;
     }

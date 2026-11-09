@@ -25,6 +25,12 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__linux__)
+#include <cstdio>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
@@ -700,8 +706,8 @@ struct llama_moe_cache::impl {
     int32_t tier_p = 0;          // LLAMA_MOE_TIER=P: the pinned tier's experts a layer (0: none)
     int32_t tier_gpu = 0;        // LLAMA_MOE_TIER_GPU=S: the misses a layer the device computes from the tier (0: none)
     std::vector<int32_t> gpu_cand;
-    ggml_context_ptr ctx_tier;
-    ggml_backend_buffer_ptr buf_tier;
+    std::vector<ggml_context_ptr> ctx_tiers;        // a context and a buffer a layer
+    std::vector<ggml_backend_buffer_ptr> buf_tiers;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> tier_of; // host experts -> their copies in the tier
     std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
 
@@ -1388,6 +1394,23 @@ struct llama_moe_cache::impl {
         return !g.is_lent.empty() && g.is_lent[s];
     }
 
+    // the host copy of expert e of l.experts[ip] to read: the tier's if it is in the tier (whose mapped pages B′ lets
+    // go), else the mapping's
+    static const uint8_t * host_expert(const layer & l, size_t ip, int64_t e) {
+        if (!l.tier_ptrs.empty() && l.tier_ptrs[ip][e] != nullptr) {
+            return (const uint8_t *) l.tier_ptrs[ip][e];
+        }
+        return (const uint8_t *) l.experts[ip]->data + e*l.experts[ip]->nb[2];
+    }
+
+    const void * host_expert(const ggml_tensor * w, int64_t e) const {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return (const uint8_t *) w->data + e*w->nb[2];
+        }
+        return host_expert(layers[it->second.il], it->second.ip, e);
+    }
+
     // hot spare mode: make expert e of layer l resident at slot s, or not resident if s < 0
     // the CPU branch sees the change at the next ubatch, the device maps when the shadows are flushed
     void set_resident(layer & l, int32_t e, int32_t s) {
@@ -1466,7 +1489,7 @@ struct llama_moe_cache::impl {
                     }
                 }
                 uint8_t * src = d.staging + d.half*half_size + d.staging_used;
-                const uint8_t * expert = (const uint8_t *) l.experts[ip]->data + e*expert_size;
+                const uint8_t * expert = host_expert(l, ip, e);
                 // the upload is recorded now and reads the staging memory when it runs, after its submission
                 if (d.upload_bg(d.backend, g.banks[ip], src, s*expert_size, expert_size)) {
                     if (get_worker() != nullptr) {
@@ -1494,7 +1517,7 @@ struct llama_moe_cache::impl {
                 d.staging_used = 0;
             }
             uint8_t * src = d.staging + d.staging_used;
-            copy_to_staging(src, (const uint8_t *) l.experts[ip]->data + e*expert_size, expert_size);
+            copy_to_staging(src, host_expert(l, ip, e), expert_size);
             ggml_backend_tensor_set_async(d.backend, g.banks[ip], src, s*expert_size, expert_size);
             d.staging_used += GGML_PAD(expert_size, 64);
             d.pending = true;
@@ -2006,7 +2029,7 @@ struct llama_moe_cache::impl {
                     const size_t sz = l.experts[ip]->nb[2];
                     uint8_t * dst = d.staging + h*half_size + used;
                     ok = d.upload_bg(d.backend, g.banks[ip], dst, sw.slot*sz, sz);
-                    chunks.back().jobs.push_back({ dst, (const uint8_t *) l.experts[ip]->data + e*sz, sz });
+                    chunks.back().jobs.push_back({ dst, host_expert(l, ip, e), sz });
                     used += GGML_PAD(sz, 64);
                 }
                 GGML_ASSERT(ok && "background upload failed in a text start");
@@ -2628,7 +2651,7 @@ struct llama_moe_cache::impl {
                     const size_t sz = l.experts[ip]->nb[2];
                     back.resize(sz);
                     ggml_backend_tensor_get(g.banks[ip], back.data(), (size_t) sl*sz, sz);
-                    bad = bad || memcmp(back.data(), (const uint8_t *) l.experts[ip]->data + (size_t) e*sz, sz) != 0;
+                    bad = bad || memcmp(back.data(), host_expert(l, ip, e), sz) != 0;
                 }
                 n_checked++;
                 if (bad && n_bad++ < 8) {
@@ -2698,13 +2721,27 @@ struct llama_moe_cache::impl {
     // memory, filled from the host experts; then every expert's maps say where its misses run
     void init_tier() {
         const std::vector<float> & prior = predictor->prior();
-        size_t n_tensors = 0;
-        for (const layer & l : layers) {
-            n_tensors += !l.tier_slot_of.empty() ? l.experts.size() : 0;
+        // the CPU's MUL_MAT_ID reads the tier's experts from it; without that it reads the mapping, whose pages then stay
+        auto remap = (void (*)(const ggml_tensor *, const void * const *, int64_t)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)), "ggml_backend_cpu_set_expert_remap");
+        if (!remap) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_TIER: the CPU backend can't read experts from the tier, it reads the mapping\n", __func__);
         }
-        ggml_init_params ip = { n_tensors*ggml_tensor_overhead(), nullptr, true };
-        ctx_tier.reset(ggml_init(ip));
+        // B′: the tier's experts are read from the tier from now on (the CPU through its remap, the uploads through
+        // host_expert), so their pages in the model's mapping are let go, layer by layer as the tier fills: RAM in use
+        // grows by one layer's tier at most (Q6 locked leaves no room for a whole tier). LLAMA_MOE_TIER_KEEP=1 keeps them.
+        const bool keep = getenv("LLAMA_MOE_TIER_KEEP") && atoi(getenv("LLAMA_MOE_TIER_KEEP")) != 0;
+        const bool release = remap != nullptr && !keep;
+        const std::vector<std::pair<unsigned long, unsigned long>> files = release ? file_mappings() : std::vector<std::pair<unsigned long, unsigned long>>();
+
         ggml_backend_buffer_type_t buft = nullptr;
+        // LLAMA_MOE_TIER_CPU=1 (a probe): the tier in ordinary memory, which only the CPU reads
+        if (getenv("LLAMA_MOE_TIER_CPU") && atoi(getenv("LLAMA_MOE_TIER_CPU")) != 0) {
+            buft = ggml_backend_cpu_buffer_type();
+        }
+        const int64_t t0 = ggml_time_us();
+        size_t bytes = 0, released = 0, not_mapped = 0;
+        int64_t t_release_us = 0;
         for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
             layer & l = layers[il];
             if (l.tier_slot_of.empty()) {
@@ -2724,8 +2761,11 @@ struct llama_moe_cache::impl {
             for (int32_t j = 0; j < P; ++j) {
                 l.tier_slot_of[order[j]] = j;
             }
+            // the layer's banks, a buffer of their own
+            ggml_init_params ip = { l.experts.size()*ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(ip));
             for (const ggml_tensor * w : l.experts) {
-                ggml_tensor * t = ggml_new_tensor_3d(ctx_tier.get(), w->type, w->ne[0], w->ne[1], P);
+                ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), w->type, w->ne[0], w->ne[1], P);
                 ggml_format_name(t, "moe_tier.%s", w->name);
                 l.tier.push_back(t);
                 tier_of[w] = t;
@@ -2735,67 +2775,115 @@ struct llama_moe_cache::impl {
                 auto pinned = (ggml_backend_dev_pinned_buffer_type_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
                     "ggml_backend_dev_pinned_buffer_type");
                 buft = pinned ? pinned(dev) : ggml_backend_dev_host_buffer_type(dev);
+                buft = buft ? buft : ggml_backend_cpu_buffer_type();
             }
-        }
-        // LLAMA_MOE_TIER_CPU=1 (a probe): the tier in ordinary memory, which only the CPU reads
-        if (buft == nullptr || (getenv("LLAMA_MOE_TIER_CPU") && atoi(getenv("LLAMA_MOE_TIER_CPU")) != 0)) {
-            buft = ggml_backend_cpu_buffer_type();
-        }
-        buf_tier.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_tier.get(), buft));
-        if (!buf_tier) {
-            throw std::runtime_error("failed to allocate the MoE cache's pinned tier");
-        }
-        // the copies: one job per expert and tensor, over a few threads
-        struct copy_job { uint8_t * dst; const uint8_t * src; size_t n; };
-        std::vector<copy_job> jobs;
-        size_t bytes = 0;
-        for (layer & l : layers) {
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buf) {
+                throw std::runtime_error(format("failed to allocate the MoE cache's pinned tier for layer %d", il));
+            }
+            // the copies: one job per expert and tensor, over a few threads
+            struct copy_job { uint8_t * dst; const uint8_t * src; size_t n; };
+            std::vector<copy_job> jobs;
+            l.tier_ptrs.assign(l.tier.size(), {});
             for (size_t ip = 0; ip < l.tier.size(); ++ip) {
                 const ggml_tensor * w = l.experts[ip];
-                for (int32_t e = 0; e < (int32_t) l.tier_slot_of.size(); ++e) {
+                l.tier_ptrs[ip].assign(n_expert, nullptr);
+                for (int32_t e = 0; e < n_expert; ++e) {
                     if (l.tier_slot_of[e] >= 0) {
-                        jobs.push_back({ (uint8_t *) l.tier[ip]->data + (size_t) l.tier_slot_of[e]*l.tier[ip]->nb[2],
-                                         (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2] });
+                        uint8_t * dst = (uint8_t *) l.tier[ip]->data + (size_t) l.tier_slot_of[e]*l.tier[ip]->nb[2];
+                        jobs.push_back({ dst, (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2] });
+                        l.tier_ptrs[ip][e] = dst;
                         bytes += w->nb[2];
                     }
                 }
             }
-        }
-        const int64_t t0 = ggml_time_us();
-        std::atomic<size_t> next{0};
-        std::vector<std::thread> threads;
-        for (int i = 0; i < 4; ++i) {
-            threads.emplace_back([&] {
-                for (size_t j; (j = next.fetch_add(1)) < jobs.size(); ) {
-                    memcpy(jobs[j].dst, jobs[j].src, jobs[j].n);
-                }
-            });
-        }
-        for (auto & t : threads) {
-            t.join();
-        }
-        // the CPU's MUL_MAT_ID reads the tier's experts from it
-        auto remap = (void (*)(const ggml_tensor *, const void * const *, int64_t)) ggml_backend_reg_get_proc_address(
-            ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)), "ggml_backend_cpu_set_expert_remap");
-        for (layer & l : layers) {
-            l.tier_ptrs.assign(l.tier.size(), {});
-            for (size_t ip = 0; ip < l.tier.size(); ++ip) {
-                l.tier_ptrs[ip].assign(l.tier_slot_of.size(), nullptr);
-                for (int32_t e = 0; e < (int32_t) l.tier_slot_of.size(); ++e) {
-                    if (l.tier_slot_of[e] >= 0) {
-                        l.tier_ptrs[ip][e] = (const uint8_t *) l.tier[ip]->data + (size_t) l.tier_slot_of[e]*l.tier[ip]->nb[2];
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> threads;
+            for (int i = 0; i < 4; ++i) {
+                threads.emplace_back([&] {
+                    for (size_t j; (j = next.fetch_add(1)) < jobs.size(); ) {
+                        memcpy(jobs[j].dst, jobs[j].src, jobs[j].n);
                     }
-                }
-                if (remap) {
+                });
+            }
+            for (auto & t : threads) {
+                t.join();
+            }
+            if (remap) {
+                for (size_t ip = 0; ip < l.tier.size(); ++ip) {
                     remap(l.experts[ip], l.tier_ptrs[ip].data(), (int64_t) l.tier_ptrs[ip].size());
                 }
             }
-        }
-        if (!remap) {
-            LLAMA_LOG_WARN("%s: LLAMA_MOE_TIER: the CPU backend can't read experts from the tier, it reads the mapping\n", __func__);
+            if (release) {
+                const int64_t t1 = ggml_time_us();
+                release_tier_pages(l, files, released, not_mapped);
+                t_release_us += ggml_time_us() - t1;
+            }
+            ctx_tiers.push_back(std::move(ctx));
+            buf_tiers.push_back(std::move(buf));
         }
         LLAMA_LOG_INFO("%s: LLAMA_MOE_TIER: %d experts a layer, %.2f GiB in %s, filled in %.1f s\n", __func__, tier_p,
-            bytes/1073741824.0, ggml_backend_buffer_name(buf_tier.get()), (ggml_time_us() - t0)/1e6);
+            bytes/1073741824.0, ggml_backend_buft_name(buft), (ggml_time_us() - t0)/1e6);
+        if (release) {
+            LLAMA_LOG_INFO("%s: LLAMA_MOE_TIER: let go of %.2f GiB of the mapping's pages in %.1f s%s\n", __func__,
+                released/1073741824.0, t_release_us/1e6,
+                not_mapped > 0 ? format(" (%.2f GiB of tier experts are not in a file mapping, kept)", not_mapped/1073741824.0).c_str() : "");
+        }
+    }
+
+    // the address ranges of the process's file mappings
+    static std::vector<std::pair<unsigned long, unsigned long>> file_mappings() {
+        std::vector<std::pair<unsigned long, unsigned long>> files;
+#if defined(__linux__)
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long a = 0, b = 0, off = 0, inode = 0;
+            char perms[8], dev[16];
+            if (sscanf(line.c_str(), "%lx-%lx %7s %lx %15s %lu", &a, &b, perms, &off, dev, &inode) == 6 && inode != 0) {
+                files.emplace_back(a, b);
+            }
+        }
+#endif
+        return files;
+    }
+
+    // B′: let go of the pages of l's tier experts in the model's mapping (unlocked and paged out); only in file
+    // mappings, since the pages of loaded weights would be lost
+    static void release_tier_pages(const layer & l, const std::vector<std::pair<unsigned long, unsigned long>> & files,
+            size_t & released, size_t & not_mapped) {
+#if defined(__linux__)
+        auto in_file = [&](unsigned long a, unsigned long b) {
+            return std::any_of(files.begin(), files.end(), [&](const auto & f) { return a >= f.first && b <= f.second; });
+        };
+        const unsigned long page = (unsigned long) sysconf(_SC_PAGESIZE);
+        for (const ggml_tensor * w : l.experts) {
+            for (int32_t e = 0; e < (int32_t) l.tier_slot_of.size(); ++e) {
+                if (l.tier_slot_of[e] < 0) {
+                    continue;
+                }
+                // the whole pages inside the expert's slice (its neighbours share the pages at its ends)
+                const unsigned long a  = (unsigned long) w->data + (unsigned long) e*w->nb[2];
+                const unsigned long a0 = (a + page - 1) & ~(page - 1);
+                const unsigned long b0 = (a + w->nb[2]) & ~(page - 1);
+                if (b0 <= a0) {
+                    continue;
+                }
+                if (!in_file(a0, b0)) {
+                    not_mapped += w->nb[2];
+                    continue;
+                }
+                munlock((void *) a0, b0 - a0);
+#ifdef MADV_PAGEOUT
+                madvise((void *) a0, b0 - a0, MADV_PAGEOUT);
+#endif
+                madvise((void *) a0, b0 - a0, MADV_DONTNEED);
+                released += b0 - a0;
+            }
+        }
+#else
+        GGML_UNUSED(l); GGML_UNUSED(files); GGML_UNUSED(released); GGML_UNUSED(not_mapped);
+#endif
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -2946,7 +3034,7 @@ struct llama_moe_cache::impl {
                     const ggml_tensor * w = l.experts[ip];
                     const size_t expert_size = w->nb[2];
                     for (size_t j = 0; j < n; ++j) {
-                        jit_jobs.push_back({ staging + j*expert_size, (const uint8_t *) w->data + jit_pick[j]*expert_size, expert_size });
+                        jit_jobs.push_back({ staging + j*expert_size, host_expert(l, ip, jit_pick[j]), expert_size });
                     }
                     staging += n*expert_size;
                 }
@@ -3020,7 +3108,7 @@ struct llama_moe_cache::impl {
                         }
                         for (size_t j = 0; j < n; ++j) {
                             jit_st.checked++;
-                            if (memcmp(back.data() + j*expert_size, (const uint8_t *) w->data + jit_pick[j]*expert_size, expert_size) != 0) {
+                            if (memcmp(back.data() + j*expert_size, host_expert(l, ip, jit_pick[j]), expert_size) != 0) {
                                 if (jit_st.bad_data++ < 8) {
                                     LLAMA_LOG_WARN("%s: layer %d, expert %d, %s: slot %d differs from the host expert\n",
                                         __func__, il, jit_pick[j], ggml_get_name(w), jit_share ? g.lent[j] : g.n_slots + (int32_t) j);
@@ -3422,6 +3510,10 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::get_tier_experts(const ggml_tensor * w) const {
     return pimpl->get_tier_experts(w);
+}
+
+const void * llama_moe_cache::host_expert(const ggml_tensor * w, int64_t e) const {
+    return pimpl->host_expert(w, e);
 }
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {

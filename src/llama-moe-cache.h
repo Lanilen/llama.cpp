@@ -117,6 +117,8 @@ public:
     ggml_tensor * get_experts(const ggml_tensor * w) const;
     // the pinned tier's copy of the host experts w (LLAMA_MOE_TIER), nullptr without one
     ggml_tensor * get_tier_experts(const ggml_tensor * w) const;
+    // the host copy of expert e of the host experts w to read: the pinned tier's if it holds it, else w's own
+    const void * host_expert(const ggml_tensor * w, int64_t e) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
