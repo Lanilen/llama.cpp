@@ -570,6 +570,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 il);
         cur = ffn_mix.cur;
 
+        // and the next layer's router on this layer's mixed FFN input, "ffn_moe_probs_pre2c": what the CPU could compute
+        // itself from the input it already receives (no hc mix of the next layer)
+        if (early_route && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
+            ggml_tensor * probs = ggml_soft_max(ctx0, build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur));
+            cb(probs, "ffn_moe_probs_pre2c", il + 1);
+            ggml_build_forward_expand(gf, probs);
+        }
+
         cur = build_layer_ffn(cur, il, ffn_mix.side);
         cb(cur, "ffn_out", il);
 

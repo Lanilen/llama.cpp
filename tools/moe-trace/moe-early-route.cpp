@@ -34,6 +34,7 @@ struct route_layer {
     std::vector<float>   probs;   // [tokens, n_expert], the real router's
     std::vector<float>   pre;     // [tokens, n_expert]
     std::vector<float>   pre2;    // [tokens, n_expert]
+    std::vector<float>   pre2c;   // [tokens, n_expert]: the next layer's router on this layer's mixed FFN input
 };
 
 struct route_data {
@@ -60,7 +61,8 @@ static bool route_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const bool is_prob = !is_topk && !is_miss && layer_of(t->name, "ffn_moe_probs", il);
     const bool is_pre  = !is_topk && !is_miss && !is_prob && layer_of(t->name, "ffn_moe_probs_pre", il);
     const bool is_pre2 = !is_topk && !is_miss && !is_prob && !is_pre && layer_of(t->name, "ffn_moe_probs_pre2", il);
-    const bool wanted  = is_topk || is_miss || is_prob || is_pre || is_pre2;
+    const bool is_pre2c = !is_topk && !is_miss && !is_prob && !is_pre && !is_pre2 && layer_of(t->name, "ffn_moe_probs_pre2c", il);
+    const bool wanted  = is_topk || is_miss || is_prob || is_pre || is_pre2 || is_pre2c;
     if (ask) {
         return wanted && data->recording;
     }
@@ -95,7 +97,7 @@ static bool route_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     } else {
         GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[1] == 1 && ggml_is_contiguous(t));
         l.n_expert = t->ne[0];
-        std::vector<float> & v = is_prob ? l.probs : is_pre ? l.pre : l.pre2;
+        std::vector<float> & v = is_prob ? l.probs : is_pre ? l.pre : is_pre2 ? l.pre2 : l.pre2c;
         const size_t start = v.size();
         v.resize(start + t->ne[0]);
         ggml_backend_tensor_get(t, v.data() + start, 0, ggml_nbytes(t));
@@ -188,7 +190,8 @@ int main(int argc, char ** argv) {
     const int64_t k = data.k;
     const std::vector<int> Ns = { (int) k, 12, 14, 16, 20, 32 };
     struct acc { double sel = 0, miss = 0, extra = 0, touch = 0; };   // sums over tokens and layers
-    const char * names[] = { "real top-k (check)", "pre: one block early", "pre2: two blocks early", "previous token" };
+    const char * names[] = { "real top-k (check)", "pre: one block early", "pre2: two blocks early", "pre2c: on the prev. FFN input", "previous token" };
+    const int P_PREV = 4;
     std::map<std::pair<int, int>, acc> sums, sums_mid;   // (predictor, N) -> sums, all layers / layers 2..n-2
     std::map<int, std::map<std::pair<int, int>, acc>> by_layer;
     double n_sel = 0, n_miss = 0, n_pairs = 0, n_miss_mid = 0, n_pairs_mid = 0, n_sel_mid = 0;
@@ -222,17 +225,15 @@ int main(int argc, char ** argv) {
             if (mid) {
                 n_sel_mid += k; n_miss_mid += n_m; n_pairs_mid += 1;
             }
-            for (int p = 0; p < 4; ++p) {
-                const float * v = p == 0 ? l.probs.data() + t*E : p == 1 ? l.pre.data() + t*E : p == 2 ? l.pre2.data() + t*E : nullptr;
-                if (p == 0 && l.probs.size() < (size_t) (t + 1)*E) {
+            for (int p = 0; p <= P_PREV; ++p) {
+                const std::vector<float> * src = p == 0 ? &l.probs : p == 1 ? &l.pre : p == 2 ? &l.pre2 : p == 3 ? &l.pre2c : nullptr;
+                if (src != nullptr && src->size() < (size_t) (t + 1)*E) {
                     continue;
                 }
-                if (p == 2 && l.pre2.size() < (size_t) (t + 1)*E) {
-                    continue;
-                }
+                const float * v = src ? src->data() + t*E : nullptr;
                 for (int N : Ns) {
                     std::vector<int32_t> pred;
-                    if (p == 3) {
+                    if (p == P_PREV) {
                         if (N != k || t == 0) {
                             continue;
                         }
@@ -264,7 +265,7 @@ int main(int argc, char ** argv) {
            (long long) k, n_miss/n_pairs, have_miss ? "" : " (no hot spare: no misses recorded)");
     auto table = [&](const char * title, const std::map<std::pair<int, int>, acc> & S, double ns, double nm, double np) {
         printf("%s\n%-24s %4s | %9s | %9s | %7s | %6s %6s\n", title, "predictor", "N", "selected", "misses", "extra", "touch", "waste");
-        for (int p = 0; p < 4; ++p) {
+        for (int p = 0; p <= P_PREV; ++p) {
             for (int N : Ns) {
                 auto it = S.find({ p, N });
                 if (it == S.end()) {
