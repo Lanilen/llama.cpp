@@ -1161,12 +1161,12 @@ struct llama_moe_cache::impl {
             if (buft_pinned != nullptr) {
                 d.pinned.reset(ggml_backend_buft_alloc_buffer(buft_pinned, maps_size + d.staging_size));
             }
-            // LLAMA_MOE_CACHE_PIN_TEST_MIB=N (a probe): N MiB more of the same pinned memory, in pieces of 4 GiB, unused, to
+            // LLAMA_MOE_CACHE_PIN_TEST_MIB=N (a probe): N MiB more of the same pinned memory, in pieces of 1 GiB (4 GiB ones fall back to unpinned memory), unused, to
             // see whether the device runs as before with that much of its GTT window held, ahead of a pinned tier of experts
             if (const char * env = getenv("LLAMA_MOE_CACHE_PIN_TEST_MIB"); env != nullptr && buft_pinned != nullptr) {
                 size_t left = (size_t) (atof(env)*1024*1024), done = 0;
                 while (left > 0) {
-                    const size_t n = std::min(left, (size_t) 4 << 30);
+                    const size_t n = std::min(left, (size_t) 1 << 30);
                     ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft_pinned, n);
                     if (b == nullptr) {
                         break;
