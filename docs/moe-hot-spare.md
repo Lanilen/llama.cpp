@@ -189,6 +189,16 @@ the CPU wrote the same text at 6.36 tok/s with 128 against 7.07 without (one run
 `cpu-chunks` stage keeps them off where they lose. `GGML_CPU_OP_STATS=1` prints, per batch size at exit, each CPU op's
 wall time, its threads' work and the time before they start, and MUL_MAT_ID's experts and GB/s by weight type.
 
+What remains is the size of the ops. On their own, with ~9 cold experts an op, the kernels read at 55–57 GB/s, ~83% of
+what plain streaming reads reach on the 1920X (67–73 GB/s of 89.6 on paper), and leaving out the arithmetic gains only
+5–7%: reads and arithmetic overlap. In a pass each MUL_MAT_ID gets only 2–5 missed experts, and every op pays its own
+start and its uneven finish (one 128-row chunk a thread at most), so the rate falls to 39–48 GB/s. Smaller chunks
+don't help (32–256 rows: 128 stays best). `GGML_CPU_MMID_GLU=1` makes one op of three: the CPU computes each chunk's
+gate and up rows together and writes silu(gate)·up, instead of two MUL_MAT_IDs and a GLU (with `GGML_CPU_MMID_FLAT`,
+up to 8 tokens). The result is the same up to the GLU's rounding (`llama-mmid-glu-check`). Verify batches of 1/3/8
+tokens: Q4 −2.8/−3.5/−5.9%, Q6 −1.5/−4.0/−1.6%; end to end, within the noise (Q4 usual answers +1.1%, agent turns
++0.4%; Q6 agent turns +1.1%; the same wall times).
+
 ### Vulkan submits
 
 The Vulkan backend submits a graph's work in pieces so that the GPU starts while the rest is recorded. By default it
@@ -564,6 +574,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU are synchronous reads again |
 | `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
 | `GGML_CPU_MMID_FLAT=C` | the CPU's MUL_MAT_ID (the missed experts) hands out the rows of all active experts in C-row chunks instead of a slice of each expert per thread, for up to 8 tokens per expert ([The CPU's experts](#the-cpus-experts); 128 on the 1920X + R9700) |
+| `GGML_CPU_MMID_GLU=1` | with `GGML_CPU_MMID_FLAT`, up to 8 tokens: the CPU's MUL_MAT_ID of gate and up and their SWIGLU in one op ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
 | `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the 1920X + R9700 ([The CPU's experts](#the-cpus-experts)) |
 | `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the 1920X + R9700) |
