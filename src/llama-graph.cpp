@@ -2727,6 +2727,47 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
             }
 
+            // LLAMA_MOE_HOST_SUM=1: the CPU weights and sums its own experts' outputs, so it sends the device one vector a
+            // token instead of one an expert slot (10x less over the bus); the device sums its own, and the two sums are
+            // added: the same sum as below, in another order
+            static const bool host_sum = [] { const char * e = getenv("LLAMA_MOE_HOST_SUM"); return e != nullptr && atoi(e) != 0; }();
+            if (host_sum && post_exp_norm == nullptr && (int64_t) hparams.n_expert_used(il) == experts_h->ne[1]) {
+                ggml_tensor * h = experts_h;
+                ggml_tensor * first_s = nullptr;
+                if (!weight_before_ffn) {
+                    h = ggml_mul(ctx0, h, weights);
+                    first_s = h;
+                }
+                // [n_embd, n_expert_used, n_tokens] -> [n_expert_used, n_embd, n_tokens], each row summed
+                h = ggml_cont(ctx0, ggml_permute(ctx0, h, 1, 0, 2, 3));
+                first_s = first_s ? first_s : h;
+                h = ggml_sum_rows(ctx0, h);
+                h = ggml_reshape_2d(ctx0, h, h->ne[1], h->ne[2]);
+                cb(h, "ffn_moe_out_host", il);
+                for (ggml_tensor * t = first_s; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+                    if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                        ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+                    }
+                    if (t == h) {
+                        break;
+                    }
+                }
+
+                ggml_backend_t backend_layer = moe_cache->layer_backend(il);
+                ggml_tensor * moe_c = aggregate_experts(experts_c);
+                ggml_tensor * moe_out = ggml_add(ctx0, moe_c, h);
+                if (backend_layer) {
+                    // the device's sum and the add run where the layer runs, as the add of the branches did
+                    for (ggml_tensor * t = ggml_get_next_tensor(ctx0, h); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+                        if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                            ggml_backend_sched_set_tensor_backend(sched, t, backend_layer);
+                        }
+                    }
+                }
+                cb(moe_out, "ffn_moe_out", il);
+                return moe_out;
+            }
+
             // each expert output comes from one branch and is zero in the other, so the sum is exact
             ggml_tensor * experts = ggml_add(ctx0, experts_c, experts_h);
             if (ggml_backend_t backend_layer = moe_cache->layer_backend(il)) {
