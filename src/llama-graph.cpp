@@ -2194,6 +2194,30 @@ static bool moe_side_weights_on(const ggml_tensor * t, ggml_backend_dev_t dev, i
     return true;
 }
 
+// LLAMA_MOE_HOST_SUM: dst [n_embd, n_tokens] = the sum over the slots of src[0] [n_embd, n_slots, n_tokens], each slot
+// scaled by src[1] [1, n_slots, n_tokens] when given; each thread a slice of the embedding
+static void llm_moe_host_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const ggml_tensor * h = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const int64_t n_embd = h->ne[0], n_slots = h->ne[1], n_tokens = h->ne[2];
+    const int64_t per = ((n_embd + nth - 1)/nth + 15) & ~15;
+    const int64_t i0 = std::min<int64_t>(n_embd, ith*per), i1 = std::min<int64_t>(n_embd, i0 + per);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        float * o = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = i0; i < i1; ++i) {
+            o[i] = 0.0f;
+        }
+        for (int64_t u = 0; u < n_slots; ++u) {
+            const float * r = (const float *) ((const char *) h->data + u*h->nb[1] + t*h->nb[2]);
+            const float wu = w ? *(const float *) ((const char *) w->data + u*w->nb[1] + t*w->nb[2]) : 1.0f;
+            for (int64_t i = i0; i < i1; ++i) {
+                o[i] += wu*r[i];
+            }
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2732,26 +2756,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // added: the same sum as below, in another order
             static const bool host_sum = [] { const char * e = getenv("LLAMA_MOE_HOST_SUM"); return e != nullptr && atoi(e) != 0; }();
             if (host_sum && post_exp_norm == nullptr && (int64_t) hparams.n_expert_used(il) == experts_h->ne[1]) {
-                ggml_tensor * h = experts_h;
-                ggml_tensor * first_s = nullptr;
-                if (!weight_before_ffn) {
-                    h = ggml_mul(ctx0, h, weights);
-                    first_s = h;
-                }
-                // [n_embd, n_expert_used, n_tokens] -> [n_expert_used, n_embd, n_tokens], each row summed
-                h = ggml_cont(ctx0, ggml_permute(ctx0, h, 1, 0, 2, 3));
-                first_s = first_s ? first_s : h;
-                h = ggml_sum_rows(ctx0, h);
-                h = ggml_reshape_2d(ctx0, h, h->ne[1], h->ne[2]);
+                // one op: each thread a slice of the embedding, all tokens, the slots summed in order (as the device's
+                // adds); MUL + CONT(PERMUTE) + SUM_ROWS cost 50-190 us a layer, several times the copy they save
+                ggml_tensor * args[2] = { experts_h, weight_before_ffn ? nullptr : weights };
+                ggml_tensor * h = ggml_custom_4d(ctx0, GGML_TYPE_F32, experts_h->ne[0], experts_h->ne[2], 1, 1, args,
+                    weight_before_ffn ? 1 : 2, llm_moe_host_sum, GGML_N_TASKS_MAX, nullptr);
                 cb(h, "ffn_moe_out_host", il);
-                for (ggml_tensor * t = first_s; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
-                    if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
-                        ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
-                    }
-                    if (t == h) {
-                        break;
-                    }
-                }
+                ggml_backend_sched_set_tensor_backend(sched, h, backend_cpu);
 
                 ggml_backend_t backend_layer = moe_cache->layer_backend(il);
                 ggml_tensor * moe_c = aggregate_experts(experts_c);
