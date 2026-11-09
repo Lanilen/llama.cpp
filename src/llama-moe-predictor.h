@@ -43,6 +43,7 @@ public:
     const std::vector<map_kind> & maps() const;          // the count maps it reads, in this order
     const std::vector<int32_t>  & horizons() const;      // tokens, one prediction each
     int32_t every() const;                               // generated tokens between predictions
+    const std::vector<float> & prior() const;            // [n_layer*n_expert]: how often each expert is routed overall
     bool reads_turn_embd() const;                        // it reads the turn's mean token embedding
     bool is_start() const;                               // role "start": it predicts before the turn's prompt runs
 

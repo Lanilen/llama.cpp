@@ -1745,7 +1745,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+        ggml_mul_mat_id(ctx0, moe_tier_branch ? moe_cache->get_tier_experts(w) : moe_cache->get_experts(w), cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2716,6 +2716,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * experts_h = build_experts(cur, ids_h, nullptr, selected_experts);
             cb(experts_h, "ffn_moe_down_host", il);
 
+            // with a pinned tier, the misses it holds are computed from it (miss leaves them out)
+            ggml_tensor * first_t = nullptr;
+            ggml_tensor * experts_t = nullptr;
+            if (maps.tier_ids != nullptr) {
+                ggml_tensor * ids_r = ggml_reshape_1d(ctx0, ids_rec, ggml_nelements(ids_rec));
+                ggml_tensor * ids_t = ggml_get_rows(ctx0, maps.tier_ids, ids_r);
+                first_t = ids_t;
+                ggml_tensor * slots_t = ggml_get_rows(ctx0, maps.tier_slot, ids_r);
+                cb(ids_t, "ffn_moe_tier", il);
+                ids_t   = ggml_reshape_2d(ctx0, ids_t,   selected_experts->ne[0], selected_experts->ne[1]);
+                slots_t = ggml_reshape_2d(ctx0, slots_t, selected_experts->ne[0], selected_experts->ne[1]);
+                moe_tier_branch = true;
+                experts_t = build_experts(cur, ids_t, slots_t, selected_experts);
+                moe_tier_branch = false;
+                cb(experts_t, "ffn_moe_down_tier", il);
+            }
+
             // every op of the CPU branch runs on the CPU: from 32 tokens the scheduler would otherwise offload its matrix
             // multiplications to a GPU by copying all the experts of the layer, and reserve a compute buffer for that
             for (ggml_tensor * t = first_h; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
@@ -2725,6 +2742,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (t == experts_h) {
                     break;
                 }
+            }
+            if (experts_t != nullptr) {
+                for (ggml_tensor * t = first_t; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+                    if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                        ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+                    }
+                    if (t == experts_t) {
+                        break;
+                    }
+                }
+                experts_h = ggml_add(ctx0, experts_h, experts_t);
+                ggml_backend_sched_set_tensor_backend(sched, experts_h, backend_cpu);
             }
 
             // each expert output comes from one branch and is zero in the other, so the sum is exact

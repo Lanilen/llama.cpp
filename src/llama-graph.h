@@ -1066,6 +1066,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    mutable bool moe_tier_branch = false; // build_lora_mm_id reads the MoE cache's pinned tier, not its banks
 
     // tensors that read the MoE input but not its output (a shared expert, say), set before build_moe_ffn: with the
     // hot spare the GPU computes them in the cache branch, while the CPU computes the misses, rather than after them

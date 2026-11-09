@@ -37,6 +37,9 @@ struct llama_moe_cache_hot_spare_maps {
     ggml_tensor * miss = nullptr; // I32 [1, n_expert] in host memory: e if expert e is not resident, else -1
     ggml_tensor * slot = nullptr; // I32 [1, n_expert] on the cache device: the slot of e if it is resident, else -1
     ggml_tensor * hit  = nullptr; // I32 [1, n_expert] on the cache device: e if it is resident, else -1
+    // with a pinned tier (LLAMA_MOE_TIER): the misses it holds, which the CPU computes from it (miss then leaves them out)
+    ggml_tensor * tier_ids  = nullptr; // I32 [1, n_expert] in host memory: e if expert e is in the tier and not resident, else -1
+    ggml_tensor * tier_slot = nullptr; // I32 [1, n_expert] in host memory: its slot in the tier, -1 likewise
 };
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
@@ -112,6 +115,8 @@ public:
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
+    // the pinned tier's copy of the host experts w (LLAMA_MOE_TIER), nullptr without one
+    ggml_tensor * get_tier_experts(const ggml_tensor * w) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

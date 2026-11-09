@@ -78,6 +78,7 @@ const std::vector<int32_t> & llama_moe_predictor::hidden_layers() const { return
 const std::vector<llama_moe_predictor::map_kind> & llama_moe_predictor::maps() const { return pimpl->maps; }
 const std::vector<int32_t> & llama_moe_predictor::horizons() const { return pimpl->horizons; }
 int32_t llama_moe_predictor::every() const { return pimpl->every; }
+const std::vector<float> & llama_moe_predictor::prior() const { return pimpl->prior; }
 bool llama_moe_predictor::reads_turn_embd() const { return pimpl->use_turn; }
 bool llama_moe_predictor::is_start() const { return pimpl->start; }
 
