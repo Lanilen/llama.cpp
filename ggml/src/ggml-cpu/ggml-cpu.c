@@ -1574,6 +1574,16 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// GGML_CPU_MMID_FLAT's chunk size, 0: off (read once)
+static int64_t ggml_cpu_mmid_flat(void) {
+    static int64_t mmid_flat = -1;
+    if (mmid_flat < 0) {
+        const char * env = getenv("GGML_CPU_MMID_FLAT");
+        mmid_flat = env ? MAX(1, atoll(env)) : 0;
+    }
+    return mmid_flat;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1699,11 +1709,7 @@ static void ggml_compute_forward_mul_mat_id(
     // GGML_CPU_MMID_FLAT=C: with up to 8 tokens per expert, the rows of all active experts are one list, cut into chunks
     // of C rows that the threads take in turn, instead of every thread taking a slice of each expert: longer runs
     // through cold weights, still balanced between threads of unequal speed
-    static int64_t mmid_flat = -1;
-    if (mmid_flat < 0) {
-        const char * env = getenv("GGML_CPU_MMID_FLAT");
-        mmid_flat = env ? MAX(1, atoll(env)) : 0;
-    }
+    const int64_t mmid_flat = ggml_cpu_mmid_flat();
     if (mmid_flat > 0) {
         int64_t total = 0, max_cne1 = 0;
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -1821,6 +1827,227 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+}
+
+// MUL_MAT_ID(gate) + MUL_MAT_ID(up) + SWIGLU in one pass (GGML_CPU_MMID_GLU, with GGML_CPU_MMID_FLAT, up to 8 tokens):
+// a chunk's rows of gate and up of one expert are computed together and silu(gate)*up written to the GLU's output, so
+// the two products are one op over twice the rows (fewer, longer runs through the cold weights) and their outputs are
+// never written
+static void ggml_compute_forward_mul_mat_id_glu_one_chunk(
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * src0g,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    const int64_t cur_a,
+    const int64_t ir0_start,
+    const int64_t ir0_end,
+    const int64_t ir1_end,
+    const char * src0g_cur,
+    const char * src0u_cur,
+    const struct mmid_row_mapping * matrix_rows,
+    const size_t row_size,
+    const bool src1_cont,
+    const void * wdata) {
+
+    const int64_t ne00 = src0g->ne[0];
+    const size_t  nb01 = src0g->nb[1];
+    const int64_t ne11 = src1->ne[1];
+    const size_t  nb11 = src1->nb[1];
+    const size_t  nb12 = src1->nb[2];
+    const size_t  nb1  = dst->nb[1];
+    const size_t  nb2  = dst->nb[2];
+
+    ggml_vec_dot_t const vec_dot      = type_traits_cpu[src0g->type].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits_cpu[src0g->type].vec_dot_type;
+
+    const int64_t blck_0 = 16;
+    float tg[16], tu[16];
+
+    for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+        for (int64_t ir1 = 0; ir1 < ir1_end; ++ir1) {
+            const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+            const int64_t i11 = row_mapping.i1 % ne11;
+            const int64_t i12 = row_mapping.i2;
+            const char * src1_col = (const char *) wdata +
+                (src1_cont || src1->type != vec_dot_type
+                ? (i11      + i12*ne11)*row_size
+                : (i11*nb11 + i12*nb12));
+            float * dst_col = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+            const int64_t n = MIN(iir0 + blck_0, ir0_end) - iir0;
+            for (int64_t k = 0; k < n; ++k) {
+                vec_dot(ne00, &tg[k], 0, src0g_cur + (iir0 + k)*nb01, 0, src1_col, 0, 1);
+                vec_dot(ne00, &tu[k], 0, src0u_cur + (iir0 + k)*nb01, 0, src1_col, 0, 1);
+            }
+            for (int64_t k = 0; k < n; ++k) {
+                dst_col[iir0 + k] = ggml_silu_f32(tg[k])*tu[k];
+            }
+        }
+    }
+}
+
+// the GLU node at node_n + 2 of gate and up MUL_MAT_IDs at node_n and node_n + 1 (either order) can be computed by
+// ggml_compute_forward_mul_mat_id_glu; *gate and *up are set
+static bool ggml_cpu_mmid_glu_fusable(const struct ggml_cgraph * cgraph, int node_n,
+        const struct ggml_tensor ** gate, const struct ggml_tensor ** up) {
+    static int on = -1;
+    if (on < 0) {
+        const char * env = getenv("GGML_CPU_MMID_GLU");
+        on = env != NULL && atoi(env) != 0;
+    }
+    if (!on || ggml_cpu_mmid_flat() == 0 || node_n + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const struct ggml_tensor * a   = cgraph->nodes[node_n];
+    const struct ggml_tensor * b   = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+    if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        ((a->flags | b->flags | glu->flags) & GGML_TENSOR_FLAG_COMPUTE) == 0 || glu->src[1] == NULL) {
+        return false;
+    }
+    const struct ggml_tensor * g = glu->src[0];
+    const struct ggml_tensor * u = glu->src[1];
+    if (!((g == a && u == b) || (g == b && u == a))) {
+        return false;
+    }
+    if (!ggml_node_has_n_uses(cgraph, node_n, 1) || !ggml_node_has_n_uses(cgraph, node_n + 1, 1)) {
+        return false;
+    }
+    const struct ggml_tensor * w0 = g->src[0], * w1 = u->src[0];
+    if (g->src[1] != u->src[1] || g->src[2] != u->src[2] || w0->type != w1->type ||
+        w0->ne[0] != w1->ne[0] || w0->ne[1] != w1->ne[1] || w0->ne[2] != w1->ne[2] || w0->nb[1] != w1->nb[1] || w0->nb[2] != w1->nb[2] ||
+        g->src[1]->type != GGML_TYPE_F32 || g->src[2]->ne[1] > 8 ||
+        g->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, glu) ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(g)) {
+        return false;
+    }
+    *gate = g;
+    *up   = u;
+    return true;
+}
+
+static void ggml_compute_forward_mul_mat_id_glu(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst, const struct ggml_tensor * gate, const struct ggml_tensor * up) {
+
+    const struct ggml_tensor * src0g = gate->src[0];
+    const struct ggml_tensor * src0u = up->src[0];
+    const struct ggml_tensor * src1  = gate->src[1];
+    const struct ggml_tensor * ids   = gate->src[2];
+
+    const int64_t ne00 = src0g->ne[0], ne01 = src0g->ne[1];
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const size_t  nb10 = src1->nb[0], nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+    const size_t  nb02 = src0g->nb[2];
+    const size_t  nb1 = dst->nb[1], nb2 = dst->nb[2];
+    const int64_t ne0 = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const bool src1_cont = ggml_is_contiguous(src1);
+    enum ggml_type    const vec_dot_type = type_traits_cpu[src0g->type].vec_dot_type;
+    ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
+
+    GGML_ASSERT(src0g->nb[0] == ggml_type_size(src0g->type));
+    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+    GGML_UNUSED(ne00);
+
+    const int n_ids = ids->ne[0];
+    const int n_as  = src0g->ne[2];
+
+    // the work buffer as the MUL_MAT_ID's (the plan sized it for the gate or up node, the same shapes)
+    void * wdata_cur = params->wdata;
+    if (src1->type != vec_dot_type) {
+        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+    }
+    int64_t * matrix_row_counts = incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
+    struct mmid_row_mapping * matrix_rows =
+        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+
+    if (src1->type != vec_dot_type) {
+        char * wdata = params->wdata;
+        const size_t nbw0 = ggml_type_size(vec_dot_type);
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw2 = nbw1*ne11;
+        const size_t nbw3 = nbw2*ne12;
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    size_t bs = ggml_blck_size(vec_dot_type);
+                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (ne10_block_end - ne10_block_start) * bs);
+                }
+            }
+        }
+    }
+
+    if (ith == 0) {
+        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
+                if (i02 == -1) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                matrix_row_counts[i02] += 1;
+            }
+        }
+        *(atomic_int *)(atomic_current_chunk + 0) = nth;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // the rows of all active experts as one list, in chunks of GGML_CPU_MMID_FLAT rows (each row of gate and of up)
+    const int64_t mmid_flat = ggml_cpu_mmid_flat();
+    int64_t total = 0;
+    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        total += matrix_row_counts[cur_a] > 0 ? ne01 : 0;
+    }
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+    const int64_t n_chunks = (total + mmid_flat - 1)/mmid_flat;
+    atomic_int * chunk_ctr = (atomic_int *)(atomic_current_chunk + 0);
+    int64_t chunk = ith;
+    int cur_a = 0;
+    int64_t base = 0;
+    while (chunk < n_chunks) {
+        const int64_t r0 = chunk*mmid_flat;
+        const int64_t r1 = MIN(total, r0 + mmid_flat);
+        for (; cur_a < n_as; ++cur_a) {
+            if (matrix_row_counts[cur_a] == 0) {
+                continue;
+            }
+            if (base + ne01 > r0) {
+                break;
+            }
+            base += ne01;
+        }
+        int64_t b = base;
+        for (int a = cur_a; a < n_as && b < r1; ++a) {
+            const int64_t cne1 = matrix_row_counts[a];
+            if (cne1 == 0) {
+                continue;
+            }
+            const int64_t lo = MAX(r0, b);
+            const int64_t hi = MIN(r1, b + ne01);
+            if (lo < hi) {
+                ggml_compute_forward_mul_mat_id_glu_one_chunk(dst, src0g, src1, ids, a, lo - b, hi - b, cne1,
+                    (const char *) src0g->data + a*nb02, (const char *) src0u->data + a*nb02,
+                    matrix_rows, row_size, src1_cont, wdata);
+            }
+            b += ne01;
+        }
+        chunk = atomic_fetch_add_explicit(chunk_ctr, 1, memory_order_relaxed);
     }
 }
 
@@ -3170,6 +3397,14 @@ static int ggml_cpu_try_fuse_ops(
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const struct ggml_tensor * gate, * up;
+        if (ggml_cpu_mmid_glu_fusable(cgraph, node_n, &gate, &up)) {
+            ggml_compute_forward_mul_mat_id_glu(params, cgraph->nodes[node_n + 2], gate, up);
+            return 2;
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
@@ -3365,6 +3600,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             g_cpu_ops.start[par][state->ith] = t0;
             if (state->ith == 0 && node->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cpu_op_stats_mmid(node, ggml_cpu_op_stats_slot(node));
+                // fused with the next MUL_MAT_ID and its GLU: the op reads both
+                const struct ggml_tensor * g, * u;
+                if (ggml_cpu_mmid_glu_fusable(cgraph, node_n, &g, &u)) {
+                    ggml_cpu_op_stats_mmid(cgraph->nodes[node_n + 1], ggml_cpu_op_stats_slot(node));
+                }
             }
         }
 
