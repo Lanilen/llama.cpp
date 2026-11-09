@@ -465,6 +465,14 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   token's misses do as well (22%, 26% right). Only the layers where routing follows the token do better, up to 44%
   (7 and 47; 3 in one of the two sets of traces). Keeping to the tokens the model weights the engram most for (its gate) made the tables worse (13%, 8%
   right). Uploading the guesses would take about 40 ms of PCIe a token.
+- **The GPU computing some of the misses from pinned host memory,** beside the CPU computing the rest. Each layer's most
+  routed experts (by the predictor's prior) were moved into Vulkan pinned memory, their mapped pages let go so RAM
+  stayed as before (Q4 256 a layer, 36 GB; Q6 270, 52 GB); the R9700 read them in place for the best non-resident ones
+  while the CPU read them through a pointer table. The results were exact, but slower at every share: verify passes of
+  3 tokens, Q4 50.0 ms -> 51.9 / 53.6 / 57.6 with the GPU taking 17 / 25 / 35% of the misses, Q6 67.7 -> 70.7 / 75.8 /
+  84.6 (16 / 26 / 38%). The R9700 reads host memory at about 10 GB/s against the CPU's 45–50, so its share outlasts
+  the CPU time it saves, and its reads take memory bandwidth from the CPU (q4_K 48 -> 41–45 GB/s). Archived as the tag
+  `archive/pinned-tier`; a faster bus or more GPUs each taking a small share could change it.
 
 ## Still to measure
 
