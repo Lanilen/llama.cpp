@@ -264,9 +264,17 @@ uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
     return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
 }
 
+// a tensor the device reads in place from host memory: every tensor on a UMA device, and on any device the tensors in its
+// own pinned buffer type (Vulkan<N>_Pinned, memory the driver allocated; defined with the buffer types below)
+static bool ggml_vk_pinned_for_device(const ggml_backend_buffer_t buffer, size_t device_idx);
+static bool ggml_vk_tensor_on_host(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
+    const ggml_tensor * base = t->view_src ? t->view_src : t;
+    return ctx->device->uma || (base->buffer != nullptr && ggml_vk_pinned_for_device(base->buffer, ctx->device->idx));
+}
+
 size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
-    if (ctx->device->uma) {
+    if (ggml_vk_tensor_on_host(ctx, t)) {
         vk_buffer buf = nullptr;
         size_t off = 0;
         ggml_vk_host_get(ctx->device, t->data, buf, off);
@@ -5779,7 +5787,7 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
 
     vk_buffer buffer = nullptr;
     size_t offset = 0;
-    if (ctx->device->uma) {
+    if (ggml_vk_tensor_on_host(ctx, tensor)) {
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
@@ -6463,10 +6471,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool src0_uma = false;
     bool src1_uma = false;
 
-    if (ctx->device->uma) {
+    if (ggml_vk_tensor_on_host(ctx, src0)) {
         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src0_uma = d_Qx != nullptr;
+    }
+    if (ggml_vk_tensor_on_host(ctx, src1)) {
+        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src1_uma = d_Qy != nullptr;
     }
 
@@ -7509,10 +7519,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     bool src0_uma = false;
     bool src1_uma = false;
 
-    if (ctx->device->uma) {
+    if (ggml_vk_tensor_on_host(ctx, src0)) {
         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src0_uma = d_Qx != nullptr;
+    }
+    if (ggml_vk_tensor_on_host(ctx, src1)) {
+        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src1_uma = d_Qy != nullptr;
     }
 
@@ -15831,6 +15843,12 @@ static ggml_backend_buffer_t ggml_backend_vk_pinned_buffer_type_alloc_buffer(ggm
     return buffer;
 }
 
+static bool ggml_vk_pinned_for_device(const ggml_backend_buffer_t buffer, size_t device_idx) {
+    const ggml_backend_buffer_type_t buft = buffer->buft;
+    return buft != nullptr && buft->iface.get_name == ggml_backend_vk_pinned_buffer_type_name &&
+           ((ggml_backend_vk_pinned_buffer_type_context *) buft->context)->device == device_idx;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_vk_device_pinned_buffer_type(ggml_backend_dev_t dev) {
     ggml_vk_instance_init();
     if (vk_instance.multi_device) {
@@ -16682,6 +16700,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // the device's own pinned host memory is read in place, over the bus (the MoE cache's pinned tier)
+    if (buft->iface.get_name == ggml_backend_vk_pinned_buffer_type_name) {
+        return ((ggml_backend_vk_pinned_buffer_type_context *) buft->context)->device ==
+               ((ggml_backend_vk_device_context *) dev->context)->device;
+    }
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
     }
