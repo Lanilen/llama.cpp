@@ -958,6 +958,15 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
+bool ggml_backend_event_try_synchronize(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+    if (event->device->iface.event_try_synchronize == NULL) {
+        ggml_backend_event_synchronize(event);
+        return true;
+    }
+    return event->device->iface.event_try_synchronize(event->device, event);
+}
+
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.event_wait != NULL);

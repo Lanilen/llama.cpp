@@ -1559,9 +1559,10 @@ struct llama_moe_cache::impl {
         prefetch_job            job;              // posted to the threads
         prefetch_job            pending;          // armed: its read is in flight until the launch synchronizes it
         ggml_backend_event_t    ev[2] = { nullptr, nullptr };
+        bool                    stale[2] = { false, false };   // a read whose launch was skipped: synchronized before the event is reused
         std::vector<int32_t>    ids[2];           // [n_top*8] each, the read's target, by job parity
         std::vector<std::thread> threads;
-        std::atomic<size_t> jobs{0}, experts{0}, chunks{0}, bytes{0}, cut{0};
+        std::atomic<size_t> jobs{0}, experts{0}, chunks{0}, bytes{0}, cut{0}, late{0};
         std::atomic<int64_t> t_us{0}, t_wait_us{0};
     } pf;
 
@@ -1664,6 +1665,11 @@ struct llama_moe_cache::impl {
         if (pf.ev[b] == nullptr) {
             pf.ev[b] = ggml_backend_event_new(ggml_backend_get_device(be));
         }
+        if (pf.stale[b]) {
+            // the read two layers ago wasn't done in time and its launch was skipped: long done now, its copies run here
+            ggml_backend_event_synchronize(pf.ev[b]);
+            pf.stale[b] = false;
+        }
         const int64_t n = std::min<int64_t>(ggml_nelements(pred), (int64_t) pf.ids[b].size());
         ggml_backend_tensor_get_async(be, pred, pf.ids[b].data(), 0, n*sizeof(int32_t));
         ggml_backend_event_record(pf.ev[b], be);
@@ -1684,8 +1690,15 @@ struct llama_moe_cache::impl {
             return;
         }
         const int64_t t0 = ggml_time_us();
-        ggml_backend_event_synchronize(pf.ev[pf.pending.buf]);
+        // never wait: if the device hasn't finished the cache branch and the read, this layer goes without
+        const bool ready = ggml_backend_event_try_synchronize(pf.ev[pf.pending.buf]);
         pf.t_wait_us += ggml_time_us() - t0;
+        if (!ready) {
+            pf.stale[pf.pending.buf] = true;
+            pf.pending.il = -1;
+            pf.late++;
+            return;
+        }
         {
             std::lock_guard<std::mutex> lk(pf.m);
             pf.job = pf.pending;
@@ -1763,14 +1776,17 @@ struct llama_moe_cache::impl {
                         const int64_t r0 = c*pf.C, r1 = std::min(w->ne[1], r0 + pf.C);
                         const uint8_t * p = (const uint8_t *) w->data + (size_t) e*w->nb[2] + (size_t) r0*w->nb[1];
                         const size_t len = (size_t) (r1 - r0)*w->nb[1];
-                        for (size_t off = 0; off < len; off += 64) {
-                            sink += *(const volatile uint64_t *) (p + off);
+                        size_t off = 0;
+                        for (; off < len && !cut; off += 4096) {
+                            // a page at a time, so a cancel (the next layer's CPU branch starting) stops the reads at once
+                            const size_t end = std::min(len, off + 4096);
+                            for (size_t o = off; o < end; o += 64) {
+                                sink += *(const volatile uint64_t *) (p + o);
+                            }
+                            cut = pf.gen.load(std::memory_order_relaxed) != job.gen;
                         }
-                        bytes += len;
+                        bytes += std::min(off, len);
                         n_chunks++;
-                        if (pf.gen.load(std::memory_order_relaxed) != job.gen) {
-                            cut = true;
-                        }
                     }
                 }
             }
@@ -1797,8 +1813,9 @@ struct llama_moe_cache::impl {
         }
         const double j = (double) pf.jobs;
         LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_PREFETCH: %zu layers launched, %.2f experts to touch a layer, %.2f MiB touched a layer "
-            "(%zu chunks), %.0f us a layer in the threads, %.1f us a layer synchronizing the ids on the main thread, %zu thread-jobs cut short\n",
-            pf.jobs.load(), pf.experts/j, pf.bytes/j/1048576.0, pf.chunks.load(), pf.t_us/j, pf.t_wait_us/j, pf.cut.load());
+            "(%zu chunks), %.0f us a layer in the threads, %.1f us a layer testing the ids on the main thread, %zu thread-jobs cut short, "
+            "%zu layers skipped (the ids not back in time)\n",
+            pf.jobs.load(), pf.experts/j, pf.bytes/j/1048576.0, pf.chunks.load(), pf.t_us/j, pf.t_wait_us/j, pf.cut.load(), pf.late.load());
     }
 
     void update(int64_t n_tokens, int64_t pos0, int gen) {

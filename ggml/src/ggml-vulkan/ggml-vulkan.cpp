@@ -16741,8 +16741,8 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
     delete event;
 }
 
-static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    VK_LOG_DEBUG("ggml_backend_vk_device_event_synchronize(backend=" << dev << ", event=" << event << ")");
+// timeout_ns: how long to wait for the event's semaphore; false if it was not reached in that time (nothing done then)
+static bool ggml_backend_vk_device_event_synchronize_impl(ggml_backend_dev_t dev, ggml_backend_event_t event, uint64_t timeout_ns) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
     vk_event *vkev = (vk_event *)event->context;
@@ -16752,7 +16752,11 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
-        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+        const vk::Result res = device->device.waitSemaphores(swi, timeout_ns);
+        if (res == vk::Result::eTimeout) {
+            return false;
+        }
+        VK_CHECK(res, "event_synchronize", device);
 
         for (auto & cpys : vkev->out_memcpys) {
             for (auto & cpy : *cpys) {
@@ -16779,6 +16783,17 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
             vkev->cmd_buffer = nullptr;
         }
     }
+    return true;
+}
+
+static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    VK_LOG_DEBUG("ggml_backend_vk_device_event_synchronize(backend=" << dev << ", event=" << event << ")");
+    ggml_backend_vk_device_event_synchronize_impl(dev, event, UINT64_MAX);
+}
+
+static bool ggml_backend_vk_device_event_try_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    VK_LOG_DEBUG("ggml_backend_vk_device_event_try_synchronize(backend=" << dev << ", event=" << event << ")");
+    return ggml_backend_vk_device_event_synchronize_impl(dev, event, 0);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -16817,6 +16832,7 @@ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
     /* .event_new            = */ ggml_backend_vk_device_event_new,
     /* .event_free           = */ ggml_backend_vk_device_event_free,
     /* .event_synchronize    = */ ggml_backend_vk_device_event_synchronize,
+    /* .event_try_synchronize = */ ggml_backend_vk_device_event_try_synchronize,
 };
 
 static const char * ggml_backend_vk_reg_get_name(ggml_backend_reg_t reg) {
