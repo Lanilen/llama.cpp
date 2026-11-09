@@ -230,6 +230,9 @@ in the CPU's cache, so the cold reads were the problem.
   instead of two MUL_MAT_IDs and a GLU. A pass hands each op only 2–5 missed experts, so every op pays its own start
   and uneven finish; on its own, with larger ops, the kernel reaches ~83% of the RAM's streaming rate. Verify batches
   1.5–6% faster; end to end within the noise (agent turns Q4 +0.4%, Q6 +1.1%).
+- **`GGML_CPU_MMID_FFN=1`:** down joins that op, with no barrier between the halves: a thread out of gate/up work
+  takes down rows of the experts already done instead of waiting for the slowest thread. Exact against the above;
+  end to end against it, Q4 usual answers +3.6% and follow-up turns +5.9%, Q6 +3.0% and +5.9%, agent turns the same.
 - **`GOMP_SPINCOUNT=30000000`** (GCC's OpenMP, not this fork's setting): libgomp spins about 1 ms before its threads
   sleep, about the gap between two layers' CPU work, so they woke ~30 µs late every layer. This keeps them spinning
   ~32 ms, then they sleep.
@@ -371,7 +374,7 @@ published). The cache, draft and CPU settings are the tuning script's picks for 
 ([Tuning a machine](#tuning-a-machine)):
 
 ```bash
-GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=3072 \
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=3072 \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
