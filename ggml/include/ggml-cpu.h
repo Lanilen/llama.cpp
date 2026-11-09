@@ -136,6 +136,10 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // GGML_CPU_MMID_CCX: the CPUs' L3 groups the fused expert FFN deals its chunks to (1 without it), and a cpu's group
+    GGML_BACKEND_API int ggml_backend_cpu_l3_n_groups(void);
+    GGML_BACKEND_API int ggml_backend_cpu_l3_group_of(int cpu);
+
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);

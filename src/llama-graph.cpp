@@ -2681,6 +2681,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * experts_c = build_experts(cur, ids_c, slots_c, selected_experts);
             cb(experts_c, "ffn_moe_down_cache", il);
 
+            // LLAMA_MOE_PREFETCH: the next layer's predicted experts, computed here beside the cached experts while the
+            // CPU computes the misses; the CPU branch's record op reads them back (see llama_moe_cache)
+            if (moe_prefetch_build) {
+                ggml_tensor * pred = moe_prefetch_build();
+                moe_prefetch_build = nullptr;
+                if (pred != nullptr) {
+                    cb(pred, "ffn_moe_prefetch", il);
+                    ggml_build_forward_expand(gf, pred);
+                }
+                moe_cache->prefetch_tensor(il, pred);
+            } else {
+                moe_cache->prefetch_tensor(il, nullptr);
+            }
+
             // every op of the cache branch runs on the cache device, otherwise the scheduler may move the activations between devices
             for (ggml_tensor * t = first_c; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
                 if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
@@ -2743,6 +2757,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // large ubatches do not use the hot spare, but their selections still count for its refresh
     if (moe_cache != nullptr) {
+        moe_prefetch_build = nullptr;
+        moe_cache->prefetch_tensor(il, nullptr);
         if (ggml_tensor * picks = moe_cache->record(ctx0, il, selected_experts)) {
             ggml_backend_sched_set_tensor_backend(sched, picks, backend_cpu);
             cb(picks, "ffn_moe_picks", il);

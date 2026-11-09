@@ -63,6 +63,12 @@ public:
     // hot spare mode: a copy of the selected experts ids of layer il that counts them when it is computed, nullptr if layer il is not cached
     ggml_tensor * record(ggml_context * ctx, int32_t il, ggml_tensor * ids) const;
 
+    // LLAMA_MOE_PREFETCH=N (hot spare mode): the experts the next layer's router predicts, N a token, are touched into the
+    // CPU's caches while the device runs that layer's attention. The graph builds the prediction (the next layer's
+    // router two blocks early, its top N) in layer il's cache branch and hands it over; nullptr when there is none
+    int32_t prefetch_top_n() const;
+    void prefetch_tensor(int32_t il, ggml_tensor * pred) const;
+
     // hot spare mode: after a ubatch of n_tokens tokens, update the scores and refresh the resident experts
     // pos0: position of its first token (0 starts a new conversation), -1 = unknown; gen: 1 if it is generation (it
     // outputs all its tokens), 0 if it is a prompt, -1 = unknown (up to 4 tokens is generation)

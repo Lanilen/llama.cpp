@@ -1070,6 +1070,9 @@ struct llm_graph_context {
     // tensors that read the MoE input but not its output (a shared expert, say), set before build_moe_ffn: with the
     // hot spare the GPU computes them in the cache branch, while the CPU computes the misses, rather than after them
     mutable std::vector<ggml_tensor *> moe_side;
+    // LLAMA_MOE_PREFETCH: set by the model before build_moe_ffn, builds the next layer's predicted experts (I32 [N, n_tokens])
+    // from this layer's residual; build_moe_ffn puts them in the cache branch and hands them to the cache
+    mutable std::function<ggml_tensor *()> moe_prefetch_build;
 
     const llama_prec_policy * prec_policy;
 

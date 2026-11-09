@@ -667,6 +667,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cpu_get_features;
     }
+    if (strcmp(name, "ggml_backend_cpu_l3_n_groups") == 0) {
+        return (void *) ggml_backend_cpu_l3_n_groups;
+    }
+    if (strcmp(name, "ggml_backend_cpu_l3_group_of") == 0) {
+        return (void *) ggml_backend_cpu_l3_group_of;
+    }
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_cpu_set_abort_callback;
     }

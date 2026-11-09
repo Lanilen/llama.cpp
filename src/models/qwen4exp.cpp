@@ -1,3 +1,4 @@
+#include "llama-moe-cache.h"
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -576,6 +577,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * probs = ggml_soft_max(ctx0, build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur));
             cb(probs, "ffn_moe_probs_pre2c", il + 1);
             ggml_build_forward_expand(gf, probs);
+        }
+
+        // LLAMA_MOE_PREFETCH: the next layer's router on this residual (its hc FFN mix two blocks early), its top N, built
+        // in this layer's cache branch by build_moe_ffn; the cache touches those experts during the next layer's attention
+        const int32_t n_pf = moe_cache != nullptr ? moe_cache->prefetch_top_n() : 0;
+        if (n_pf > 0 && il + 2 < n_layer && il + 1 >= 2 && model.layers[il + 1].ffn_gate_inp != nullptr) {
+            ggml_tensor * res_pre = res_hc;
+            moe_prefetch_build = [this, res_pre, il, n_pf]() -> ggml_tensor * {
+                const auto & nl = this->model.layers[il + 1];
+                hc_mix mix = build_hc_mix(res_pre, nl.hc_ffn_norm, nl.hc_ffn_down, nl.hc_ffn_up, nl.hc_ffn_inject, nl.hc_ffn_down_inject, il + 1);
+                ggml_tensor * probs = ggml_soft_max(ctx0, build_lora_mm(nl.ffn_gate_inp, mix.cur));
+                return ggml_cont(ctx0, ggml_argsort_top_k(ctx0, probs, n_pf));   // [n_pf, n_tokens], contiguous for the read-back
+            };
         }
 
         cur = build_layer_ffn(cur, il, ffn_mix.side);

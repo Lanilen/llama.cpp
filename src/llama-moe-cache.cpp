@@ -20,6 +20,12 @@
 #include <stdexcept>
 #include <chrono>
 #include <thread>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
 #include <unordered_set>
 #include <tuple>
 #include <unordered_map>
@@ -177,6 +183,10 @@ struct llama_moe_cache_rec {
     std::vector<uint32_t> count;   // [n_expert] selections
     std::vector<float>    half_lives; // with a predictor: the half-lives (tokens) of its decayed count maps
     std::vector<float>    decayed; // [half-lives][n_expert] the selections weighted by 0.5^(age/half-life), the newest token has age 0
+    // the record op is the first of the layer's CPU branch: a hook run there (LLAMA_MOE_PREFETCH arms the next layer's touch)
+    void (*on_start)(void * ctx, int32_t il) = nullptr;
+    void *  on_start_ctx = nullptr;
+    int32_t il = -1;
 };
 
 // hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the llama_moe_cache_rec of the layer
@@ -187,6 +197,9 @@ static void llama_moe_cache_record(ggml_tensor * dst, const ggml_tensor * a, int
         return;
     }
     auto & rec = *(llama_moe_cache_rec *) userdata;
+    if (rec.on_start != nullptr) {
+        rec.on_start(rec.on_start_ctx, rec.il);
+    }
     auto & count = rec.count;
     const size_t n_hl = rec.half_lives.size();
     float w[8];
@@ -497,6 +510,7 @@ struct llama_moe_cache::impl {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+        ggml_tensor * pf_pred = nullptr;    // LLAMA_MOE_PREFETCH: the next layer's predicted experts, built in this layer's cache branch
 
         // hot spare mode, see llama_moe_cache_hot_spare_maps
         ggml_tensor * miss_map = nullptr;
@@ -1015,6 +1029,9 @@ struct llama_moe_cache::impl {
                     l.score.assign(g.ref[0]->ne[2], 0.0f);
                     l.score_gen.assign(g.ref[0]->ne[2], 0.0f);
                     l.rec.count.assign(g.ref[0]->ne[2], 0);
+                    l.rec.on_start = prefetch_on_start;
+                    l.rec.on_start_ctx = this;
+                    l.rec.il = il;
                     if (predictor) {
                         l.rec.half_lives.assign(std::begin(LLAMA_MOE_PRED_HALF_LIFE), std::end(LLAMA_MOE_PRED_HALF_LIFE));
                         l.rec.decayed.assign(l.rec.half_lives.size()*g.ref[0]->ne[2], 0.0f);
@@ -1065,6 +1082,7 @@ struct llama_moe_cache::impl {
 
             if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
                 init_hot_spare(params.hot);
+                prefetch_init();
             } else {
                 for (group & g : groups) {
                     for (int32_t il : g.layers) {
@@ -1496,12 +1514,269 @@ struct llama_moe_cache::impl {
         return ggml_map_custom1(ctx, ids, llama_moe_cache_record, 1, &layers[il].rec);
     }
 
+    // LLAMA_MOE_PREFETCH=N: while the device runs a layer's attention, pull the experts its router is likely to miss into the
+    // CPU's caches. The model builds the next layer's router on the residual before this layer's FFN (two blocks early;
+    // its hc mix, router, softmax and top N) in this layer's cache branch, so the device computes it beside the CPU's
+    // experts; the CPU branch's first op (the record) reads those ids back asynchronously and arms a job; touch threads,
+    // one L3 group each (GGML_CPU_MMID_CCX: the fused FFN deals its chunks to the groups), wait for the read, drop the
+    // resident experts (the miss map), and read the chunks their group will compute, a word a cache line, while the
+    // device runs the next layer's attention; the next layer's record cancels what's left. Layers 0, 1 and the last
+    // predict badly and are skipped. LLAMA_MOE_PREFETCH_THREADS: threads a group (2); LLAMA_MOE_PREFETCH_MIB: bytes
+    // touched a layer at most (12).
+    struct prefetch_job {
+        uint64_t gen = 0;
+        int32_t  il  = -1;                  // the layer whose experts are touched
+        int64_t  n_ids = 0, n_tokens = 0;   // of the ids buffer
+        int      buf = 0;                   // which ids buffer
+        std::atomic<int> ev_state{0};       // 0 the read is in flight, 1 a thread synchronizes it, 2 the ids are in
+    };
+    struct prefetch_t {
+        int32_t n_top    = 0;
+        size_t  budget   = 12u << 20;
+        int     per_group = 2;
+        int     n_grp    = 1;
+        int64_t C        = 128;
+        std::vector<std::vector<int>> cpus;       // a group's cpus
+        std::mutex              m;
+        std::condition_variable cv;
+        std::atomic<uint64_t>   gen{0};           // the current job's number: a thread works while its job is current
+        bool                    quit = false;
+        prefetch_job            job;
+        ggml_backend_event_t    ev[2] = { nullptr, nullptr };
+        std::vector<int32_t>    ids[2];           // [n_top*8] each, the read's target, by job parity
+        std::vector<std::thread> threads;
+        std::atomic<size_t> jobs{0}, experts{0}, chunks{0}, bytes{0}, cut{0};
+        std::atomic<int64_t> t_us{0}, t_wait_us{0};
+    } pf;
+
+    static void prefetch_on_start(void * ctx, int32_t il) {
+        ((impl *) ctx)->prefetch_arm(il);
+    }
+
+    void prefetch_init() {
+        const char * env = getenv("LLAMA_MOE_PREFETCH");
+        pf.n_top = env ? std::max(0, atoi(env)) : 0;
+        if (pf.n_top == 0 || mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+            pf.n_top = 0;
+            return;
+        }
+        if (const char * e = getenv("LLAMA_MOE_PREFETCH_THREADS")) { pf.per_group = std::max(1, atoi(e)); }
+        if (const char * e = getenv("LLAMA_MOE_PREFETCH_MIB"))     { pf.budget = (size_t) std::max(1, atoi(e)) << 20; }
+        if (const char * e = getenv("GGML_CPU_MMID_FLAT"))         { pf.C = std::max<int64_t>(1, atoll(e)); }
+        // the L3 groups as the CPU backend deals its chunks (GGML_CPU_MMID_CCX)
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        auto n_groups_fn = (int (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_l3_n_groups");
+        auto group_of_fn = (int (*)(int))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_l3_group_of");
+        pf.n_grp = n_groups_fn ? std::max(1, n_groups_fn()) : 1;
+        pf.cpus.assign(pf.n_grp, {});
+        int n_cpu = 1;
+#if defined(__linux__)
+        n_cpu = std::max(1, (int) sysconf(_SC_NPROCESSORS_CONF));
+#endif
+        for (int c = 0; c < n_cpu; ++c) {
+            const int g = group_of_fn ? group_of_fn(c) : 0;
+            pf.cpus[g >= 0 && g < pf.n_grp ? g : 0].push_back(c);
+        }
+        for (auto & v : pf.ids) {
+            v.assign((size_t) pf.n_top*8, -1);
+        }
+        for (int g = 0; g < pf.n_grp; ++g) {
+            for (int i = 0; i < pf.per_group; ++i) {
+                // the group's last cpus, the odd ones first (a core's second hardware thread)
+                const auto & cs = pf.cpus[g];
+                int cpu = -1;
+                for (int k = (int) cs.size() - 1, found = 0; k >= 0 && cpu < 0; --k) {
+                    if (cs[k] % 2 == 1 && found++ == i) { cpu = cs[k]; }
+                }
+                if (cpu < 0 && !cs.empty()) {
+                    cpu = cs[(cs.size() - 1 - i) % cs.size()];
+                }
+                pf.threads.emplace_back([this, g, i, cpu] { prefetch_thread(g, i, cpu); });
+            }
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_MOE_PREFETCH: the next layer's %d predicted experts touched into the L3 during its attention, %d threads on %d L3 groups, "
+            "chunks of %lld rows, up to %zu MiB a layer\n", __func__, pf.n_top, (int) pf.threads.size(), pf.n_grp, (long long) pf.C, pf.budget >> 20);
+        if (pf.n_grp == 1 && n_cpu > 8) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_PREFETCH: one L3 group (set GGML_CPU_MMID_CCX=1 so the fused FFN computes each chunk where it was touched)\n", __func__);
+        }
+    }
+
+    void prefetch_quit() {
+        if (pf.threads.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pf.m);
+            pf.quit = true;
+            pf.gen++;
+        }
+        pf.cv.notify_all();
+        for (auto & t : pf.threads) {
+            t.join();
+        }
+        pf.threads.clear();
+        for (auto & e : pf.ev) {
+            if (e) {
+                ggml_backend_event_free(e);
+                e = nullptr;
+            }
+        }
+    }
+
+    // the record of layer il runs: layer il's CPU branch starts, so the touch for il (if any) stops, and the prediction
+    // for il + 1 made in il's cache branch is read back and handed to the threads
+    void prefetch_arm(int32_t il) {
+        if (pf.n_top == 0) {
+            return;
+        }
+        const int32_t nxt = il + 1;
+        ggml_tensor * pred = il >= 0 && il < (int32_t) layers.size() ? layers[il].pf_pred : nullptr;
+        const bool ok = pred != nullptr && nxt >= 2 && nxt < (int32_t) layers.size() - 1 && layers[nxt].ig >= 0 && layers[nxt].miss_map != nullptr;
+        std::lock_guard<std::mutex> lk(pf.m);
+        const uint64_t gen = pf.gen.fetch_add(1) + 1;   // cancels the running job
+        if (!ok) {
+            pf.job.il = -1;
+            return;
+        }
+        const int b = (int) (gen & 1);
+        ggml_backend_t be = backend(il);
+        if (pf.ev[b] == nullptr) {
+            pf.ev[b] = ggml_backend_event_new(ggml_backend_get_device(be));
+        }
+        const int64_t n = std::min<int64_t>(ggml_nelements(pred), (int64_t) pf.ids[b].size());
+        ggml_backend_tensor_get_async(be, pred, pf.ids[b].data(), 0, n*sizeof(int32_t));
+        ggml_backend_event_record(pf.ev[b], be);
+        pf.job.gen = gen;
+        pf.job.il = nxt;
+        pf.job.n_ids = pred->ne[0];
+        pf.job.n_tokens = std::min<int64_t>(pred->ne[1], n/std::max<int64_t>(1, pred->ne[0]));
+        pf.job.buf = b;
+        pf.job.ev_state.store(0);
+        pf.jobs++;
+        pf.cv.notify_all();
+    }
+
+    void prefetch_thread(int g, int idx, int cpu) {
+#if defined(__linux__)
+        if (cpu >= 0) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpu, &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        }
+#else
+        GGML_UNUSED(cpu);
+#endif
+        uint64_t seen = 0;
+        std::vector<int32_t> list;
+        std::vector<char> in_list;
+        while (true) {
+            prefetch_job job;
+            {
+                std::unique_lock<std::mutex> lk(pf.m);
+                pf.cv.wait(lk, [&] { return pf.quit || pf.job.gen != seen; });
+                if (pf.quit) {
+                    return;
+                }
+                seen = pf.job.gen;
+                job.gen = pf.job.gen; job.il = pf.job.il; job.n_ids = pf.job.n_ids; job.n_tokens = pf.job.n_tokens; job.buf = pf.job.buf;
+            }
+            if (job.il < 0) {
+                continue;
+            }
+            const int64_t t0 = ggml_time_us();
+            // one thread synchronizes the read (the event's memcpys run in it), the others wait for it
+            int expected = 0;
+            if (pf.job.ev_state.compare_exchange_strong(expected, 1)) {
+                ggml_backend_event_synchronize(pf.ev[job.buf]);
+                pf.job.ev_state.store(2);
+            } else {
+                while (pf.job.ev_state.load() != 2 && pf.gen.load() == job.gen) {
+                    std::this_thread::yield();
+                }
+            }
+            if (pf.gen.load() != job.gen) {
+                pf.cut++;
+                continue;
+            }
+            const int64_t t1 = ggml_time_us();
+            pf.t_wait_us += t1 - t0;
+            // the experts, by rank over the tokens, once each, not resident
+            layer & l = layers[job.il];
+            const int32_t n_expert = (int32_t) l.slot_of.size();
+            const int32_t * miss = (const int32_t *) l.miss_map->data;
+            const int32_t * ids = pf.ids[job.buf].data();
+            list.clear();
+            in_list.assign(n_expert, 0);
+            for (int64_t r = 0; r < job.n_ids; ++r) {
+                for (int64_t t = 0; t < job.n_tokens; ++t) {
+                    const int32_t e = ids[t*job.n_ids + r];
+                    if (e >= 0 && e < n_expert && !in_list[e] && miss[e] >= 0) {
+                        in_list[e] = 1;
+                        list.push_back(e);
+                    }
+                }
+            }
+            // this thread's chunks: its group's (as the fused FFN deals them), every per_group-th of those
+            const size_t budget = pf.budget/((size_t) pf.n_grp*pf.per_group);
+            size_t bytes = 0, n_chunks = 0;
+            int64_t k = 0;
+            bool cut = false;
+            uint64_t sink = 0;
+            for (size_t j = 0; j < list.size() && !cut && bytes < budget; ++j) {
+                const int32_t e = list[j];
+                for (const ggml_tensor * w : l.experts) {
+                    const int64_t cpe = (w->ne[1] + pf.C - 1)/pf.C;
+                    for (int64_t c = 0; c < cpe && !cut && bytes < budget; ++c) {
+                        if ((int) ((e + c) % pf.n_grp) != g || (k++ % pf.per_group) != idx) {
+                            continue;
+                        }
+                        const int64_t r0 = c*pf.C, r1 = std::min(w->ne[1], r0 + pf.C);
+                        const uint8_t * p = (const uint8_t *) w->data + (size_t) e*w->nb[2] + (size_t) r0*w->nb[1];
+                        const size_t len = (size_t) (r1 - r0)*w->nb[1];
+                        for (size_t off = 0; off < len; off += 64) {
+                            sink += *(const volatile uint64_t *) (p + off);
+                        }
+                        bytes += len;
+                        n_chunks++;
+                        if (pf.gen.load(std::memory_order_relaxed) != job.gen) {
+                            cut = true;
+                        }
+                    }
+                }
+            }
+            if (sink == 0x5bd1e995) {   // keep the loads
+                LLAMA_LOG_DEBUG("%s: %llu\n", __func__, (unsigned long long) sink);
+            }
+            pf.bytes += bytes;
+            pf.chunks += n_chunks;
+            if (idx == 0 && g == 0) {
+                pf.experts += list.size();
+            }
+            pf.cut += cut;
+            pf.t_us += ggml_time_us() - t1;
+        }
+    }
+
+    void prefetch_log() const {
+        if (pf.n_top == 0 || pf.jobs == 0) {
+            return;
+        }
+        const double j = (double) pf.jobs;
+        LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_PREFETCH: %zu layers armed, %.2f experts to touch a layer, %.2f MiB touched a layer "
+            "(%zu chunks), %.0f us a layer in the threads (%.0f waiting for the ids), %zu thread-jobs cut short\n",
+            pf.jobs.load(), pf.experts/j, pf.bytes/j/1048576.0, pf.chunks.load(), pf.t_us/j, pf.t_wait_us/j, pf.cut.load());
+    }
+
     void update(int64_t n_tokens, int64_t pos0, int gen) {
         if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || n_tokens <= 0) {
             return;
         }
         if (gen < 0) {
             gen = n_tokens <= 4;
+        }
+        if (pf.n_top > 0) {
+            pf.gen++;   // the ubatch is done: what is left of the last layer's touch stops
         }
         join_installer();
         const int64_t t_start_us = ggml_time_us();
@@ -2432,6 +2707,7 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        prefetch_quit();
         // the background uploads read the staging memory until they are done
         join_installer();
         finish_submits();
@@ -2984,6 +3260,7 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        prefetch_log();
         if (offload_st.uploads > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST: %.2f GiB of host experts in %zu uploads for %zu tensors; %.2f s waiting for a half's "
                 "uploads, %.2f s copying at the end of a tensor\n", offload_st.bytes/1073741824.0, offload_st.uploads, offload_st.finishes,
@@ -3089,6 +3366,16 @@ ggml_backend_t llama_moe_cache::layer_backend(int32_t il) const {
 
 bool llama_moe_cache::get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const {
     return pimpl->get_hot_spare_maps(il, n_tokens, maps);
+}
+
+int32_t llama_moe_cache::prefetch_top_n() const {
+    return pimpl->pf.n_top;
+}
+
+void llama_moe_cache::prefetch_tensor(int32_t il, ggml_tensor * pred) const {
+    if (il >= 0 && il < (int32_t) pimpl->layers.size()) {
+        pimpl->layers[il].pf_pred = pred;
+    }
 }
 
 ggml_tensor * llama_moe_cache::record(ggml_context * ctx, int32_t il, ggml_tensor * ids) const {

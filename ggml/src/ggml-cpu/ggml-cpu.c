@@ -1635,6 +1635,14 @@ static void ggml_cpu_l3_groups_init(void) {
 #endif
 }
 
+int ggml_backend_cpu_l3_n_groups(void) {
+    return g_l3_n_groups;
+}
+
+int ggml_backend_cpu_l3_group_of(int cpu) {
+    return cpu >= 0 && cpu < GGML_CPU_MAX_CPUS ? g_l3_group_of[cpu] : 0;
+}
+
 static int ggml_cpu_l3_group(void) {
     if (g_l3_n_groups <= 1) {
         return 0;
