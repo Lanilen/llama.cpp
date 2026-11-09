@@ -342,6 +342,17 @@ static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
     return ggml_scale(ctx, acc, 1.0f / (float) hc);
 }
 
+// LLAMA_MOE_EARLY_ROUTE: layer il's FFN mix and router applied to the residual x at an earlier point, the probabilities
+// named name-il and kept in the graph (nothing reads them but an eval callback)
+void llama_model_qwen4exp::graph::build_early_route(ggml_tensor * x, int il, const char * name) {
+    const auto & layer = model.layers[il];
+    hc_mix mix = build_hc_mix(x, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, il);
+    ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, mix.cur);
+    ggml_tensor * probs  = ggml_soft_max(ctx0, logits);
+    cb(probs, name, il);
+    ggml_build_forward_expand(gf, probs);
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // build_hc_mix returns the mixed [n_embd, T] stream and the [hc, T] scatter weights.
 llama_model_qwen4exp::graph::hc_mix
@@ -488,6 +499,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    static const bool early_route = [] { const char * e = getenv("LLAMA_MOE_EARLY_ROUTE"); return e != nullptr && atoi(e) != 0; }();
+
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
@@ -506,6 +519,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+        }
+
+        // LLAMA_MOE_EARLY_ROUTE=1 (a probe): this layer's router on the residual before its attention, "ffn_moe_probs_pre":
+        // how well the experts can be predicted one block early (llama-moe-early-route)
+        if (early_route && model.layers[il].ffn_gate_inp != nullptr) {
+            build_early_route(res_hc, il, "ffn_moe_probs_pre");
         }
 
         hc_mix attn_mix = build_hc_mix(res_hc,
@@ -536,6 +555,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         res_hc = build_hc_combine(res_hc, cur, attn_mix.inject, il);
+
+        // and the next layer's router on the residual before this layer's FFN, "ffn_moe_probs_pre2": two blocks early
+        if (early_route && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
+            build_early_route(res_hc, il + 1, "ffn_moe_probs_pre2");
+        }
 
         hc_mix ffn_mix = build_hc_mix(res_hc,
                 model.layers[il].hc_ffn_norm,
