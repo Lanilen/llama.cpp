@@ -5,8 +5,10 @@
 // (ffn_moe_misses) for every generated token, and reports per predictor and N (its top N experts):
 //   selected  the share of the real top-k in the top N
 //   misses    the share of the real misses (the CPU's experts) in the top N: what a prefetch of the top N would catch
-//   extra     experts in the top N that weren't selected, a token and layer (what a prefetch would touch for nothing)
-// and the previous token's selection as the baseline predictor. Greedy generation; the prompt's tokens don't count.
+//   touch     experts in the top N that aren't resident in the cache, a token and layer: what a prefetch would read
+//   waste     of those, the ones that weren't selected (read for nothing)
+// and the previous token's selection as the baseline predictor; then the same for layers 2..n-2 only (the first two
+// and the last predict worst). Greedy generation; the prompt's tokens don't count.
 // usage: LLAMA_MOE_EARLY_ROUTE=1 llama-moe-early-route -m model.gguf -f prompt.txt -n 512 [the server's placement flags]
 
 #include "arg.h"
@@ -28,6 +30,7 @@ struct route_layer {
     int64_t n_expert = 0;
     std::vector<int32_t> topk;    // [tokens, k]
     std::vector<int32_t> misses;  // [tokens, k], -1 where the expert was resident (empty without the hot spare)
+    std::vector<char>    resident; // [tokens, n_expert], from the cache's miss map at that token
     std::vector<float>   probs;   // [tokens, n_expert], the real router's
     std::vector<float>   pre;     // [tokens, n_expert]
     std::vector<float>   pre2;    // [tokens, n_expert]
@@ -77,6 +80,18 @@ static bool route_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         const size_t start = l.misses.size();
         l.misses.resize(start + ggml_nelements(t));
         ggml_backend_tensor_get(t, l.misses.data() + start, 0, ggml_nbytes(t));
+        // the misses are a lookup in the cache's miss map (e where expert e isn't resident, -1 where it is): the
+        // residency of every expert at this token
+        const ggml_tensor * mm = t->src[0];
+        if (mm != nullptr && mm->type == GGML_TYPE_I32 && l.n_expert > 0 && ggml_nelements(mm) == l.n_expert) {
+            std::vector<int32_t> map(l.n_expert);
+            ggml_backend_tensor_get(mm, map.data(), 0, ggml_nbytes(mm));
+            const size_t r0 = l.resident.size();
+            l.resident.resize(r0 + l.n_expert);
+            for (int64_t e = 0; e < l.n_expert; ++e) {
+                l.resident[r0 + e] = map[e] < 0;
+            }
+        }
     } else {
         GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[1] == 1 && ggml_is_contiguous(t));
         l.n_expert = t->ne[0];
@@ -171,13 +186,14 @@ int main(int argc, char ** argv) {
 
     // the tokens with a complete record (the last decode's selections aren't followed by a sampled token, but count)
     const int64_t k = data.k;
-    const std::vector<int> Ns = { (int) k, 12, 16, 20, 32 };
-    struct acc { double sel = 0, miss = 0, extra = 0; };   // sums over tokens and layers
+    const std::vector<int> Ns = { (int) k, 12, 14, 16, 20, 32 };
+    struct acc { double sel = 0, miss = 0, extra = 0, touch = 0; };   // sums over tokens and layers
     const char * names[] = { "real top-k (check)", "pre: one block early", "pre2: two blocks early", "previous token" };
-    std::map<std::pair<int, int>, acc> sums;   // (predictor, N) -> sums
+    std::map<std::pair<int, int>, acc> sums, sums_mid;   // (predictor, N) -> sums, all layers / layers 2..n-2
     std::map<int, std::map<std::pair<int, int>, acc>> by_layer;
-    double n_sel = 0, n_miss = 0, n_pairs = 0;
+    double n_sel = 0, n_miss = 0, n_pairs = 0, n_miss_mid = 0, n_pairs_mid = 0, n_sel_mid = 0;
     int n_layers_used = 0;
+    const int il_max = data.layers.empty() ? 0 : data.layers.rbegin()->first;
     for (auto & [il, l] : data.layers) {
         const int64_t T = (int64_t) l.topk.size()/k;
         if (T == 0 || l.pre.empty() || l.n_expert == 0) {
@@ -186,8 +202,11 @@ int main(int argc, char ** argv) {
         n_layers_used++;
         const int64_t E = l.n_expert;
         const bool have_miss = l.misses.size() == l.topk.size();
+        const bool have_res  = l.resident.size() == (size_t) T*E;
+        const bool mid = il >= 2 && il <= il_max - 2;
         for (int64_t t = 0; t < T; ++t) {
             const int32_t * sel = l.topk.data() + t*k;
+            const char * res = have_res ? l.resident.data() + t*E : nullptr;
             std::vector<char> is_sel(E, 0), is_miss(E, 0);
             int64_t n_m = 0;
             for (int64_t j = 0; j < k; ++j) {
@@ -200,6 +219,9 @@ int main(int argc, char ** argv) {
             n_sel += k;
             n_miss += n_m;
             n_pairs += 1;
+            if (mid) {
+                n_sel_mid += k; n_miss_mid += n_m; n_pairs_mid += 1;
+            }
             for (int p = 0; p < 4; ++p) {
                 const float * v = p == 0 ? l.probs.data() + t*E : p == 1 ? l.pre.data() + t*E : p == 2 ? l.pre2.data() + t*E : nullptr;
                 if (p == 0 && l.probs.size() < (size_t) (t + 1)*E) {
@@ -220,10 +242,14 @@ int main(int argc, char ** argv) {
                     }
                     acc & a = sums[{ p, N }];
                     acc & b = by_layer[il][{ p, N }];
+                    acc & c = sums_mid[{ p, N }];
                     for (int32_t e : pred) {
-                        const double s = is_sel[e], m = is_miss[e];
-                        a.sel += s; a.miss += m; a.extra += 1 - s;
-                        b.sel += s; b.miss += m; b.extra += 1 - s;
+                        const double s = is_sel[e], m = is_miss[e], tc = res ? !res[e] : 0;
+                        a.sel += s; a.miss += m; a.extra += 1 - s; a.touch += tc;
+                        b.sel += s; b.miss += m; b.extra += 1 - s; b.touch += tc;
+                        if (mid) {
+                            c.sel += s; c.miss += m; c.extra += 1 - s; c.touch += tc;
+                        }
                     }
                 }
             }
@@ -236,17 +262,26 @@ int main(int argc, char ** argv) {
     const bool have_miss = n_miss > 0;
     printf("\n%d generated tokens, %d MoE layers, %lld experts a token; %.2f misses a token and layer%s\n", n_gen, n_layers_used,
            (long long) k, n_miss/n_pairs, have_miss ? "" : " (no hot spare: no misses recorded)");
-    printf("%-24s %4s | %9s | %9s | %7s\n", "predictor", "N", "selected", "misses", "extra");
-    for (int p = 0; p < 4; ++p) {
-        for (int N : Ns) {
-            auto it = sums.find({ p, N });
-            if (it == sums.end()) {
-                continue;
+    auto table = [&](const char * title, const std::map<std::pair<int, int>, acc> & S, double ns, double nm, double np) {
+        printf("%s\n%-24s %4s | %9s | %9s | %7s | %6s %6s\n", title, "predictor", "N", "selected", "misses", "extra", "touch", "waste");
+        for (int p = 0; p < 4; ++p) {
+            for (int N : Ns) {
+                auto it = S.find({ p, N });
+                if (it == S.end()) {
+                    continue;
+                }
+                const acc & a = it->second;
+                printf("%-24s %4d | %8.1f%% | %8s | %7.2f | %6.2f %6.2f\n", names[p], N, 100.0*a.sel/ns,
+                       nm > 0 ? (std::to_string((int) (1000.0*a.miss/nm)/10.0).substr(0, 4) + "%").c_str() : "-", a.extra/np,
+                       a.touch/np, (a.touch - a.miss)/np);
             }
-            const acc & a = it->second;
-            printf("%-24s %4d | %8.1f%% | %8s | %7.2f\n", names[p], N, 100.0*a.sel/n_sel,
-                   have_miss ? (std::to_string((int) (1000.0*a.miss/n_miss)/10.0).substr(0, 4) + "%").c_str() : "-", a.extra/n_pairs);
         }
+    };
+    table("all layers", sums, n_sel, n_miss, n_pairs);
+    if (n_pairs_mid > 0) {
+        printf("\n");
+        table("layers 2..n-2 (misses a token and layer: see below)", sums_mid, n_sel_mid, n_miss_mid, n_pairs_mid);
+        printf("  misses a token and layer there: %.2f\n", n_miss_mid/n_pairs_mid);
     }
     // per layer: the one-block-early predictor at N = k and N = 20, the misses it catches
     printf("\nper layer, pre (one block early): selected at N=%lld, misses caught at N=%lld / 20, misses a token\n", (long long) k, (long long) k);
