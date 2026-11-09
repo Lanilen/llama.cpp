@@ -2655,7 +2655,8 @@ struct llama_moe_cache::impl {
                 buft = pinned ? pinned(dev) : ggml_backend_dev_host_buffer_type(dev);
             }
         }
-        if (buft == nullptr) {
+        // LLAMA_MOE_TIER_CPU=1 (a probe): the tier in ordinary memory, which only the CPU reads
+        if (buft == nullptr || (getenv("LLAMA_MOE_TIER_CPU") && atoi(getenv("LLAMA_MOE_TIER_CPU")) != 0)) {
             buft = ggml_backend_cpu_buffer_type();
         }
         buf_tier.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_tier.get(), buft));
