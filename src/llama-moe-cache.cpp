@@ -185,9 +185,23 @@ struct llama_moe_cache_rec {
     std::vector<float>    decayed; // [half-lives][n_expert] the selections weighted by 0.5^(age/half-life), the newest token has age 0
     // the record op is the first of the layer's CPU branch: a hook run there (LLAMA_MOE_PREFETCH arms the next layer's touch)
     void (*on_start)(void * ctx, int32_t il) = nullptr;
+    void (*on_end)(void * ctx, int32_t il) = nullptr;
     void *  on_start_ctx = nullptr;
     int32_t il = -1;
 };
+
+// LLAMA_MOE_PREFETCH: the last op of a layer's CPU branch (an in-place pass-through): the main thread hands the next
+// layer's predicted experts, read back since the branch's start, to the touch threads
+static void llama_moe_cache_launch(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst); GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto & rec = *(llama_moe_cache_rec *) userdata;
+    if (rec.on_end != nullptr) {
+        rec.on_end(rec.on_start_ctx, rec.il);
+    }
+}
 
 // hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the llama_moe_cache_rec of the layer
 static void llama_moe_cache_record(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
@@ -1030,6 +1044,7 @@ struct llama_moe_cache::impl {
                     l.score_gen.assign(g.ref[0]->ne[2], 0.0f);
                     l.rec.count.assign(g.ref[0]->ne[2], 0);
                     l.rec.on_start = prefetch_on_start;
+                    l.rec.on_end = prefetch_on_end;
                     l.rec.on_start_ctx = this;
                     l.rec.il = il;
                     if (predictor) {
@@ -1528,7 +1543,6 @@ struct llama_moe_cache::impl {
         int32_t  il  = -1;                  // the layer whose experts are touched
         int64_t  n_ids = 0, n_tokens = 0;   // of the ids buffer
         int      buf = 0;                   // which ids buffer
-        std::atomic<int> ev_state{0};       // 0 the read is in flight, 1 a thread synchronizes it, 2 the ids are in
     };
     struct prefetch_t {
         int32_t n_top    = 0;
@@ -1541,7 +1555,9 @@ struct llama_moe_cache::impl {
         std::condition_variable cv;
         std::atomic<uint64_t>   gen{0};           // the current job's number: a thread works while its job is current
         bool                    quit = false;
-        prefetch_job            job;
+        bool                    debug = false;    // LLAMA_MOE_PREFETCH_DEBUG=1: the first arm, launch and touch logged
+        prefetch_job            job;              // posted to the threads
+        prefetch_job            pending;          // armed: its read is in flight until the launch synchronizes it
         ggml_backend_event_t    ev[2] = { nullptr, nullptr };
         std::vector<int32_t>    ids[2];           // [n_top*8] each, the read's target, by job parity
         std::vector<std::thread> threads;
@@ -1553,6 +1569,10 @@ struct llama_moe_cache::impl {
         ((impl *) ctx)->prefetch_arm(il);
     }
 
+    static void prefetch_on_end(void * ctx, int32_t il) {
+        ((impl *) ctx)->prefetch_launch(il);
+    }
+
     void prefetch_init() {
         const char * env = getenv("LLAMA_MOE_PREFETCH");
         pf.n_top = env ? std::max(0, atoi(env)) : 0;
@@ -1560,6 +1580,7 @@ struct llama_moe_cache::impl {
             pf.n_top = 0;
             return;
         }
+        pf.debug = getenv("LLAMA_MOE_PREFETCH_DEBUG") && atoi(getenv("LLAMA_MOE_PREFETCH_DEBUG")) != 0;
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_THREADS")) { pf.per_group = std::max(1, atoi(e)); }
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_MIB"))     { pf.budget = (size_t) std::max(1, atoi(e)) << 20; }
         if (const char * e = getenv("GGML_CPU_MMID_FLAT"))         { pf.C = std::max<int64_t>(1, atoll(e)); }
@@ -1624,21 +1645,21 @@ struct llama_moe_cache::impl {
     }
 
     // the record of layer il runs: layer il's CPU branch starts, so the touch for il (if any) stops, and the prediction
-    // for il + 1 made in il's cache branch is read back and handed to the threads
+    // for il + 1 made in il's cache branch is read back (asynchronously, after the cache branch on the device)
     void prefetch_arm(int32_t il) {
         if (pf.n_top == 0) {
             return;
         }
+        pf.gen++;   // cancels the running job
         const int32_t nxt = il + 1;
         ggml_tensor * pred = il >= 0 && il < (int32_t) layers.size() ? layers[il].pf_pred : nullptr;
-        const bool ok = pred != nullptr && nxt >= 2 && nxt < (int32_t) layers.size() - 1 && layers[nxt].ig >= 0 && layers[nxt].miss_map != nullptr;
-        std::lock_guard<std::mutex> lk(pf.m);
-        const uint64_t gen = pf.gen.fetch_add(1) + 1;   // cancels the running job
+        const bool ok = pred != nullptr && layers[il].ig >= 0 && nxt >= 2 && nxt < (int32_t) layers.size() - 1 &&
+            layers[nxt].ig >= 0 && layers[nxt].miss_map != nullptr;
+        pf.pending.il = -1;
         if (!ok) {
-            pf.job.il = -1;
             return;
         }
-        const int b = (int) (gen & 1);
+        const int b = (int) (pf.gen.load() & 1);
         ggml_backend_t be = backend(il);
         if (pf.ev[b] == nullptr) {
             pf.ev[b] = ggml_backend_event_new(ggml_backend_get_device(be));
@@ -1646,13 +1667,37 @@ struct llama_moe_cache::impl {
         const int64_t n = std::min<int64_t>(ggml_nelements(pred), (int64_t) pf.ids[b].size());
         ggml_backend_tensor_get_async(be, pred, pf.ids[b].data(), 0, n*sizeof(int32_t));
         ggml_backend_event_record(pf.ev[b], be);
-        pf.job.gen = gen;
-        pf.job.il = nxt;
-        pf.job.n_ids = pred->ne[0];
-        pf.job.n_tokens = std::min<int64_t>(pred->ne[1], n/std::max<int64_t>(1, pred->ne[0]));
-        pf.job.buf = b;
-        pf.job.ev_state.store(0);
+        pf.pending.il = nxt;
+        pf.pending.n_ids = pred->ne[0];
+        pf.pending.n_tokens = std::min<int64_t>(pred->ne[1], n/std::max<int64_t>(1, pred->ne[0]));
+        pf.pending.buf = b;
+        if (pf.debug && pf.jobs == 0) {
+            LLAMA_LOG_INFO("%s: LLAMA_MOE_PREFETCH: first arm, layer %d predicts %d: %lld x %lld ids\n", __func__, il, nxt,
+                (long long) pf.pending.n_ids, (long long) pf.pending.n_tokens);
+        }
+    }
+
+    // the end of layer il's CPU branch: the read has landed by now (the cache branch is shorter than the CPU's), so the
+    // main thread synchronizes it (no other thread touches the device) and hands the job to the touch threads
+    void prefetch_launch(int32_t il) {
+        if (pf.n_top == 0 || pf.pending.il < 0 || pf.pending.il != il + 1) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_event_synchronize(pf.ev[pf.pending.buf]);
+        pf.t_wait_us += ggml_time_us() - t0;
+        {
+            std::lock_guard<std::mutex> lk(pf.m);
+            pf.job = pf.pending;
+            pf.job.gen = pf.gen.load();
+        }
+        pf.pending.il = -1;
         pf.jobs++;
+        if (pf.debug && pf.jobs == 1) {
+            const int32_t * ids = pf.ids[pf.job.buf].data();
+            LLAMA_LOG_INFO("%s: LLAMA_MOE_PREFETCH: first launch, layer %d: ids %d %d %d %d ... (%.0f us synchronizing)\n", __func__,
+                pf.job.il, ids[0], ids[1], ids[2], ids[3], (double) pf.t_wait_us);
+        }
         pf.cv.notify_all();
     }
 
@@ -1681,26 +1726,10 @@ struct llama_moe_cache::impl {
                 seen = pf.job.gen;
                 job.gen = pf.job.gen; job.il = pf.job.il; job.n_ids = pf.job.n_ids; job.n_tokens = pf.job.n_tokens; job.buf = pf.job.buf;
             }
-            if (job.il < 0) {
-                continue;
-            }
-            const int64_t t0 = ggml_time_us();
-            // one thread synchronizes the read (the event's memcpys run in it), the others wait for it
-            int expected = 0;
-            if (pf.job.ev_state.compare_exchange_strong(expected, 1)) {
-                ggml_backend_event_synchronize(pf.ev[job.buf]);
-                pf.job.ev_state.store(2);
-            } else {
-                while (pf.job.ev_state.load() != 2 && pf.gen.load() == job.gen) {
-                    std::this_thread::yield();
-                }
-            }
-            if (pf.gen.load() != job.gen) {
-                pf.cut++;
+            if (job.il < 0 || pf.gen.load() != job.gen) {
                 continue;
             }
             const int64_t t1 = ggml_time_us();
-            pf.t_wait_us += t1 - t0;
             // the experts, by rank over the tokens, once each, not resident
             layer & l = layers[job.il];
             const int32_t n_expert = (int32_t) l.slot_of.size();
@@ -1748,6 +1777,10 @@ struct llama_moe_cache::impl {
             if (sink == 0x5bd1e995) {   // keep the loads
                 LLAMA_LOG_DEBUG("%s: %llu\n", __func__, (unsigned long long) sink);
             }
+            if (pf.debug && g == 0 && idx == 0 && pf.jobs <= 1) {
+                LLAMA_LOG_INFO("%s: LLAMA_MOE_PREFETCH: first touch, layer %d: %zu experts to touch, this thread %zu chunks, %zu KiB, %lld us%s\n",
+                    __func__, job.il, list.size(), n_chunks, bytes >> 10, (long long) (ggml_time_us() - t1), cut ? ", cut" : "");
+            }
             pf.bytes += bytes;
             pf.chunks += n_chunks;
             if (idx == 0 && g == 0) {
@@ -1763,8 +1796,8 @@ struct llama_moe_cache::impl {
             return;
         }
         const double j = (double) pf.jobs;
-        LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_PREFETCH: %zu layers armed, %.2f experts to touch a layer, %.2f MiB touched a layer "
-            "(%zu chunks), %.0f us a layer in the threads (%.0f waiting for the ids), %zu thread-jobs cut short\n",
+        LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_PREFETCH: %zu layers launched, %.2f experts to touch a layer, %.2f MiB touched a layer "
+            "(%zu chunks), %.0f us a layer in the threads, %.1f us a layer synchronizing the ids on the main thread, %zu thread-jobs cut short\n",
             pf.jobs.load(), pf.experts/j, pf.bytes/j/1048576.0, pf.chunks.load(), pf.t_us/j, pf.t_wait_us/j, pf.cut.load());
     }
 
@@ -3376,6 +3409,13 @@ void llama_moe_cache::prefetch_tensor(int32_t il, ggml_tensor * pred) const {
     if (il >= 0 && il < (int32_t) pimpl->layers.size()) {
         pimpl->layers[il].pf_pred = pred;
     }
+}
+
+ggml_tensor * llama_moe_cache::prefetch_launch(ggml_context * ctx, int32_t il, ggml_tensor * after) const {
+    if (pimpl->pf.n_top == 0 || il < 0 || il >= (int32_t) pimpl->layers.size() || pimpl->layers[il].miss_map == nullptr) {
+        return after;
+    }
+    return ggml_custom_inplace(ctx, after, nullptr, 0, llama_moe_cache_launch, 1, &pimpl->layers[il].rec);
 }
 
 ggml_tensor * llama_moe_cache::record(ggml_context * ctx, int32_t il, ggml_tensor * ids) const {

@@ -68,6 +68,9 @@ public:
     // router two blocks early, its top N) in layer il's cache branch and hands it over; nullptr when there is none
     int32_t prefetch_top_n() const;
     void prefetch_tensor(int32_t il, ggml_tensor * pred) const;
+    // the last op of layer il's CPU branch (after the experts, an in-place pass-through of after): the main thread hands
+    // the prediction read back since the branch's start to the touch threads; after itself without the prefetch
+    ggml_tensor * prefetch_launch(ggml_context * ctx, int32_t il, ggml_tensor * after) const;
 
     // hot spare mode: after a ubatch of n_tokens tokens, update the scores and refresh the resident experts
     // pos0: position of its first token (0 starts a new conversation), -1 = unknown; gen: 1 if it is generation (it

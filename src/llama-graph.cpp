@@ -2729,6 +2729,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             ggml_tensor * experts_h = build_experts(cur, ids_h, nullptr, selected_experts);
             cb(experts_h, "ffn_moe_down_host", il);
+            // LLAMA_MOE_PREFETCH: the branch's last op hands the next layer's predicted experts to the touch threads
+            ggml_tensor * experts_h_end = moe_cache->prefetch_launch(ctx0, il, experts_h);
+            if (experts_h_end != experts_h) {
+                cb(experts_h_end, "ffn_moe_prefetch_launch", il);
+                ggml_backend_sched_set_tensor_backend(sched, experts_h_end, backend_cpu);
+            }
 
             // every op of the CPU branch runs on the CPU: from 32 tokens the scheduler would otherwise offload its matrix
             // multiplications to a GPU by copying all the experts of the layer, and reserve a compute buffer for that
@@ -2742,7 +2748,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             // each expert output comes from one branch and is zero in the other, so the sum is exact
-            ggml_tensor * experts = ggml_add(ctx0, experts_c, experts_h);
+            ggml_tensor * experts = ggml_add(ctx0, experts_c, experts_h_end);
             if (ggml_backend_t backend_layer = moe_cache->layer_backend(il)) {
                 ggml_backend_sched_set_tensor_backend(sched, experts, backend_layer);
             }
