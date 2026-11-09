@@ -2275,10 +2275,11 @@ static void ggml_compute_forward_moe_ffn(
     ggml_barrier(params->threadpool);
 
     n_active = *n_active_p;
-    // the chunks (of the active experts' rows, in order) go to the groups in turn: group g has chunks g, g + n_grp, ...
-    // of each half, so every group has local work however few experts there are
+    // a chunk's group is (expert, chunk) modulo n_grp, so it doesn't depend on which other experts are active: a prefetch
+    // of predicted experts lands each chunk in the group that will compute it. Each group walks the whole chunk list and
+    // skips the others' chunks (the list is short), own group first, then the others' (stealing)
     const int my = ggml_cpu_l3_group();
-    #define GRP_N(g, total) ((g) < (total) ? ((total) - (g) + n_grp - 1)/n_grp : 0)
+    #define GRP_OF(e, c) ((int) (((e) + (c)) % n_grp))
 
     const size_t row_size_dn = ggml_row_size(vdt_dn, n_ff);
     const void * wdata_dn = vdt_dn != GGML_TYPE_F32 ? (const void *) glq : glu->data;
@@ -2288,9 +2289,19 @@ static void ggml_compute_forward_moe_ffn(
     const int64_t n_gu_all = (int64_t) n_active*cpe_gu;
     for (int gi = 0; gi < n_grp; ++gi) {
     const int g = (my + gi) % n_grp;
-    const int64_t n_gu = GRP_N(g, n_gu_all);
-    for (int64_t mi; (mi = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu; ) {
-        const int64_t k = g + mi*n_grp;
+    // the group's counter indexes its own chunks: the mi-th chunk of the list whose group is g
+    for (int64_t mi; (mi = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu_all; ) {
+        int64_t k = -1, seen = 0;
+        for (int64_t kk = 0; kk < n_gu_all && k < 0; ++kk) {
+            if (n_grp == 1 || GRP_OF(active[kk / cpe_gu], kk % cpe_gu) == g) {
+                if (seen++ == mi) {
+                    k = kk;
+                }
+            }
+        }
+        if (k < 0) {
+            break;
+        }
         const int e = active[k / cpe_gu];
         const int64_t r0 = (k % cpe_gu)*C, r1 = MIN(n_ff, r0 + C);
         const int64_t cne1 = matrix_row_counts[e];
@@ -2315,9 +2326,18 @@ static void ggml_compute_forward_moe_ffn(
     const int64_t n_dn_all = (int64_t) n_active*cpe_dn;
     for (int gi = 0; gi < n_grp; ++gi) {
     const int g = (my + gi) % n_grp;
-    const int64_t n_dn = GRP_N(g, n_dn_all);
-    for (int64_t mi; (mi = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn; ) {
-        const int64_t k = g + mi*n_grp;
+    for (int64_t mi; (mi = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn_all; ) {
+        int64_t k = -1, seen = 0;
+        for (int64_t kk = 0; kk < n_dn_all && k < 0; ++kk) {
+            if (n_grp == 1 || GRP_OF(active[kk / cpe_dn], kk % cpe_dn) == g) {
+                if (seen++ == mi) {
+                    k = kk;
+                }
+            }
+        }
+        if (k < 0) {
+            break;
+        }
         const int e = active[k / cpe_dn];
         while (atomic_load_explicit((atomic_int *) sync[e] + 1, memory_order_acquire) == 0) {
             ggml_thread_cpu_relax();
@@ -2329,7 +2349,7 @@ static void ggml_compute_forward_moe_ffn(
     }
     #undef CTR_GU
     #undef CTR_DN
-    #undef GRP_N
+    #undef GRP_OF
 }
 
 /////////////////////////////////
