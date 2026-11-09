@@ -226,6 +226,10 @@ in the CPU's cache, so the cold reads were the problem.
 - **`GGML_CPU_MMID_FLAT=C`:** MUL_MAT_ID lines up the rows of all active experts and hands them out in chunks of C
   rows, instead of every thread taking a slice of each expert in turn. It applies up to 8 tokens per expert, and the
   logits don't change. It doesn't suit every CPU: on the 14600KF it was slower.
+- **`GGML_CPU_MMID_GLU=1`:** the CPU computes each expert's gate and up rows in one pass and writes silu(gate)·up,
+  instead of two MUL_MAT_IDs and a GLU. A pass hands each op only 2–5 missed experts, so every op pays its own start
+  and uneven finish; on its own, with larger ops, the kernel reaches ~83% of the RAM's streaming rate. Verify batches
+  1.5–6% faster; end to end within the noise (agent turns Q4 +0.4%, Q6 +1.1%).
 - **`GOMP_SPINCOUNT=30000000`** (GCC's OpenMP, not this fork's setting): libgomp spins about 1 ms before its threads
   sleep, about the gap between two layers' CPU work, so they woke ~30 µs late every layer. This keeps them spinning
   ~32 ms, then they sleep.
@@ -367,7 +371,7 @@ published). The cache, draft and CPU settings are the tuning script's picks for 
 ([Tuning a machine](#tuning-a-machine)):
 
 ```bash
-GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=3072 \
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_VK_FLOPS_PER_SUBMIT=100000000 LLAMA_MOE_RESIZE_SPLIT=3072 \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
@@ -457,6 +461,9 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   the OpenMP threads pinned to cores (`OMP_PLACES`, 3–8% slower). With the experts on the CPU alone, loading the weights
   instead of mapping them gave 2–3%. With the hot spare, loading them, putting them on 2 MiB pages, and cutting the
   CPU's work into chunks of 96–192 KB (as Strata's CPU pool does) each came within 1% of the mapped weights.
+- **The CPU summing its own experts' outputs** before sending them to the GPU (one vector a token instead of one an
+  expert slot, 10x less over the bus): as one op it costs 8–19 µs a layer and saved nothing (verify batches within
+  1%); the copy it removed was already hidden behind other work.
 - **Keeping the GPU busy** with one sleeping wave from a second process held it at about 3.28 GHz: Q4 answers +1.3%,
   Q6 nothing, prompts −16–17%.
 - **Prefetching a token's misses from its n-grams,** what Flash-Next's engram (its per-layer n-gram table, read at
