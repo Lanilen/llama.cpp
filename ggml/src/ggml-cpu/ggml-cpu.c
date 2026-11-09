@@ -1574,8 +1574,9 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-// GGML_CPU_MMID_CCX: the CPUs' L3 groups (the CCXs of a Zen 1/2), for the fused expert FFN: a thread takes the experts of
-// its own group first, so that weights another thread of the group pulled into their L3 are read from there.
+// GGML_CPU_MMID_CCX: the CPUs' L3 groups (the CCXs of a Zen 1/2), for the fused expert FFN: the chunks go to the groups in
+// turn and a thread takes its own group's first, so that weights another thread of the group pulled into their L3 are
+// read from there.
 // 1: the groups from sysfs (Linux; one group elsewhere); N > 1: N groups by cpu modulo N (a test); unset or 0: one group
 #define GGML_CPU_MAX_L3_GROUPS 16
 #define GGML_CPU_MAX_CPUS 1024
@@ -2274,20 +2275,23 @@ static void ggml_compute_forward_moe_ffn(
     ggml_barrier(params->threadpool);
 
     n_active = *n_active_p;
-    // the experts in the active list go to the groups in turn: group g has the ones at positions g, g + n_grp, ...
+    // the chunks (of the active experts' rows, in order) go to the groups in turn: group g has chunks g, g + n_grp, ...
+    // of each half, so every group has local work however few experts there are
     const int my = ggml_cpu_l3_group();
-    #define GRP_N(g) ((g) < n_active ? (n_active - (g) + n_grp - 1)/n_grp : 0)
+    #define GRP_N(g, total) ((g) < (total) ? ((total) - (g) + n_grp - 1)/n_grp : 0)
 
     const size_t row_size_dn = ggml_row_size(vdt_dn, n_ff);
     const void * wdata_dn = vdt_dn != GGML_TYPE_F32 ? (const void *) glq : glu->data;
     ggml_from_float_t const from_float_dn = type_traits_cpu[vdt_dn].from_float;
 
     // the first half: gate + up + SWIGLU, chunk by chunk; own group's experts first, then the other groups' (stealing)
+    const int64_t n_gu_all = (int64_t) n_active*cpe_gu;
     for (int gi = 0; gi < n_grp; ++gi) {
     const int g = (my + gi) % n_grp;
-    const int64_t n_gu = GRP_N(g)*cpe_gu;
-    for (int64_t k; (k = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu; ) {
-        const int e = active[g + (k / cpe_gu)*n_grp];
+    const int64_t n_gu = GRP_N(g, n_gu_all);
+    for (int64_t m; (m = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu; ) {
+        const int64_t k = g + m*n_grp;
+        const int e = active[k / cpe_gu];
         const int64_t r0 = (k % cpe_gu)*C, r1 = MIN(n_ff, r0 + C);
         const int64_t cne1 = matrix_row_counts[e];
         ggml_compute_forward_mul_mat_id_glu_one_chunk(glu, src0g, x, ids, e, r0, r1, cne1,
@@ -2308,11 +2312,13 @@ static void ggml_compute_forward_moe_ffn(
     }
 
     // the second half: down, in the experts' order, as each is ready; own group first again
+    const int64_t n_dn_all = (int64_t) n_active*cpe_dn;
     for (int gi = 0; gi < n_grp; ++gi) {
     const int g = (my + gi) % n_grp;
-    const int64_t n_dn = GRP_N(g)*cpe_dn;
-    for (int64_t k; (k = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn; ) {
-        const int e = active[g + (k / cpe_dn)*n_grp];
+    const int64_t n_dn = GRP_N(g, n_dn_all);
+    for (int64_t m; (m = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn; ) {
+        const int64_t k = g + m*n_grp;
+        const int e = active[k / cpe_dn];
         while (atomic_load_explicit((atomic_int *) sync[e] + 1, memory_order_acquire) == 0) {
             ggml_thread_cpu_relax();
         }
