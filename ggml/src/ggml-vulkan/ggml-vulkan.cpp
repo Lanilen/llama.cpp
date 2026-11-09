@@ -267,6 +267,7 @@ uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
 // a tensor the device reads in place from host memory: every tensor on a UMA device, and on any device the tensors in its
 // own pinned buffer type (Vulkan<N>_Pinned, memory the driver allocated; defined with the buffer types below)
 static bool ggml_vk_pinned_for_device(const ggml_backend_buffer_t buffer, size_t device_idx);
+bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
 static bool ggml_vk_tensor_on_host(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     const ggml_tensor * base = t->view_src ? t->view_src : t;
     return ctx->device->uma || (base->buffer != nullptr && ggml_vk_pinned_for_device(base->buffer, ctx->device->idx));
@@ -12491,11 +12492,18 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
+            // weights in pinned host memory, read in place, have no device buffer and are never written
+            if (!ggml_backend_buffer_is_vk(node->buffer)) {
+                return false;
+            }
             auto n_base = vk_tensor_offset(node) + node->view_offs;
             auto n_size = ggml_nbytes(node);
             ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
             vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
+                if (!ggml_backend_buffer_is_vk(other->buffer)) {
+                    continue;
+                }
                 ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
                 vk_buffer o_buf = o_buf_ctx->dev_buffer;
                 if (a_buf == o_buf) {
@@ -14444,6 +14452,10 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
 }
 
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
+    // a tensor in pinned host memory (weights read in place) shares no buffer with the device's tensors
+    if (!ggml_backend_buffer_is_vk(a->buffer) || !ggml_backend_buffer_is_vk(b->buffer)) {
+        return false;
+    }
     ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
     vk_buffer a_buf = a_buf_ctx->dev_buffer;
     ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;

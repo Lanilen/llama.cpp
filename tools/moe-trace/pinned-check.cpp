@@ -75,12 +75,14 @@ int main(int argc, char ** argv) {
                 }
             }
             auto run = [&](ggml_backend_t backend, bool pinned, std::vector<float> & out, double * us) {
-                ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+                ggml_init_params ip = { 12 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
                 ggml_context * ctx = ggml_init(ip);
                 ggml_tensor * as = ggml_new_tensor_3d(ctx, sh.type, sh.k, sh.m, n_expert);
                 ggml_tensor * b  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, sh.k, n_used, n);
                 ggml_tensor * id = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+                // two reads of the weights in one graph, so the device's hazard checks see them beside other nodes
                 ggml_tensor * y  = ggml_mul_mat_id(ctx, as, b, id);
+                y = ggml_add(ctx, y, ggml_mul_mat_id(ctx, as, b, id));
                 ggml_cgraph * gf = ggml_new_graph(ctx);
                 ggml_build_forward_expand(gf, y);
                 ggml_backend_buffer_t wbuf = nullptr;
@@ -124,7 +126,7 @@ int main(int argc, char ** argv) {
             all_ok = all_ok && ok;
             int64_t distinct = 0;
             { std::vector<int32_t> u = ids; std::sort(u.begin(), u.end()); distinct = std::unique(u.begin(), u.end()) - u.begin(); }
-            const double gbs = distinct * sh.m * row_size / 1e3 / us;
+            const double gbs = 2 * distinct * sh.m * row_size / 1e3 / us;
             printf("%-5s %5lldx%-5lld %3lld | %12.2e%s | %9.1f %7.1f\n", ggml_type_name(sh.type), (long long) sh.m, (long long) sh.k,
                    (long long) n, rel, ok ? "" : " FAIL", us, gbs);
         }
