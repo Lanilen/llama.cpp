@@ -186,6 +186,7 @@ struct llama_moe_cache_rec {
     // the record op is the first of the layer's CPU branch: a hook run there (LLAMA_MOE_PREFETCH arms the next layer's touch)
     void (*on_start)(void * ctx, int32_t il) = nullptr;
     void (*on_end)(void * ctx, int32_t il) = nullptr;
+    void (*on_worker)(void * ctx) = nullptr;     // the record op's other threads (the main thread's pin, see prefetch_t)
     void *  on_start_ctx = nullptr;
     int32_t il = -1;
 };
@@ -206,11 +207,14 @@ static void llama_moe_cache_launch(ggml_tensor * dst, int ith, int nth, void * u
 // hot spare mode: copies the selected experts ids [n_expert_used, n_tokens] and counts them, userdata is the llama_moe_cache_rec of the layer
 static void llama_moe_cache_record(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
+    auto & rec = *(llama_moe_cache_rec *) userdata;
     // every thread of the CPU backend runs the op, one does the work
     if (ith != 0) {
+        if (rec.on_worker != nullptr) {
+            rec.on_worker(rec.on_start_ctx);
+        }
         return;
     }
-    auto & rec = *(llama_moe_cache_rec *) userdata;
     if (rec.on_start != nullptr) {
         rec.on_start(rec.on_start_ctx, rec.il);
     }
@@ -1045,6 +1049,7 @@ struct llama_moe_cache::impl {
                     l.rec.count.assign(g.ref[0]->ne[2], 0);
                     l.rec.on_start = prefetch_on_start;
                     l.rec.on_end = prefetch_on_end;
+                    l.rec.on_worker = prefetch_on_worker;
                     l.rec.on_start_ctx = this;
                     l.rec.il = il;
                     if (predictor) {
@@ -1540,7 +1545,11 @@ struct llama_moe_cache::impl {
     // touched a layer at most (12). The touch threads run on cores' second hardware threads, one a core, and never on
     // the main thread's core: its recording of the device's work is the critical path while they run, and a sibling
     // streaming through the shared L2 slows it. The main thread is pinned to a core for that (LLAMA_MOE_PREFETCH_MAIN_CPU,
-    // default the first cpu; -1: not pinned, then the touch threads avoid no core).
+    // default the first cpu; -1: not pinned, then the touch threads avoid no core), on its first arm, inside a graph
+    // compute, once the CPU backend's worker threads exist: a new thread inherits its creator's mask, so a pin at init
+    // put every OpenMP worker on that one cpu (12 threads spinning on cpu 0, the run never finished a batch). A worker
+    // created later (a larger team, or a threadpool made a graph at a time) finds the pin on itself in the record op
+    // and takes the process's mask back.
     struct prefetch_job {
         uint64_t gen = 0;
         int32_t  il  = -1;                  // the layer whose experts are touched
@@ -1559,6 +1568,11 @@ struct llama_moe_cache::impl {
         std::atomic<uint64_t>   gen{0};           // the current job's number: a thread works while its job is current
         bool                    quit = false;
         bool                    debug = false;    // LLAMA_MOE_PREFETCH_DEBUG=1: the first arm, launch and touch logged
+        int                     main_cpu = -1;    // the main thread's cpu (-1: not pinned)
+        std::atomic<bool>       main_pinned{false};
+#if defined(__linux__)
+        cpu_set_t               full;             // the process's mask before the pin, for threads that inherited the pin
+#endif
         prefetch_job            job;              // posted to the threads
         prefetch_job            pending;          // armed: its read is in flight until the launch synchronizes it
         ggml_backend_event_t    ev[2] = { nullptr, nullptr };
@@ -1575,6 +1589,10 @@ struct llama_moe_cache::impl {
 
     static void prefetch_on_end(void * ctx, int32_t il) {
         ((impl *) ctx)->prefetch_launch(il);
+    }
+
+    static void prefetch_on_worker(void * ctx) {
+        ((impl *) ctx)->prefetch_worker_check();
     }
 
     void prefetch_init() {
@@ -1607,14 +1625,22 @@ struct llama_moe_cache::impl {
         for (auto & v : pf.ids) {
             v.assign((size_t) pf.n_top*8, -1);
         }
-        // the main thread's core (the cpu and its sibling, by the core id in sysfs), kept free of touch threads
+        // the main thread's core (the cpu and its sibling, by the core id in sysfs), kept free of touch threads; the pin
+        // itself waits for the first arm (prefetch_pin_main)
         std::vector<int> avoid;
 #if defined(__linux__)
+        CPU_ZERO(&pf.full);
+        if (sched_getaffinity(0, sizeof(pf.full), &pf.full) != 0) {
+            for (int c = 0; c < n_cpu && c < CPU_SETSIZE; ++c) {
+                CPU_SET(c, &pf.full);
+            }
+        }
+        if (main_cpu >= 0 && main_cpu < n_cpu && !CPU_ISSET(main_cpu, &pf.full)) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_PREFETCH: cpu %d is not in the process's mask, the main thread is not pinned\n", __func__, main_cpu);
+            main_cpu = -1;
+        }
         if (main_cpu >= 0 && main_cpu < n_cpu) {
-            cpu_set_t set;
-            CPU_ZERO(&set);
-            CPU_SET(main_cpu, &set);
-            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            pf.main_cpu = main_cpu;
             avoid.push_back(main_cpu);
             char path[128], list[64] = { 0 };
             snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", main_cpu);
@@ -1683,12 +1709,48 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // the main thread's pin, on its first arm (see prefetch_t): the caller is the CPU backend's thread 0 in a graph compute
+    void prefetch_pin_main() {
+#if defined(__linux__)
+        if (pf.main_cpu < 0 || pf.main_pinned.load(std::memory_order_relaxed)) {
+            return;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(pf.main_cpu, &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_PREFETCH: could not pin the main thread to cpu %d\n", __func__, pf.main_cpu);
+        }
+        pf.main_pinned.store(true, std::memory_order_release);
+#endif
+    }
+
+    // every other thread of the CPU backend, in the record op: one created after the pin inherited it, and takes the
+    // process's mask back (a thread checks once)
+    void prefetch_worker_check() {
+#if defined(__linux__)
+        if (!pf.main_pinned.load(std::memory_order_acquire)) {
+            return;
+        }
+        static thread_local bool checked = false;
+        if (checked) {
+            return;
+        }
+        checked = true;
+        cpu_set_t cur;
+        if (pthread_getaffinity_np(pthread_self(), sizeof(cur), &cur) == 0 && CPU_COUNT(&cur) == 1 && CPU_ISSET(pf.main_cpu, &cur)) {
+            pthread_setaffinity_np(pthread_self(), sizeof(pf.full), &pf.full);
+        }
+#endif
+    }
+
     // the record of layer il runs: layer il's CPU branch starts, so the touch for il (if any) stops, and the prediction
     // for il + 1 made in il's cache branch is read back (asynchronously, after the cache branch on the device)
     void prefetch_arm(int32_t il) {
         if (pf.n_top == 0) {
             return;
         }
+        prefetch_pin_main();
         pf.gen++;   // cancels the running job
         const int32_t nxt = il + 1;
         ggml_tensor * pred = il >= 0 && il < (int32_t) layers.size() ? layers[il].pf_pred : nullptr;
