@@ -453,8 +453,10 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   CPU's experts' time, which the next step needs, so it would gain at most about 3%
   ([docs/moe-hot-spare-async-cpu.md](docs/moe-hot-spare-async-cpu.md)).
 - **For the CPU's experts:** software prefetch (`GGML_CPU_MMID_PREFETCH`, 1–14% slower), 16 or 23 threads instead of 12
-  (4–20% slower: two threads on a core share its arithmetic), ggml's repacked q4_K layout (9–17% slower at 1–3 tokens).
-  Loading the weights instead of mapping them gave 2–3%.
+  (4–20% slower: two threads on a core share its arithmetic), ggml's repacked q4_K layout (9–17% slower at 1–3 tokens),
+  the OpenMP threads pinned to cores (`OMP_PLACES`, 3–8% slower). With the experts on the CPU alone, loading the weights
+  instead of mapping them gave 2–3%. With the hot spare, loading them, putting them on 2 MiB pages, and cutting the
+  CPU's work into chunks of 96–192 KB (as Strata's CPU pool does) each came within 1% of the mapped weights.
 - **Keeping the GPU busy** with one sleeping wave from a second process held it at about 3.28 GHz: Q4 answers +1.3%,
   Q6 nothing, prompts −16–17%.
 - **Prefetching a token's misses from its n-grams,** what Flash-Next's engram (its per-layer n-gram table, read at
