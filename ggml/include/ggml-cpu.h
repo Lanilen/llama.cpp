@@ -133,6 +133,9 @@ extern "C" {
 
     GGML_BACKEND_API bool ggml_backend_is_cpu                (ggml_backend_t backend);
     GGML_BACKEND_API void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
+    // MUL_MAT_ID with src0 = t reads expert e from ptrs[e] when it is not NULL (ptrs: n entries, kept by the caller), else
+    // from t's own data: a MoE cache keeps copies of some experts elsewhere (its pinned tier); NULL ptrs removes the entry
+    GGML_BACKEND_API void ggml_backend_cpu_set_expert_remap  (const struct ggml_tensor * t, const void * const * ptrs, int64_t n);
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 

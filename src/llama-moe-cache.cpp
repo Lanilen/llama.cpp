@@ -501,13 +501,11 @@ struct llama_moe_cache::impl {
 
         // hot spare mode, see llama_moe_cache_hot_spare_maps
         ggml_tensor * miss_map = nullptr;
-        // a pinned tier (LLAMA_MOE_TIER): copies of the layer's most routed experts in pinned host memory, which the CPU
-        // reads (and, with its GPU branch, the device); its misses leave miss_mapped and go to tier_ids / tier_slot
-        ggml_tensor * miss_mapped = nullptr; // the misses outside the tier
-        ggml_tensor * tier_ids    = nullptr;
-        ggml_tensor * tier_slot   = nullptr;
+        // a pinned tier (LLAMA_MOE_TIER): copies of the layer's most routed experts in pinned host memory; the CPU reads
+        // them through ggml_backend_cpu_set_expert_remap (its MUL_MAT_ID stays one op), the device through its GPU branch
         std::vector<ggml_tensor *> tier;      // one per expert tensor, P experts each
         std::vector<int32_t> tier_slot_of;   // [n_expert] its slot in the tier, -1 if not in it
+        std::vector<std::vector<const void *>> tier_ptrs; // per expert tensor, [n_expert]: the expert's copy in the tier, or null
         ggml_tensor * slot_dev = nullptr;
         ggml_tensor * hit_dev  = nullptr;
         std::vector<int32_t> slot_of; // [n_expert] slot of each expert, -1 if not resident
@@ -974,11 +972,6 @@ struct llama_moe_cache::impl {
         // predictor); its maps are host tensors of their own
         if (const char * env = getenv("LLAMA_MOE_TIER"); env != nullptr && mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && predictor) {
             tier_p = std::max(0, atoi(env));
-            if (tier_p > 0) {
-                for (const group & g : groups) {
-                    n_tensors_host += g.n_slots > 0 ? 3*g.layers.size() : 0;
-                }
-            }
         }
 
         auto init_ctx = [](size_t n_tensors) {
@@ -1048,13 +1041,6 @@ struct llama_moe_cache::impl {
                     l.uploading.assign(g.ref[0]->ne[2], 0);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
                     if (tier_p > 0) {
-                        l.miss_mapped = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                        l.tier_ids    = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                        l.tier_slot   = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                        ggml_format_name(l.miss_mapped, "moe_cache.miss_mapped-%d", il);
-                        ggml_format_name(l.tier_ids,    "moe_cache.tier_ids-%d", il);
-                        ggml_format_name(l.tier_slot,   "moe_cache.tier_slot-%d", il);
-                        buf_host_size += 3*GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
                         l.tier_slot_of.assign(g.ref[0]->ne[2], -1);
                     }
                     if (g.n_jit > 0) {
@@ -1373,12 +1359,6 @@ struct llama_moe_cache::impl {
     // the CPU branch sees the change at the next ubatch, the device maps when the shadows are flushed
     void set_resident(layer & l, int32_t e, int32_t s) {
         ((int32_t *) l.miss_map->data)[e] = s < 0 ? e : -1;
-        if (l.tier_ids != nullptr) {
-            const bool in_tier = s < 0 && l.tier_slot_of[e] >= 0;
-            ((int32_t *) l.miss_mapped->data)[e] = s < 0 && !in_tier ? e : -1;
-            ((int32_t *) l.tier_ids->data)[e]    = in_tier ? e : -1;
-            ((int32_t *) l.tier_slot->data)[e]   = in_tier ? l.tier_slot_of[e] : -1;
-        }
         l.slot_host[e] = s;
         l.hit_host[e]  = s < 0 ? -1 : e;
         l.slot_of[e]   = s;
@@ -2484,10 +2464,6 @@ struct llama_moe_cache::impl {
         maps = { l.miss_map, l.slot_dev, l.hit_dev };
         if (n_tokens > max_batch && l.jit_slot != nullptr && groups[l.ig].n_jit > 0) {
             maps = { l.jit_miss, l.jit_slot, l.jit_hit };
-        } else if (n_tokens <= max_batch && l.tier_ids != nullptr) {
-            // the tier serves the batches that keep to the resident set (generation, verify passes); the jit's and the
-            // large ones see all the misses on the mapping, as before
-            maps = { l.miss_mapped, l.slot_dev, l.hit_dev, l.tier_ids, l.tier_slot };
         }
         return true;
     }
@@ -2503,6 +2479,16 @@ struct llama_moe_cache::impl {
         }
         log_stats();
         verify_resident("at exit");
+        if (!tier_of.empty()) {
+            // the CPU backend stops reading the tier before its memory goes
+            auto remap = (void (*)(const ggml_tensor *, const void * const *, int64_t)) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)), "ggml_backend_cpu_set_expert_remap");
+            for (const auto & [w, t] : tier_of) {
+                if (remap) {
+                    remap(w, nullptr, 0);
+                }
+            }
+        }
         if (!save_path.empty()) {
             save_hot_spare(save_path);
         }
@@ -2618,14 +2604,14 @@ struct llama_moe_cache::impl {
         const std::vector<float> & prior = predictor->prior();
         size_t n_tensors = 0;
         for (const layer & l : layers) {
-            n_tensors += l.tier_ids != nullptr ? l.experts.size() : 0;
+            n_tensors += !l.tier_slot_of.empty() ? l.experts.size() : 0;
         }
         ggml_init_params ip = { n_tensors*ggml_tensor_overhead(), nullptr, true };
         ctx_tier.reset(ggml_init(ip));
         ggml_backend_buffer_type_t buft = nullptr;
         for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
             layer & l = layers[il];
-            if (l.tier_ids == nullptr) {
+            if (l.tier_slot_of.empty()) {
                 continue;
             }
             const int32_t n_expert = (int32_t) l.slot_of.size();
@@ -2692,13 +2678,25 @@ struct llama_moe_cache::impl {
         for (auto & t : threads) {
             t.join();
         }
+        // the CPU's MUL_MAT_ID reads the tier's experts from it
+        auto remap = (void (*)(const ggml_tensor *, const void * const *, int64_t)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)), "ggml_backend_cpu_set_expert_remap");
         for (layer & l : layers) {
-            if (l.tier_ids == nullptr) {
-                continue;
+            l.tier_ptrs.assign(l.tier.size(), {});
+            for (size_t ip = 0; ip < l.tier.size(); ++ip) {
+                l.tier_ptrs[ip].assign(l.tier_slot_of.size(), nullptr);
+                for (int32_t e = 0; e < (int32_t) l.tier_slot_of.size(); ++e) {
+                    if (l.tier_slot_of[e] >= 0) {
+                        l.tier_ptrs[ip][e] = (const uint8_t *) l.tier[ip]->data + (size_t) l.tier_slot_of[e]*l.tier[ip]->nb[2];
+                    }
+                }
+                if (remap) {
+                    remap(l.experts[ip], l.tier_ptrs[ip].data(), (int64_t) l.tier_ptrs[ip].size());
+                }
             }
-            for (int32_t e = 0; e < (int32_t) l.slot_of.size(); ++e) {
-                set_resident(l, e, l.slot_of[e]);
-            }
+        }
+        if (!remap) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_TIER: the CPU backend can't read experts from the tier, it reads the mapping\n", __func__);
         }
         LLAMA_LOG_INFO("%s: LLAMA_MOE_TIER: %d experts a layer, %.2f GiB in %s, filled in %.1f s\n", __func__, tier_p,
             bytes/1073741824.0, ggml_backend_buffer_name(buf_tier.get()), (ggml_time_us() - t0)/1e6);

@@ -1574,6 +1574,42 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// ggml_backend_cpu_set_expert_remap: expert tensors whose experts are read, some of them, from other memory; set while no
+// graph runs (a model's load), read by every MUL_MAT_ID
+#define GGML_CPU_EXPERT_REMAP_MAX 1024
+static struct { const struct ggml_tensor * t; const void * const * ptrs; int64_t n; } g_expert_remap[GGML_CPU_EXPERT_REMAP_MAX];
+static int g_n_expert_remap = 0;
+
+void ggml_backend_cpu_set_expert_remap(const struct ggml_tensor * t, const void * const * ptrs, int64_t n) {
+    for (int i = 0; i < g_n_expert_remap; ++i) {
+        if (g_expert_remap[i].t == t) {
+            if (ptrs == NULL) {
+                g_expert_remap[i] = g_expert_remap[--g_n_expert_remap];
+            } else {
+                g_expert_remap[i].ptrs = ptrs;
+                g_expert_remap[i].n    = n;
+            }
+            return;
+        }
+    }
+    if (ptrs != NULL) {
+        GGML_ASSERT(g_n_expert_remap < GGML_CPU_EXPERT_REMAP_MAX && "too many expert tensors remapped");
+        g_expert_remap[g_n_expert_remap].t    = t;
+        g_expert_remap[g_n_expert_remap].ptrs = ptrs;
+        g_expert_remap[g_n_expert_remap].n    = n;
+        g_n_expert_remap++;
+    }
+}
+
+static const void * const * ggml_cpu_expert_remap_of(const struct ggml_tensor * t, int64_t n) {
+    for (int i = 0; i < g_n_expert_remap; ++i) {
+        if (g_expert_remap[i].t == t) {
+            return g_expert_remap[i].n >= n ? g_expert_remap[i].ptrs : NULL;
+        }
+    }
+    return NULL;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1583,6 +1619,10 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * ids = dst->src[2];
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // expert a's data: its copy in other memory if the tensor has one (ggml_backend_cpu_set_expert_remap), else its own
+    const void * const * remap = g_n_expert_remap > 0 ? ggml_cpu_expert_remap_of(src0, ne02) : NULL;
+#define MMID_EXPERT_DATA(a) ((remap != NULL && remap[(a)] != NULL) ? (const char *) remap[(a)] : (const char *) src0->data + (a)*nb02)
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -1746,7 +1786,7 @@ static void ggml_compute_forward_mul_mat_id(
                         ggml_compute_forward_mul_mat_id_one_chunk(
                             dst, src0, src1, ids, a,
                             lo - b, hi - b, 0, cne1,
-                            (const char *) src0->data + a * nb02, matrix_rows, row_size, src1_cont, wdata
+                            MMID_EXPERT_DATA(a), matrix_rows, row_size, src1_cont, wdata
                         );
                     }
                     b += ne01;
@@ -1769,7 +1809,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = MMID_EXPERT_DATA(cur_a);
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1823,6 +1863,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 }
+#undef MMID_EXPERT_DATA
 
 /////////////////////////////////
 
