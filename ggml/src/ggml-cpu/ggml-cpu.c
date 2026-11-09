@@ -1574,10 +1574,6 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-// GGML_CPU_MMID_FLAT and GGML_CPU_MMID_FLAT_BYTES (see ggml_compute_forward_mul_mat_id), read in ggml_cpu_init
-static int64_t g_mmid_flat       = 0;
-static int64_t g_mmid_flat_bytes = 0;
-
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1703,12 +1699,12 @@ static void ggml_compute_forward_mul_mat_id(
     // GGML_CPU_MMID_FLAT=C: with up to 8 tokens per expert, the rows of all active experts are one list, cut into chunks
     // of C rows that the threads take in turn, instead of every thread taking a slice of each expert: longer runs
     // through cold weights, still balanced between threads of unequal speed
-    // GGML_CPU_MMID_FLAT_BYTES=B: the same, with chunks of about B bytes of weight rows instead of a fixed number of
-    // rows, so that ops with short rows (Flash-Next's down projections, 480 bytes a q5_1 row) get as long runs as the
-    // others (it takes the place of GGML_CPU_MMID_FLAT). Both are read once in ggml_cpu_init: every thread of an op must
-    // take the same path
-    const int64_t flat_rows = g_mmid_flat_bytes > 0 ? MAX(1, g_mmid_flat_bytes / (int64_t) nb01) : g_mmid_flat;
-    if (flat_rows > 0) {
+    static int64_t mmid_flat = -1;
+    if (mmid_flat < 0) {
+        const char * env = getenv("GGML_CPU_MMID_FLAT");
+        mmid_flat = env ? MAX(1, atoll(env)) : 0;
+    }
+    if (mmid_flat > 0) {
         int64_t total = 0, max_cne1 = 0;
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             if (matrix_row_counts[cur_a] > 0) {
@@ -1719,15 +1715,15 @@ static void ggml_compute_forward_mul_mat_id(
         if (total > 0 && max_cne1 <= 8) {
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-            const int64_t n_chunks = (total + flat_rows - 1)/flat_rows;
+            const int64_t n_chunks = (total + mmid_flat - 1)/mmid_flat;
             // expert 0's counter, set to nth before the barrier above: the first nth chunks go one to each thread
             atomic_int * chunk_ctr = (atomic_int *)(atomic_current_chunk + 0);
             int64_t chunk = ith;
             int cur_a = 0;
             int64_t base = 0;   // the first row of cur_a in the list
             while (chunk < n_chunks) {
-                const int64_t r0 = chunk*flat_rows;
-                const int64_t r1 = MIN(total, r0 + flat_rows);
+                const int64_t r0 = chunk*mmid_flat;
+                const int64_t r1 = MIN(total, r0 + mmid_flat);
                 // chunks come in increasing order to each thread, so the walk over the experts only moves forward
                 for (; cur_a < n_as; ++cur_a) {
                     if (matrix_row_counts[cur_a] == 0) {
@@ -4132,12 +4128,6 @@ void ggml_cpu_init(void) {
     static bool is_first_call = true;
 
     if (is_first_call) {
-        {
-            const char * env = getenv("GGML_CPU_MMID_FLAT");
-            g_mmid_flat = env ? MAX(1, atoll(env)) : 0;
-            const char * env_b = getenv("GGML_CPU_MMID_FLAT_BYTES");
-            g_mmid_flat_bytes = env_b ? MAX(1, atoll(env_b)) : 0;
-        }
         // initialize GELU, Quick GELU, SILU and EXP F32 tables
         {
             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
