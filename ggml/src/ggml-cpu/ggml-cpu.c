@@ -1574,6 +1574,78 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// GGML_CPU_MMID_CCX: the CPUs' L3 groups (the CCXs of a Zen 1/2), for the fused expert FFN: a thread takes the experts of
+// its own group first, so that weights another thread of the group pulled into their L3 are read from there.
+// 1: the groups from sysfs (Linux; one group elsewhere); N > 1: N groups by cpu modulo N (a test); unset or 0: one group
+#define GGML_CPU_MAX_L3_GROUPS 16
+#define GGML_CPU_MAX_CPUS 1024
+static int    g_l3_n_groups = 1;
+static int8_t g_l3_group_of[GGML_CPU_MAX_CPUS];
+
+static void ggml_cpu_l3_groups_init(void) {
+    const char * env = getenv("GGML_CPU_MMID_CCX");
+    const int mode = env ? atoi(env) : 0;
+    memset(g_l3_group_of, 0, sizeof(g_l3_group_of));
+    g_l3_n_groups = 1;
+    if (mode <= 0) {
+        return;
+    }
+    int n_cpu = 1;
+#if defined(__linux__) || defined(__APPLE__)
+    n_cpu = (int) sysconf(_SC_NPROCESSORS_CONF);
+#endif
+    n_cpu = MIN(MAX(n_cpu, 1), GGML_CPU_MAX_CPUS);
+    if (mode > 1) {
+        g_l3_n_groups = MIN(mode, GGML_CPU_MAX_L3_GROUPS);
+        for (int c = 0; c < n_cpu; ++c) {
+            g_l3_group_of[c] = (int8_t) (c % g_l3_n_groups);
+        }
+        return;
+    }
+#if defined(__linux__)
+    char lists[GGML_CPU_MAX_L3_GROUPS][128];
+    int n = 0;
+    for (int c = 0; c < n_cpu; ++c) {
+        char path[128], list[128] = { 0 };
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index3/shared_cpu_list", c);
+        FILE * f = fopen(path, "r");
+        if (f == NULL || fgets(list, sizeof(list), f) == NULL) {
+            if (f) { fclose(f); }
+            continue;
+        }
+        fclose(f);
+        int g = 0;
+        for (; g < n; ++g) {
+            if (strcmp(lists[g], list) == 0) {
+                break;
+            }
+        }
+        if (g == n) {
+            if (n == GGML_CPU_MAX_L3_GROUPS) {
+                g = 0;
+            } else {
+                snprintf(lists[n], sizeof(lists[n]), "%s", list);
+                n++;
+            }
+        }
+        g_l3_group_of[c] = (int8_t) g;
+    }
+    g_l3_n_groups = MAX(1, n);
+#endif
+}
+
+static int ggml_cpu_l3_group(void) {
+    if (g_l3_n_groups <= 1) {
+        return 0;
+    }
+#if defined(__linux__)
+    const int c = sched_getcpu();
+    return c >= 0 && c < GGML_CPU_MAX_CPUS ? g_l3_group_of[c] : 0;
+#else
+    return 0;
+#endif
+}
+
 // GGML_CPU_MMID_FLAT's chunk size, 0: off (read once)
 static int64_t ggml_cpu_mmid_flat(void) {
     static int64_t mmid_flat = -1;
@@ -1954,7 +2026,7 @@ static struct ggml_cpu_moe_ffn_ws ggml_cpu_moe_ffn_layout(const struct ggml_tens
     w.rows   = n_as*n_rows*sizeof(struct mmid_row_mapping);
     w.active = n_as*sizeof(int32_t);
     w.sync   = n_as*CACHE_LINE_SIZE;
-    w.ctr    = 2*CACHE_LINE_SIZE;
+    w.ctr    = (2*GGML_CPU_MAX_L3_GROUPS + 1)*CACHE_LINE_SIZE;   // a gate/up and a down counter a group, the expert count
     w.total  = w.xq + w.glq + w.counts + w.rows + w.active + w.sync + w.ctr + 8*CACHE_LINE_SIZE;
     return w;
 }
@@ -2147,9 +2219,11 @@ static void ggml_compute_forward_moe_ffn(
     int32_t * active = (int32_t *) base; base += GGML_PAD(ws.active, 64);
     base = (char *) GGML_PAD((uintptr_t) base, CACHE_LINE_SIZE);
     char (*sync)[CACHE_LINE_SIZE] = (char (*)[CACHE_LINE_SIZE]) base; base += ws.sync;   // per expert: done chunks, ready
-    atomic_int * ctr_gu = (atomic_int *) base;
-    atomic_int * ctr_dn = (atomic_int *) (base + CACHE_LINE_SIZE);
-    int32_t * n_active_p = (int32_t *) (base + CACHE_LINE_SIZE) + 4;   // beside ctr_dn, read once after the barrier
+    // a cache line a counter: the gate/up chunks taken of each group's experts, then the down chunks
+    const int n_grp = g_l3_n_groups;
+    #define CTR_GU(g) ((atomic_int *) (base + (g)*CACHE_LINE_SIZE))
+    #define CTR_DN(g) ((atomic_int *) (base + (GGML_CPU_MAX_L3_GROUPS + (g))*CACHE_LINE_SIZE))
+    int32_t * n_active_p = (int32_t *) (base + 2*GGML_CPU_MAX_L3_GROUPS*CACHE_LINE_SIZE);   // written before the barrier
 
     // the input in gate/up's dot type, each thread a slice of the blocks
     const size_t row_size_gu = ggml_row_size(vdt_gu, x->ne[0]);
@@ -2190,23 +2264,30 @@ static void ggml_compute_forward_moe_ffn(
                 active[n_active++] = e;
             }
         }
-        atomic_store_explicit(ctr_gu, nth, memory_order_relaxed);
-        atomic_store_explicit(ctr_dn, 0, memory_order_relaxed);
+        for (int g = 0; g < n_grp; ++g) {
+            atomic_store_explicit(CTR_GU(g), 0, memory_order_relaxed);
+            atomic_store_explicit(CTR_DN(g), 0, memory_order_relaxed);
+        }
         *n_active_p = n_active;
     }
 
     ggml_barrier(params->threadpool);
 
     n_active = *n_active_p;
+    // the experts in the active list go to the groups in turn: group g has the ones at positions g, g + n_grp, ...
+    const int my = ggml_cpu_l3_group();
+    #define GRP_N(g) ((g) < n_active ? (n_active - (g) + n_grp - 1)/n_grp : 0)
 
     const size_t row_size_dn = ggml_row_size(vdt_dn, n_ff);
     const void * wdata_dn = vdt_dn != GGML_TYPE_F32 ? (const void *) glq : glu->data;
     ggml_from_float_t const from_float_dn = type_traits_cpu[vdt_dn].from_float;
 
-    // the first half: gate + up + SWIGLU, chunk by chunk
-    const int64_t n_gu = (int64_t) n_active*cpe_gu;
-    for (int64_t k = ith; k < n_gu; k = atomic_fetch_add_explicit(ctr_gu, 1, memory_order_relaxed)) {
-        const int e = active[k / cpe_gu];
+    // the first half: gate + up + SWIGLU, chunk by chunk; own group's experts first, then the other groups' (stealing)
+    for (int gi = 0; gi < n_grp; ++gi) {
+    const int g = (my + gi) % n_grp;
+    const int64_t n_gu = GRP_N(g)*cpe_gu;
+    for (int64_t k; (k = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu; ) {
+        const int e = active[g + (k / cpe_gu)*n_grp];
         const int64_t r0 = (k % cpe_gu)*C, r1 = MIN(n_ff, r0 + C);
         const int64_t cne1 = matrix_row_counts[e];
         ggml_compute_forward_mul_mat_id_glu_one_chunk(glu, src0g, x, ids, e, r0, r1, cne1,
@@ -2224,12 +2305,14 @@ static void ggml_compute_forward_moe_ffn(
             atomic_store_explicit((atomic_int *) sync[e] + 1, 1, memory_order_release);
         }
     }
+    }
 
-    // the second half: down, in the experts' order, as each is ready
-    const int64_t n_dn = (int64_t) n_active*cpe_dn;
-    for (int64_t k = atomic_fetch_add_explicit(ctr_dn, 1, memory_order_relaxed); k < n_dn;
-         k = atomic_fetch_add_explicit(ctr_dn, 1, memory_order_relaxed)) {
-        const int e = active[k / cpe_dn];
+    // the second half: down, in the experts' order, as each is ready; own group first again
+    for (int gi = 0; gi < n_grp; ++gi) {
+    const int g = (my + gi) % n_grp;
+    const int64_t n_dn = GRP_N(g)*cpe_dn;
+    for (int64_t k; (k = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn; ) {
+        const int e = active[g + (k / cpe_dn)*n_grp];
         while (atomic_load_explicit((atomic_int *) sync[e] + 1, memory_order_acquire) == 0) {
             ggml_thread_cpu_relax();
         }
@@ -2237,6 +2320,10 @@ static void ggml_compute_forward_moe_ffn(
         ggml_compute_forward_mul_mat_id_one_chunk(down, src0d, glu, ids, e, r0, r1, 0, matrix_row_counts[e],
             (const char *) src0d->data + e*src0d->nb[2], matrix_rows, row_size_dn, true, wdata_dn);
     }
+    }
+    #undef CTR_GU
+    #undef CTR_DN
+    #undef GRP_N
 }
 
 /////////////////////////////////
@@ -3417,8 +3504,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
-                        // GGML_CPU_MMID_FFN: the fused FFN also converts its input and keeps an expert list and two counters
-                        cur += ggml_nelements(src1)*sizeof(float) + n_as*sizeof(int32_t) + 12*CACHE_LINE_SIZE;
+                        // GGML_CPU_MMID_FFN: the fused FFN also converts its input and keeps an expert list and counters
+                        cur += ggml_nelements(src1)*sizeof(float) + n_as*sizeof(int32_t) + (2*GGML_CPU_MAX_L3_GROUPS + 12)*CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
@@ -4624,6 +4711,7 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            ggml_cpu_l3_groups_init();
         }
 
         is_first_call = false;
