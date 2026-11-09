@@ -2289,8 +2289,8 @@ static void ggml_compute_forward_moe_ffn(
     for (int gi = 0; gi < n_grp; ++gi) {
     const int g = (my + gi) % n_grp;
     const int64_t n_gu = GRP_N(g, n_gu_all);
-    for (int64_t m; (m = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu; ) {
-        const int64_t k = g + m*n_grp;
+    for (int64_t mi; (mi = atomic_fetch_add_explicit(CTR_GU(g), 1, memory_order_relaxed)) < n_gu; ) {
+        const int64_t k = g + mi*n_grp;
         const int e = active[k / cpe_gu];
         const int64_t r0 = (k % cpe_gu)*C, r1 = MIN(n_ff, r0 + C);
         const int64_t cne1 = matrix_row_counts[e];
@@ -2316,8 +2316,8 @@ static void ggml_compute_forward_moe_ffn(
     for (int gi = 0; gi < n_grp; ++gi) {
     const int g = (my + gi) % n_grp;
     const int64_t n_dn = GRP_N(g, n_dn_all);
-    for (int64_t m; (m = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn; ) {
-        const int64_t k = g + m*n_grp;
+    for (int64_t mi; (mi = atomic_fetch_add_explicit(CTR_DN(g), 1, memory_order_relaxed)) < n_dn; ) {
+        const int64_t k = g + mi*n_grp;
         const int e = active[k / cpe_dn];
         while (atomic_load_explicit((atomic_int *) sync[e] + 1, memory_order_acquire) == 0) {
             ggml_thread_cpu_relax();
