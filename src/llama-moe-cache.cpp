@@ -1537,7 +1537,10 @@ struct llama_moe_cache::impl {
     // resident experts (the miss map), and read the chunks their group will compute, a word a cache line, while the
     // device runs the next layer's attention; the next layer's record cancels what's left. Layers 0, 1 and the last
     // predict badly and are skipped. LLAMA_MOE_PREFETCH_THREADS: threads a group (2); LLAMA_MOE_PREFETCH_MIB: bytes
-    // touched a layer at most (12).
+    // touched a layer at most (12). The touch threads run on cores' second hardware threads, one a core, and never on
+    // the main thread's core: its recording of the device's work is the critical path while they run, and a sibling
+    // streaming through the shared L2 slows it. The main thread is pinned to a core for that (LLAMA_MOE_PREFETCH_MAIN_CPU,
+    // default the first cpu; -1: not pinned, then the touch threads avoid no core).
     struct prefetch_job {
         uint64_t gen = 0;
         int32_t  il  = -1;                  // the layer whose experts are touched
@@ -1583,6 +1586,8 @@ struct llama_moe_cache::impl {
         }
         pf.debug = getenv("LLAMA_MOE_PREFETCH_DEBUG") && atoi(getenv("LLAMA_MOE_PREFETCH_DEBUG")) != 0;
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_THREADS")) { pf.per_group = std::max(1, atoi(e)); }
+        int main_cpu = 0;
+        if (const char * e = getenv("LLAMA_MOE_PREFETCH_MAIN_CPU")) { main_cpu = atoi(e); }
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_MIB"))     { pf.budget = (size_t) std::max(1, atoi(e)) << 20; }
         if (const char * e = getenv("GGML_CPU_MMID_FLAT"))         { pf.C = std::max<int64_t>(1, atoll(e)); }
         // the L3 groups as the CPU backend deals its chunks (GGML_CPU_MMID_CCX)
@@ -1602,22 +1607,55 @@ struct llama_moe_cache::impl {
         for (auto & v : pf.ids) {
             v.assign((size_t) pf.n_top*8, -1);
         }
-        for (int g = 0; g < pf.n_grp; ++g) {
-            for (int i = 0; i < pf.per_group; ++i) {
-                // the group's last cpus, the odd ones first (a core's second hardware thread)
-                const auto & cs = pf.cpus[g];
-                int cpu = -1;
-                for (int k = (int) cs.size() - 1, found = 0; k >= 0 && cpu < 0; --k) {
-                    if (cs[k] % 2 == 1 && found++ == i) { cpu = cs[k]; }
+        // the main thread's core (the cpu and its sibling, by the core id in sysfs), kept free of touch threads
+        std::vector<int> avoid;
+#if defined(__linux__)
+        if (main_cpu >= 0 && main_cpu < n_cpu) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(main_cpu, &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            avoid.push_back(main_cpu);
+            char path[128], list[64] = { 0 };
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", main_cpu);
+            if (FILE * f = fopen(path, "r")) {
+                if (fgets(list, sizeof(list), f)) {
+                    for (char * tok = strtok(list, ",\n"); tok; tok = strtok(nullptr, ",\n")) {
+                        int a = 0, b = 0;
+                        if (sscanf(tok, "%d-%d", &a, &b) == 2) { for (int c = a; c <= b; ++c) { avoid.push_back(c); } }
+                        else if (sscanf(tok, "%d", &a) == 1) { avoid.push_back(a); }
+                    }
                 }
-                if (cpu < 0 && !cs.empty()) {
-                    cpu = cs[(cs.size() - 1 - i) % cs.size()];
-                }
-                pf.threads.emplace_back([this, g, i, cpu] { prefetch_thread(g, i, cpu); });
+                fclose(f);
             }
         }
+#endif
+        int n_threads = 0;
+        for (int g = 0; g < pf.n_grp; ++g) {
+            // the group's odd cpus (a core's second hardware thread), from the end, not the main thread's core, one a core
+            const auto & cs = pf.cpus[g];
+            int placed = 0;
+            for (int k = (int) cs.size() - 1; k >= 0 && placed < pf.per_group; --k) {
+                const int cpu = cs[k];
+                if (cpu % 2 == 0 && cs.size() > 1) {
+                    continue;
+                }
+                if (std::find(avoid.begin(), avoid.end(), cpu) != avoid.end()) {
+                    continue;
+                }
+                pf.threads.emplace_back([this, g, placed, cpu] { prefetch_thread(g, placed, cpu); });
+                placed++;
+                n_threads++;
+            }
+            if (placed < pf.per_group) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_PREFETCH: L3 group %d has room for %d touch threads, not %d\n", __func__, g, placed, pf.per_group);
+            }
+            pf.per_group = std::min(pf.per_group, std::max(1, placed));
+        }
+        GGML_UNUSED(n_threads);
         LLAMA_LOG_INFO("%s: LLAMA_MOE_PREFETCH: the next layer's %d predicted experts touched into the L3 during its attention, %d threads on %d L3 groups, "
-            "chunks of %lld rows, up to %zu MiB a layer\n", __func__, pf.n_top, (int) pf.threads.size(), pf.n_grp, (long long) pf.C, pf.budget >> 20);
+            "chunks of %lld rows, up to %zu MiB a layer; the main thread on cpu %d\n", __func__, pf.n_top, (int) pf.threads.size(), pf.n_grp,
+            (long long) pf.C, pf.budget >> 20, main_cpu);
         if (pf.n_grp == 1 && n_cpu > 8) {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_PREFETCH: one L3 group (set GGML_CPU_MMID_CCX=1 so the fused FFN computes each chunk where it was touched)\n", __func__);
         }
