@@ -1914,7 +1914,8 @@ static bool ggml_cpu_mmid_glu_match(const struct ggml_cgraph * cgraph, int node_
         w0->ne[0] != w1->ne[0] || w0->ne[1] != w1->ne[1] || w0->ne[2] != w1->ne[2] || w0->nb[1] != w1->nb[1] || w0->nb[2] != w1->nb[2] ||
         g->src[1]->type != GGML_TYPE_F32 || g->src[2]->ne[1] > 8 ||
         g->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, glu) ||
-        !ggml_is_contiguous(glu) || !ggml_is_contiguous(g)) {
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(g) || !ggml_is_contiguous(g->src[1])) {
+        // (the input must be contiguous: the fused ops index its rows by their size)
         return false;
     }
     *gate = g;
