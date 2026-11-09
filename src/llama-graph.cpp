@@ -2681,6 +2681,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * experts_c = build_experts(cur, ids_c, slots_c, selected_experts);
             cb(experts_c, "ffn_moe_down_cache", il);
 
+            // LLAMA_MOE_TIER_GPU: the device also computes some misses, reading their weights from the pinned tier
+            if (maps.gpu_ids != nullptr) {
+                ggml_tensor * ids_g   = ggml_get_rows(ctx0, maps.gpu_ids,  ids);
+                ggml_tensor * slots_g = ggml_get_rows(ctx0, maps.gpu_slot, ids);
+                cb(ids_g,   "ffn_moe_tier_ids",   il);
+                cb(slots_g, "ffn_moe_tier_slots", il);
+                ids_g   = ggml_reshape_2d(ctx0, ids_g,   selected_experts->ne[0], selected_experts->ne[1]);
+                slots_g = ggml_reshape_2d(ctx0, slots_g, selected_experts->ne[0], selected_experts->ne[1]);
+                moe_tier_branch = true;
+                ggml_tensor * experts_g = build_experts(cur, ids_g, slots_g, selected_experts);
+                moe_tier_branch = false;
+                cb(experts_g, "ffn_moe_down_tier", il);
+                experts_c = ggml_add(ctx0, experts_c, experts_g);
+            }
+
             // every op of the cache branch runs on the cache device, otherwise the scheduler may move the activations between devices
             for (ggml_tensor * t = first_c; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
                 if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {

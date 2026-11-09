@@ -506,6 +506,14 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> tier;      // one per expert tensor, P experts each
         std::vector<int32_t> tier_slot_of;   // [n_expert] its slot in the tier, -1 if not in it
         std::vector<std::vector<const void *>> tier_ptrs; // per expert tensor, [n_expert]: the expert's copy in the tier, or null
+        // LLAMA_MOE_TIER_GPU=S: the device computes the S best tier experts that aren't resident from the tier, in a branch
+        // of its own beside the cache branch (small ubatches); the CPU computes the other misses
+        ggml_tensor * gpu_miss     = nullptr; // host: as miss_map, without the device's picks
+        ggml_tensor * gpu_ids_dev  = nullptr; // device: e if the device computes it from the tier, else -1
+        ggml_tensor * gpu_slot_dev = nullptr; // device: its slot in the tier, else -1
+        int32_t * gpu_ids_host  = nullptr;    // shadows of the device maps
+        int32_t * gpu_slot_host = nullptr;
+        std::vector<int32_t> gpu_pick;        // the device's picks, in expert order
         ggml_tensor * slot_dev = nullptr;
         ggml_tensor * hit_dev  = nullptr;
         std::vector<int32_t> slot_of; // [n_expert] slot of each expert, -1 if not resident
@@ -554,6 +562,8 @@ struct llama_moe_cache::impl {
         size_t tokens = 0;
         size_t hits   = 0;
         size_t misses = 0;
+        size_t tier   = 0; // of the misses, those in the pinned tier
+        size_t gpu    = 0; // of those, the ones the device computed from it
         size_t swaps  = 0;
         size_t bytes  = 0;
         int64_t t_us  = 0;
@@ -688,6 +698,8 @@ struct llama_moe_cache::impl {
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     int32_t tier_p = 0;          // LLAMA_MOE_TIER=P: the pinned tier's experts a layer (0: none)
+    int32_t tier_gpu = 0;        // LLAMA_MOE_TIER_GPU=S: the misses a layer the device computes from the tier (0: none)
+    std::vector<int32_t> gpu_cand;
     ggml_context_ptr ctx_tier;
     ggml_backend_buffer_ptr buf_tier;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> tier_of; // host experts -> their copies in the tier
@@ -933,6 +945,14 @@ struct llama_moe_cache::impl {
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
+        // LLAMA_MOE_TIER=P: a pinned tier of the P experts a layer the predictor's prior ranks highest (hot spare mode, with a
+        // predictor); LLAMA_MOE_TIER_GPU=S: the device computes S of its experts a layer, with maps of their own
+        if (const char * env = getenv("LLAMA_MOE_TIER"); env != nullptr && mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && predictor) {
+            tier_p = std::max(0, atoi(env));
+            if (const char * env_gpu = getenv("LLAMA_MOE_TIER_GPU"); env_gpu != nullptr && tier_p > 0) {
+                tier_gpu = std::min(tier_p, std::max(0, atoi(env_gpu)));
+            }
+        }
         for (group & g : groups) {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
@@ -958,7 +978,8 @@ struct llama_moe_cache::impl {
                 if (g.n_share > 0) {
                     g.is_lent.assign(g.n_slots + g.n_share, 0);
                 }
-                n_tensors[g.id] += 2*g.layers.size();
+                n_tensors[g.id] += (tier_gpu > 0 ? 4 : 2)*g.layers.size();
+                n_tensors_host  += tier_gpu > 0 ? g.layers.size() : 0;
             } else {
                 g.slru.init(model.layers.size(), n_expert, g.n_slots);
             }
@@ -967,11 +988,6 @@ struct llama_moe_cache::impl {
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
-        }
-        // LLAMA_MOE_TIER=P: a pinned tier of the P experts a layer the predictor's prior ranks highest (hot spare mode, with a
-        // predictor); its maps are host tensors of their own
-        if (const char * env = getenv("LLAMA_MOE_TIER"); env != nullptr && mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && predictor) {
-            tier_p = std::max(0, atoi(env));
         }
 
         auto init_ctx = [](size_t n_tensors) {
@@ -1042,6 +1058,16 @@ struct llama_moe_cache::impl {
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
                     if (tier_p > 0) {
                         l.tier_slot_of.assign(g.ref[0]->ne[2], -1);
+                    }
+                    if (tier_gpu > 0) {
+                        l.gpu_miss     = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        l.gpu_ids_dev  = ggml_new_tensor_2d(ctx,            GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        l.gpu_slot_dev = ggml_new_tensor_2d(ctx,            GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        ggml_format_name(l.gpu_miss,     "moe_cache.gpu_miss_map-%d", il);
+                        ggml_format_name(l.gpu_ids_dev,  "moe_cache.gpu_ids_map-%d",  il);
+                        ggml_format_name(l.gpu_slot_dev, "moe_cache.gpu_slot_map-%d", il);
+                        buf_host_size += GGML_PAD(ggml_nbytes(l.miss_map), alignment_host);
+                        devices[g.id].buf_size += 2*GGML_PAD(ggml_nbytes(l.slot_dev), ggml_backend_buft_get_alignment(devices[g.id].buft));
                     }
                     if (g.n_jit > 0) {
                         l.jit_miss = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
@@ -1144,7 +1170,7 @@ struct llama_moe_cache::impl {
                 if (g.id != (int32_t) id || g.n_slots == 0) {
                     continue;
                 }
-                maps_size += g.layers.size()*2*GGML_PAD(g.ref[0]->ne[2]*sizeof(int32_t), 64);
+                maps_size += g.layers.size()*(tier_gpu > 0 ? 4 : 2)*GGML_PAD(g.ref[0]->ne[2]*sizeof(int32_t), 64);
                 for (const ggml_tensor * t : g.ref) {
                     expert_size_max = std::max(expert_size_max, (size_t) t->nb[2]);
                 }
@@ -1214,6 +1240,13 @@ struct llama_moe_cache::impl {
                     l.slot_host = (int32_t *) base;
                     l.hit_host  = (int32_t *) (base + n);
                     base += 2*n;
+                    if (l.gpu_miss != nullptr) {
+                        l.gpu_ids_host  = (int32_t *) base;
+                        l.gpu_slot_host = (int32_t *) (base + n);
+                        std::fill(l.gpu_ids_host,  l.gpu_ids_host  + l.slot_of.size(), -1);
+                        std::fill(l.gpu_slot_host, l.gpu_slot_host + l.slot_of.size(), -1);
+                        base += 2*n;
+                    }
                 }
             }
             d.staging = base;
@@ -1362,6 +1395,50 @@ struct llama_moe_cache::impl {
         l.slot_host[e] = s;
         l.hit_host[e]  = s < 0 ? -1 : e;
         l.slot_of[e]   = s;
+        if (l.gpu_miss != nullptr) {
+            // a resident expert is never one of the device's picks
+            if (s >= 0 && l.gpu_ids_host[e] >= 0) {
+                l.gpu_ids_host[e]  = -1;
+                l.gpu_slot_host[e] = -1;
+                l.gpu_pick.erase(std::find(l.gpu_pick.begin(), l.gpu_pick.end(), e));
+            }
+            ((int32_t *) l.gpu_miss->data)[e] = s < 0 && l.gpu_ids_host[e] < 0 ? e : -1;
+        }
+        l.dirty = true;
+    }
+
+    // LLAMA_MOE_TIER_GPU: the device's picks of layer l, its tier_gpu best tier experts that aren't resident, ranked as
+    // the refresh ranks them; the maps change only if the picks do
+    void refresh_gpu_picks(layer & l) {
+        const int32_t n_expert = (int32_t) l.slot_of.size();
+        const std::vector<float> & rank = pred_valid ? l.pred : l.score;
+        gpu_cand.clear();
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (l.slot_of[e] < 0 && l.tier_slot_of[e] >= 0) {
+                gpu_cand.push_back(e);
+            }
+        }
+        if ((int32_t) gpu_cand.size() > tier_gpu) {
+            std::nth_element(gpu_cand.begin(), gpu_cand.begin() + tier_gpu, gpu_cand.end(),
+                [&](int32_t a, int32_t b) { return rank[a] != rank[b] ? rank[a] > rank[b] : a < b; });
+            gpu_cand.resize(tier_gpu);
+        }
+        std::sort(gpu_cand.begin(), gpu_cand.end());
+        if (gpu_cand == l.gpu_pick) {
+            return;
+        }
+        int32_t * gmiss = (int32_t *) l.gpu_miss->data;
+        for (int32_t e : l.gpu_pick) {
+            l.gpu_ids_host[e]  = -1;
+            l.gpu_slot_host[e] = -1;
+            gmiss[e] = l.slot_of[e] < 0 ? e : -1;
+        }
+        for (int32_t e : gpu_cand) {
+            l.gpu_ids_host[e]  = e;
+            l.gpu_slot_host[e] = l.tier_slot_of[e];
+            gmiss[e] = -1;
+        }
+        l.gpu_pick = gpu_cand;
         l.dirty = true;
     }
 
@@ -1521,6 +1598,10 @@ struct llama_moe_cache::impl {
             device & d = devices[groups[l.ig].id];
             ggml_backend_tensor_set_async(d.backend, l.slot_dev, l.slot_host, 0, ggml_nbytes(l.slot_dev));
             ggml_backend_tensor_set_async(d.backend, l.hit_dev,  l.hit_host,  0, ggml_nbytes(l.hit_dev));
+            if (l.gpu_ids_dev != nullptr) {
+                ggml_backend_tensor_set_async(d.backend, l.gpu_ids_dev,  l.gpu_ids_host,  0, ggml_nbytes(l.gpu_ids_dev));
+                ggml_backend_tensor_set_async(d.backend, l.gpu_slot_dev, l.gpu_slot_host, 0, ggml_nbytes(l.gpu_slot_dev));
+            }
             l.dirty = false;
             d.pending = true;
         }
@@ -1582,6 +1663,10 @@ struct llama_moe_cache::impl {
                 const uint32_t c = l.rec.count[e];
                 if (c > 0) {
                     (l.slot_of[e] >= 0 ? st.hits : st.misses) += c;
+                    if (l.slot_of[e] < 0 && !l.tier_slot_of.empty() && l.tier_slot_of[e] >= 0) {
+                        st.tier += c;
+                        st.gpu  += small && l.gpu_ids_host != nullptr && l.gpu_ids_host[e] >= 0 ? c : 0;
+                    }
                     l.rec.count[e] = 0;
                 }
                 l.score[e] = l.score[e]*decay + c;
@@ -1645,6 +1730,13 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (tier_gpu > 0) {
+            for (layer & l : layers) {
+                if (l.gpu_miss != nullptr) {
+                    refresh_gpu_picks(l);
+                }
+            }
+        }
         flush_maps();
 
         st.t_us += ggml_time_us() - t_start_us;
@@ -2464,6 +2556,10 @@ struct llama_moe_cache::impl {
         maps = { l.miss_map, l.slot_dev, l.hit_dev };
         if (n_tokens > max_batch && l.jit_slot != nullptr && groups[l.ig].n_jit > 0) {
             maps = { l.jit_miss, l.jit_slot, l.jit_hit };
+        } else if (n_tokens <= max_batch && l.gpu_miss != nullptr) {
+            maps.miss     = l.gpu_miss;
+            maps.gpu_ids  = l.gpu_ids_dev;
+            maps.gpu_slot = l.gpu_slot_dev;
         }
         return true;
     }
@@ -3169,6 +3265,10 @@ struct llama_moe_cache::impl {
                 name, st.tokens, hits ? format(" hit rate = %.2f%%,", n > 0 ? 100.0*st.hits/n : 0.0).c_str() : "",
                 st.swaps, st.bytes/1024.0/1024.0, st.bytes/1024.0/1024.0/st.tokens, st.t_us/1000.0/st.tokens,
                 st.t_sync_us/1000.0/st.tokens, st.t_copy_us/1000.0/st.tokens, st.t_wait_us/1000.0/st.tokens);
+            if (st.tier > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: of the misses, %.2f%% in the pinned tier, %.2f%% computed by the device from it\n",
+                    name, 100.0*st.tier/std::max<size_t>(1, st.misses), 100.0*st.gpu/std::max<size_t>(1, st.misses));
+            }
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, %s: per token, waiting for the copies %.3f ms in a refresh that filled a staging half "
                 "and %.3f at the next update, for a half's uploads %.3f; %zu full rebalances, %.1f ms each%s\n",
                 name, st.t_wait_half_us/1000.0/st.tokens, st.t_wait_next_us/1000.0/st.tokens, st.t_dma_us/1000.0/st.tokens,

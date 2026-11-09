@@ -37,6 +37,9 @@ struct llama_moe_cache_hot_spare_maps {
     ggml_tensor * miss = nullptr; // I32 [1, n_expert] in host memory: e if expert e is not resident, else -1
     ggml_tensor * slot = nullptr; // I32 [1, n_expert] on the cache device: the slot of e if it is resident, else -1
     ggml_tensor * hit  = nullptr; // I32 [1, n_expert] on the cache device: e if it is resident, else -1
+    // LLAMA_MOE_TIER_GPU: the misses the cache device computes from the pinned tier (then miss leaves them out), else nullptr
+    ggml_tensor * gpu_ids  = nullptr; // I32 [1, n_expert] on the cache device: e if the device computes it, else -1
+    ggml_tensor * gpu_slot = nullptr; // I32 [1, n_expert] on the cache device: its slot in the tier, else -1
 };
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
