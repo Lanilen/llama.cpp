@@ -27,6 +27,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -374,6 +377,20 @@ void * ggml_aligned_malloc(size_t size) {
         default:
             result = EFAULT;
             break;
+    }
+  #elif defined(__linux__)
+    // GGML_CPU_HUGEPAGE=1: buffers of 32 MiB and more (the weights, when they are loaded instead of mapped) on 2 MiB
+    // pages where the kernel has them (transparent huge pages, "madvise" mode included): a CPU kernel walking cold
+    // weights misses the TLB once per 2 MiB instead of once per 4 KiB
+    static int hugepage = -1;
+    if (hugepage < 0) {
+        const char * env = getenv("GGML_CPU_HUGEPAGE");
+        hugepage = env != NULL && atoi(env) != 0;
+    }
+    const bool huge = hugepage && size >= ((size_t) 32 << 20);
+    int result = posix_memalign(&aligned_memory, huge ? ((size_t) 2 << 20) : (size_t) alignment, size);
+    if (result == 0 && huge) {
+        madvise(aligned_memory, size, MADV_HUGEPAGE);
     }
   #else
     int result = posix_memalign(&aligned_memory, alignment, size);
