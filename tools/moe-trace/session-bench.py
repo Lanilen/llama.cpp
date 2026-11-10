@@ -14,6 +14,7 @@ import json
 import sys
 import time
 import urllib.request
+from typing import Any
 
 DEFAULT_TURNS = [
     "Here is a source file:\n\n```\n{file}\n```\n\nExplain what this file does, section by section.",
@@ -55,7 +56,7 @@ def main():
 
     extra = json.loads(args.extra)
     messages = []
-    results = []
+    results: list[dict[str, Any]] = []
     print(f"{'turn':>4} {'prompt':>7} {'cached':>7} {'pp t/s':>8} {'gen':>5} {'tg t/s':>7} {'accept':>7} {'wall s':>7}")
     for i, turn in enumerate(turns):
         messages.append({"role": "user", "content": turn.replace("{file}", pasted)})
