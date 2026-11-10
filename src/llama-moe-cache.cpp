@@ -1544,8 +1544,9 @@ struct llama_moe_cache::impl {
     // predict badly and are skipped. LLAMA_MOE_PREFETCH_THREADS: threads a group (2); LLAMA_MOE_PREFETCH_MIB: bytes
     // touched a layer at most (12). The touch threads run on cores' second hardware threads, one a core, and never on
     // the main thread's core: its recording of the device's work is the critical path while they run, and a sibling
-    // streaming through the shared L2 slows it. The main thread is pinned to a core for that (LLAMA_MOE_PREFETCH_MAIN_CPU,
-    // default the first cpu; -1: not pinned, then the touch threads avoid no core), on its first arm, inside a graph
+    // streaming through the shared L2 slows it. The main thread can be pinned to a core for that (LLAMA_MOE_PREFETCH_MAIN_CPU,
+    // a cpu; default -1: not pinned, the touch threads avoid no core; measured a loss on the 1920X, +1 / +5 / +45 ms a
+    // batch at 1 / 3 / 8 tokens even with the core to itself), on its first arm, inside a graph
     // compute, once the CPU backend's worker threads exist: a new thread inherits its creator's mask, so a pin at init
     // put every OpenMP worker on that one cpu (12 threads spinning on cpu 0, the run never finished a batch). A worker
     // created later (a larger team, or a threadpool made a graph at a time) finds the pin on itself in the record op
@@ -1609,7 +1610,7 @@ struct llama_moe_cache::impl {
         }
         pf.debug = getenv("LLAMA_MOE_PREFETCH_DEBUG") && atoi(getenv("LLAMA_MOE_PREFETCH_DEBUG")) != 0;
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_THREADS")) { pf.per_group = std::max(1, atoi(e)); }
-        int main_cpu = 0;
+        int main_cpu = -1;
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_MAIN_CPU")) { main_cpu = atoi(e); }
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_MODE")) {
             pf.mode = strcmp(e, "read") == 0 ? 1 : strcmp(e, "graph") == 0 ? 2 : 0;
