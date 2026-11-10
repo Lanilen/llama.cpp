@@ -22,7 +22,8 @@ loads what the answer is about to need instead of what the last answer used.
 The predictor was developed and measured on one model, Qwen3.8-Flash-Next (`qwen4exp`: 48 MoE layers, 512 experts,
 10 used per token), at Q4_K_XL and Q6_K_XL, on an AMD Radeon AI PRO R9700 (32 GB) with the experts in system memory.
 The pipeline reads the model's shape from the traces and isn't tied to it, but no other model has been trained yet.
-The trained Flash-Next files aren't published.
+The trained Flash-Next files (the main predictor, the start predictor and their test vectors) are on Hugging Face:
+[Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).
 
 ## Contents
 
