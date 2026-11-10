@@ -237,6 +237,18 @@ semaphore for up to N µs before blocking. On the 1920X + R9700 with N = 2000, F
 tokens were 1.3 / 1.4 / 0.9% faster without the fused expert FFN and 1.7 / 1.1 / 2.6% faster with it, every pair of
 two in its favour: about 10 µs a layer, the wake-up of that one wait.
 
+### Graphs by batch length
+
+A ubatch of another length than the last one can't reuse the previous graph: the context rebuilds it and the scheduler
+reallocates it, 3 + 11 ms on the 1920X, and the first compute after a reallocation runs up to 12 ms slower. Speculative
+decoding verifies batches of varying length whenever the draft count varies. `LLAMA_GRAPH_CACHE=N` keeps up to N
+schedulers, each with the graph of one small batch length (up to `LLAMA_GRAPH_CACHE_TOKENS` tokens, 16) and its own
+compute buffers (about 50 MiB of device memory each on the R9700), the least recently used one replaced; the main
+scheduler takes everything else, and all of them go when the context re-reserves. On the 1920X + R9700 with Flash-Next
+Q4, verify batches alternating 1, 2, 3 and 4 tokens took 50.0 / 54.3 / 66.7 / 70.4 ms without it and 34.1 / 40.0 / 45.5 /
+52.7 with it, the same as in uniform blocks; end to end, fixed 2 drafts 38.6 → 39.4 tok/s and gated 5 drafts (p-min 0.8)
+30.8 → 37.3. The logits of 1-token batches are identical; 3-token batches differ within placement noise.
+
 ### Changes that apply without any option
 
 These change behaviour for every model and GPU, with or without the cache:
@@ -594,6 +606,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the 1920X + R9700) |
 | `GGML_VK_SPIN_WAIT=N` | Vulkan: when the host synchronizes an event, poll its semaphore for up to N µs before blocking ([Vulkan submits](#vulkan-submits)) |
+| `LLAMA_GRAPH_CACHE=N` | a scheduler and graph of its own for each of up to N small batch lengths (`LLAMA_GRAPH_CACHE_TOKENS`, 16), so a verify batch of another length than the last one reuses its graph instead of rebuilding and reallocating it ([Graphs by batch length](#graphs-by-batch-length)) |
 | `GGML_VK_ASYNC_TRANSFER_MIN=N` | Vulkan, with the cache's background uploads: asynchronous writes smaller than N bytes go through the compute queue, so they don't wait behind the uploads on the transfer queue; larger ones stay there (default 1048576) |
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
 | `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid in the mat-vec's store |
