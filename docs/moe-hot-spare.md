@@ -211,7 +211,6 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
-| `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops |
 | `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
 | `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan (upstream): no fused adds |
 | `GGML_VK_DISABLE_FUSION=1` | Vulkan (upstream): no fused operations at all, to measure what fusion is worth on a GPU |
