@@ -346,19 +346,26 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
 // and a backend may refuse large ones (Vulkan without 64-bit indexing: maxStorageBufferRange, 4 GiB on RADV)
 static int64_t llama_moe_cache_max_bank_experts(ggml_backend_dev_t dev, const std::vector<ggml_tensor *> & ref, int64_t limit) {
     ggml_init_params params = {
-        /*.mem_size   =*/ ref.size()*ggml_tensor_overhead(),
+        /*.mem_size   =*/ 4*ref.size()*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     ggml_context_ptr ctx(ggml_init(params));
+    // the banks are read by MUL_MAT_ID: that op is probed, with a bank of n experts as its weights (the backends do not
+    // size check a tensor that is not computed)
+    std::vector<ggml_tensor *> banks;
     std::vector<ggml_tensor *> probes;
     for (const ggml_tensor * t : ref) {
-        probes.push_back(ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], 1));
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], 1);
+        ggml_tensor * b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, t->ne[0], 1, 1);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+        banks.push_back(as);
+        probes.push_back(ggml_mul_mat_id(ctx.get(), as, b, ids));
     }
     auto fits = [&](int64_t n) {
-        for (ggml_tensor * x : probes) {
-            x->ne[2] = n;
-            if (!ggml_backend_dev_supports_op(dev, x)) {
+        for (size_t i = 0; i < probes.size(); ++i) {
+            banks[i]->ne[2] = n;
+            if (!ggml_backend_dev_supports_op(dev, probes[i])) {
                 return false;
             }
         }
