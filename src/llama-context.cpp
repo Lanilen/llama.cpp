@@ -1798,6 +1798,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf = model.build_graph(gparams);
 
+        dt.lap(decode_timing::BUILD);
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
@@ -2156,8 +2157,8 @@ void llama_context::decode_timing::print(bool with_moe_cache) const {
         for (int i = 0; i < N_STEPS; ++i) {
             total += ms((step) i);
         }
-        LLAMA_LOG_INFO("%s: decode timing, %s, %d%s tokens: %" PRId64 " batches, %" PRId64 " graphs built; ms setup %.2f graph %.2f inputs %.2f before %.2f compute %.2f hidden %.2f update %.2f extract %.2f total %.2f\n",
-                __func__, with_moe_cache ? "MoE cache" : "no MoE cache", k + 1, k + 1 == N_KINDS ? "+" : "", n[k], n_built[k], ms(SETUP), ms(GRAPH), ms(INPUTS), ms(BEFORE), ms(COMPUTE), ms(HIDDEN), ms(UPDATE), ms(EXTRACT), total);
+        LLAMA_LOG_INFO("%s: decode timing, %s, %d%s tokens: %" PRId64 " batches, %" PRId64 " graphs built; ms setup %.2f build %.2f alloc %.2f inputs %.2f before %.2f compute %.2f hidden %.2f update %.2f extract %.2f total %.2f\n",
+                __func__, with_moe_cache ? "MoE cache" : "no MoE cache", k + 1, k + 1 == N_KINDS ? "+" : "", n[k], n_built[k], ms(SETUP), ms(BUILD), ms(GRAPH), ms(INPUTS), ms(BEFORE), ms(COMPUTE), ms(HIDDEN), ms(UPDATE), ms(EXTRACT), total);
     }
 }
 
