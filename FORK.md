@@ -483,6 +483,20 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   84.6 (16 / 26 / 38%). The R9700 reads host memory at about 10 GB/s against the CPU's 45–50, so its share outlasts
   the CPU time it saves, and its reads take memory bandwidth from the CPU (q4_K 48 -> 41–45 GB/s). Archived as the tag
   `archive/pinned-tier`; a faster bus or more GPUs each taking a small share could change it.
+- **Prefetching the CPU's experts into its caches during the attention** (early routing). Flash-Next's router for a
+  layer, applied to the residual two blocks earlier, names 79–81% of the layer's cache misses in its top 12 (one block
+  earlier 87–90%, but that leaves no time to act). Built in full: the prediction computed in the layer's cache branch
+  on the GPU, its ids read back with an event, and eight touch threads on the cores' second hardware threads reading
+  the predicted non-resident experts' chunks into the L3 of the CCX that would compute them (the fused op dealt its
+  chunks to the L3 groups for that), cancelled when the next layer's CPU work starts. The prediction and the touch
+  worked as designed (10 MiB a layer in about 220 µs, inside the attention; identical logits), but verify passes got
+  slower: 36.0 / 50.0 / 93.5 ms -> 45.9 / 67.0 / 112.4 at 1 / 3 / 8 tokens. The prediction's ops cost about 2 ms a
+  pass, the read-back 2–3, the touch's memory traffic beside the recording thread and the cache's copies 4–6, and the
+  fused op itself ran 12–20% slower on the touched chunks: in a bench with the workers pinned and every chunk hot it
+  had run 13–30% faster, but floating workers and the touch bursts lose that. The op is only 7–15 ms of those passes,
+  so no cache gain could have paid. Pinning the recording thread to a core lost more (+1 / +5 / +45 ms). Archived as
+  the tag `archive/early-routing`, with the per-L3-group chunk queues (`GGML_CPU_MMID_CCX`, free on their own but
+  useless without the prefetch) and `llama-moe-early-route`, which measures the prediction.
 
 ## Still to measure
 
