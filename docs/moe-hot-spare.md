@@ -208,6 +208,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | --- | --- |
 | `GGML_SCHED_OVERLAP=0` | the cache branch is not a split of its own, so it no longer runs while the CPU computes the misses |
 | `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU that the prefetch does not cover are synchronous reads |
+| `LLAMA_MTP_DEV_ROWS=0` | the MTP draft keeps the target's h rows on the host instead of upstream's device buffer (640 MiB at `-b 16384`), see [Speculative decoding with MTP](#speculative-decoding-with-mtp) |
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
@@ -376,6 +377,13 @@ that borrows the main model's embedding and output head). The draft context has 
 - Size the cache per GPU around the draft, with the headroom above for the compute buffer that is reserved again.
 - One drafted token (`--spec-draft-n-max 1`) was best on the test machine: each extra drafted token makes the CPU compute
   the experts of one more token per pass.
+- Upstream's draft-mtp keeps the target's h rows in a device buffer (a row per batch token, 640 MiB at `-b 16384`)
+  and the catch-up reads them in place; each pass it uploads the pending row and reads one back. This fork queues
+  those two transfers on the backend's compute queue (`llama_context::set_h_nextn_rows`, `get_h_nextn_rows`): as
+  synchronous transfers they went through Vulkan's transfer queue, behind the hot spare's background uploads, and on
+  the 1920X + R9700 the head took 11.7 ms a pass instead of 5.7 (Q4, 2 drafts; Q6 14.5 instead of 5.8).
+  `LLAMA_MTP_DEV_ROWS=0` keeps the rows on the host as before (head 5.3 ms). The buffer counts against the cache's
+  headroom ([Prompts](#prompts---moe-cache-resize)).
 
 ## Fusion
 
