@@ -725,6 +725,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    int64_t flops_per_submit_override; // GGML_VK_FLOPS_PER_SUBMIT, -1 = the rules in ggml_backend_vk_graph_compute
 
     bool shader_64b_indexing;
 
