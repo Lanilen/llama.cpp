@@ -1940,7 +1940,11 @@ bool llama_context::get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out) 
     } else {
         synchronize();
     }
-    ggml_backend_tensor_get(h_nextn_dev, out, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
+    // queued on the backend and waited for at once: a synchronous read goes through the device's transfer queue
+    // (Vulkan), behind the MoE cache's background expert uploads queued there, and waits for them (the MTP draft head
+    // took 12 instead of 5 ms a pass on a 1920X + R9700); a queued read stays on the compute queue
+    ggml_backend_tensor_get_async(h_nextn_backend, h_nextn_dev, out, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
+    ggml_backend_synchronize(h_nextn_backend);
     return true;
 }
 
@@ -1952,7 +1956,9 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
     if (ev_h_nextn_read_recorded) {
         ggml_backend_event_synchronize(ev_h_nextn_read.get());
     }
-    ggml_backend_tensor_set(h_nextn_dev, data, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
+    // queued and waited for at once, like the read above: the write must be complete before the draft's graph reads it
+    ggml_backend_tensor_set_async(h_nextn_backend, h_nextn_dev, data, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
+    ggml_backend_synchronize(h_nextn_backend);
     return true;
 }
 
