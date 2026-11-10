@@ -576,13 +576,27 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   (the pending row up, one row back) queued on the backend's compute queue (`53ecc74ab`): as synchronous transfers they
   went through Vulkan's transfer queue behind the hot spare's background uploads, and the draft head took 11.7 ms a pass
   instead of 5.7 (Q4, 2 drafts; Q6 14.5 instead of 5.8), a pass 70.4 ms instead of 64.2 end to end (Q6 86.8 instead of
-  77.4; polaris 63.0 / 78.5 the same evening). `LLAMA_MTP_DEV_ROWS=0` keeps the host rows (head 5.3 ms). Open: the
-  buffer counts against the cache's headroom, and the measuring reserve of the merge's 4096-token graph takes 2178 MiB
-  against 1947 (the graph's tensors are the same: 3898 nodes and 226.7 GB of tensor bytes in both builds' dumps at a
-  65536 context, `ggml-alloc.c` is unchanged, and on the 14600KF + RTX 4070 Ti both builds measure the same 3334 MiB for
-  Qwen3-Coder-30B's 4096-token graph, with and without the jit: it is Flash-Next's graph at that context, placed differently), so the resize fit of the 1920X + R9700 is 2048 tokens instead of
-  4096, with 57 MiB to spare before, and prompts of 2049-4096 tokens release the cache (q2k 31.9 against 32.4 tok/s).
-  A slightly smaller cache (`--moe-cache-mib`, the tuner's `mib` stage) buys the 4096 fit back. The benchmark harness's
+  77.4; polaris 63.0 / 78.5 the same evening). `LLAMA_MTP_DEV_ROWS=0` keeps the host rows (head 5.3 ms). The buffer
+  counts against the cache's headroom, and it is one of two reasons the resize fit of the 1920X + R9700 fell from 4096
+  to 2048 tokens (`-cmoed`, the harness; with the preset's draft experts on the GPU, from 1024 to 256 by the buffer
+  alone). The other: the measuring reserve of the merge's 4096-token graph takes 2178 MiB against 1947 (8192: 4595
+  against 3875; 2048 the same), with the same tensors and lifetimes. The fit measures a compute buffer as the sum of
+  the allocator's chunks, which the Vulkan backend hands out at `GGML_VK_SUBALLOCATION_BLOCK_SIZE` (1 GiB), and a
+  graph with 400-512 MiB tensors leaves the tail of each chunk unused by an amount that depends on the best fit's
+  earlier placements. Upstream's conv-state store for the recurrent layers (one `set_rows` through a strided view
+  instead of the fork's four contiguous copies; the only structural change in the fit's graph besides the device rows'
+  `set_rows`) moved them: in the allocation dumps (14600KF + RTX 4070 Ti, no draft, 1907 against 1851 MiB) the second
+  layer's 400 MiB expert output and the first sparse layer's 512 MiB mask land in the second chunk. With one 4 GiB
+  chunk (`GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296`, the R9700's allocation limit) both builds measure 1892 / 1860
+  MiB at 4096 and 3590 / 3654 at 8192, and the fit is 4096 again only together with `LLAMA_MTP_DEV_ROWS=0`: draft 1589
+  + main 1892 + 256 MiB of headroom = 3737 of 3812 MiB free (polaris: 1605 + 1947 + 256 = 3808 of 3815). Kept as
+  settings, both are switches that exist already; upstream's store and device rows stay. End to end (q4-d2, one pass
+  each, the same harness): with both settings the merge generates 40.02 tok/s over the usual answers and 35.94 on the
+  agent turns, a pass 63.7 ms (process 46.3, head 5.6), against 39.30 / 34.34 / 64.2 with neither and polaris's 39.47
+  / 34.98 / 63.0; the chunk setting alone 39.17 / 34.01 / 64.6. The cache was released 4 times in every run
+  (`LLAMA_MOE_RESIZE_SPLIT=3072` keeps it for the 2.2k-token prompts either way, in one ubatch instead of two with the
+  4096 fit: 227 / 264 against 221 / 251 tok/s).
+  A slightly smaller cache (`--moe-cache-mib`, the tuner's `mib` stage) is the other way to buy a fit back. The benchmark harness's
   per-request generation rate on short turns right after a long prompt reads 4-15% lower on the merge while the pass laps
   are within polaris's run-to-run spread and the wall time is equal or better (prompts 5-11% faster): the draft's catch-up
   of the prompt is accounted to generation instead of the prompt, an accounting difference, not a cost.
