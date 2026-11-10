@@ -108,6 +108,23 @@ size in what is left (its buffers for a batch can be larger than the main contex
 spilled into system memory and generation fell from 26 to 8.5 tok/s), and if it fits only a smaller one, the main context
 follows it.
 
+The measured size is the sum of the compute buffer's chunks: the Vulkan backend hands out buffers of at most its suballocation
+block size (`GGML_VK_SUBALLOCATION_BLOCK_SIZE`, 1 GiB by default), so a graph with 400-512 MiB tensors (Qwen3.8-Flash-Next's
+expert outputs and sparse-attention masks at 4096 tokens) leaves the tail of each chunk unused, and how much depends on where the
+allocator's best fit put the tensors before them. The merge of upstream 2026-11-10 changed the recurrent layers' conv-state store
+(one `set_rows` through a strided view instead of four contiguous copies) and with it those placements: on the 1920X + R9700 the
+4096-token graph measured 2178 MiB instead of 1947 (8192: 4595 instead of 3875; 2048: the same 947), the fit fell from 4096 to 2048
+tokens, and on the 14600KF + RTX 4070 Ti without the draft 1907 instead of 1851 (the second layer's 400 MiB expert output and the
+first sparse layer's 512 MiB mask moved into the second chunk). The tensors and their lifetimes are the same. With
+`GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296` (one chunk, up to the R9700's 4 GiB allocation limit) the two builds measure 1892 and
+1860 MiB at 4096 tokens, 3590 and 3654 at 8192. The MTP draft's device rows (640 MiB at `-b 16384`) count against the same headroom,
+and the draft's own reserve is checked together with the main context's (draft + main + 256 MiB <= free): with the draft's experts
+on the CPU (`-cmoed`) polaris fit 4096 with 1605 + 1947 + 256 = 3808 of 3815 MiB free; the merge needs both settings,
+`GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296` and `LLAMA_MTP_DEV_ROWS=0` (1589 + 1892 + 256 = 3737 of 3812 free; with the chunks alone
+3172 free, fit 2048). With the draft's experts on the GPU, as Local Coder's preset has them, the device rows alone take the fit from
+1024 to 256 tokens (490 MiB free at the fit instead of 1132), and `LLAMA_MTP_DEV_ROWS=0` gives 1024 again. A smaller cache
+(`--moe-cache-mib`, the tuner's `mib` stage) is the other way to buy a fit back.
+
 Backends also keep memory of their own between graphs, sized by the largest graph so far and outside the scheduler's buffers:
 the Vulkan backend's scratch and staging buffers. Deep in a long context a large batch grows them a lot (the sparse attention
 top-k of Qwen3.8-Flash-Next takes about 2 bytes per KV cell per token: 950 MiB at 59k cells and `-ub 8192` on the 1920X + R9700), and
@@ -209,6 +226,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `GGML_SCHED_OVERLAP=0` | the cache branch is not a split of its own, so it no longer runs while the CPU computes the misses |
 | `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU that the prefetch does not cover are synchronous reads |
 | `LLAMA_MTP_DEV_ROWS=0` | the MTP draft keeps the target's h rows on the host instead of upstream's device buffer (640 MiB at `-b 16384`), see [Speculative decoding with MTP](#speculative-decoding-with-mtp) |
+| `GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296` | Vulkan (upstream): one allocator chunk per compute buffer instead of 1 GiB chunks, so the resize fit does not pay for the unused tail of each chunk (see [Prompts](#prompts---moe-cache-resize)) |
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
@@ -383,7 +401,8 @@ that borrows the main model's embedding and output head). The draft context has 
   synchronous transfers they went through Vulkan's transfer queue, behind the hot spare's background uploads, and on
   the 1920X + R9700 the head took 11.7 ms a pass instead of 5.7 (Q4, 2 drafts; Q6 14.5 instead of 5.8).
   `LLAMA_MTP_DEV_ROWS=0` keeps the rows on the host as before (head 5.3 ms). The buffer counts against the cache's
-  headroom ([Prompts](#prompts---moe-cache-resize)).
+  headroom: on the 1920X + R9700 with the draft's experts on the GPU it took the resize fit from 1024 to 256 tokens, with them
+  on the CPU it is one of the two reasons the fit fell from 4096 to 2048 ([Prompts](#prompts---moe-cache-resize)).
 
 ## Fusion
 
