@@ -49,7 +49,7 @@ generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's t
 |---|---|---|
 | `polaris` | everything, the one to use | this file |
 | [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan support for the sparse-attention ops on GPUs without fp16 | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
-| [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | the hot spare cache, `--moe-cache-resize` and `--moe-cache-batch`, the scheduler and Vulkan changes for models with experts on the CPU (overlapping splits, asynchronous reads, fused adds, the submit size), trace tools | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
+| [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | the hot spare cache, `--moe-cache-resize` and `--moe-cache-batch`, the scheduler and Vulkan changes for models with experts on the CPU (a split of its own for the cache branch, fused adds, a read staging ring), trace tools | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
 | [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus the expert predictor and its training pipeline, `--moe-cache-jit`, the cache fit shared with a draft context, the work beside the MoE, the tuning script with the cache's and the drafts' stages | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`moe-tuning`](https://github.com/Lanilen/llama.cpp/tree/moe-tuning) | `moe-predictor` plus the CPU's expert chunks and op counters, the mat-vec store fusion, the split of large prompts, the shared jit slots and the fast expert copies, and the tuning script's CPU and Vulkan stages | [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts), [tools/moe-trace](tools/moe-trace/README.md#tuning-a-machine) |
 | [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4, **work in progress, stable** | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
@@ -161,10 +161,12 @@ the uploads, and the slots lent, at one per N tokens of the ubatch (at least 64)
 
 A model split between GPUs and the CPU runs as many small graphs (splits), with copies between them. These changes
 apply to any such model, with or without the cache:
-- **Overlapping splits:** the GPU part of a layer runs while the CPU computes its experts.
-- **Asynchronous reads:** the copies of a split's inputs to the CPU are queued and waited for once per GPU, instead of a
-  submission and a fence each (about 140 µs each on the RX 480's driver, 49 times a token). On Vulkan, a read into
-  memory that isn't pinned goes through a staging ring.
+- **A split of its own for the cache branch** (`ggml_backend_sched_set_tensor_overlap`): with it, upstream's input
+  prefetch (2026-11) reads the CPU split's inputs before the cache branch runs, so the CPU computes its experts while
+  the GPU computes the resident ones. The fork's own copy-ahead and its asynchronous reads (one wait per GPU instead of
+  a submission and a fence each, about 140 µs on the RX 480's driver, 49 times a token) did the same before upstream's
+  prefetch and went at the merge of 2026-11-10 ([Upstream since 2026-10-29](#upstream-since-2026-10-29)).
+- **A Vulkan staging ring** for asynchronous reads into memory that isn't pinned for the GPU; the prefetch's reads use it.
 - **MUL_MAT_ID skips unused slots** (id -1), which both cache branches rely on.
 - **Fused f32 adds without fp16 rounding modes**, so GPUs such as the RX 480 get them.
 - **A fused MUL_MAT → SCALE → SiLU/sigmoid** in the mat-vec's store: Flash-Next's hyper-connection products, 97 a pass.
@@ -177,7 +179,8 @@ apply to any such model, with or without the cache:
   own, about 50 MiB of device memory each, and the main scheduler takes everything else.
 
 **Measured:**
-- Overlap and asynchronous reads, RTX 4070 Ti with the experts on the CPU and no cache: 26.6 → 29.2 tok/s.
+- Overlap and asynchronous reads (2026-10, before upstream's prefetch), RTX 4070 Ti with the experts on the CPU and no
+  cache: 26.6 → 29.2 tok/s.
 - Fused adds on the RX 480s: 14.44 → 14.57 tok/s.
 - The mat-vec store fusion: the same logits, and within noise at the settings below. With the GPU's work exposed (one
   submit per split), it's worth 1.5–2.7%.
@@ -518,11 +521,71 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   gain there is work distribution, which the fused op already has. Its design pays off on cores with AVX-512 `dpbusd`;
   on Zen 1 the extra unpacking, shuffles and float work cost more than the multiplies it saves.
 
+## Upstream since 2026-10-29
+
+The fork follows upstream by merges, never rebases. On 2026-11-10 every branch moved from upstream `36a0e2ffc`
+(2026-10-29) to `3b4d6ab3f` (2026-11-10), 239 upstream commits. The rule for each conflict: where upstream has its own
+version of something the fork built and it performs about as well in general, upstream's version stays and ours goes;
+ours stays only where it measured better on the real workload, and the measurement is written here. Everything was
+measured on the 1920X + R9700 with Flash-Next UD-Q4_K_XL and UD-Q6_K_XL, today's polaris against the merge in one
+session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens of context (medians, two passes).
+
+**What upstream now has that the fork built too, and what happened to ours**
+- **Part of the cache misses on the CPU** (`--moe-cache-cpu-share F`, upstream `e95426f16`): upstream's MoE cache
+  computes a share of its misses from the host experts while the device computes the hits, with a scheduler prefetch
+  that reads the CPU part's inputs before the device part runs. The hot spare's idea in a smaller form: a share of the
+  misses, no learned ranking, no jit slots, no resize. It lives on in the fork as the cache's `lru` mode, which is
+  upstream's cache unchanged (its ClassLRU eviction, the CPU share, `LLAMA_MOE_CACHE_TRACE`, `scripts/moe-cache-tune.py`
+  and [docs/moe-cache.md](docs/moe-cache.md)); the hot spare is the `hot-spare` mode. Measured against each other at the
+  same memory below.
+- **ClassLRU** (`c4fb57969`): eviction by a decayed use count in eight classes, LRU within a class. It replaced the SLRU
+  of the `lru` mode. The hot spare ranks its residents with the predictor's decayed counts instead.
+- **An input prefetch in the scheduler** (`ggml_backend_sched_prefetch_inputs`): before a split runs, the inputs of the
+  next split that its backend already holds are read asynchronously, and the next split waits for that read only. The
+  same idea as the fork's copy-ahead for the cache branch and its asynchronous reads. **Dropped: the fork's copy-ahead
+  and asynchronous reads.** Kept: the split boundary that puts the cache branch in a split of its own
+  (`ggml_backend_sched_set_tensor_overlap`), which the prefetch needs and cannot force, and `GGML_SCHED_TIMING`.
+  Measured, Q4: upstream's prefetch with the boundary alone 36.7 / 53.2 / 93.0 and 36.9 / 53.2 / 92.9 ms, the fork's
+  copy-ahead and asynchronous reads 36.5 / 52.7 / 92.9 and 36.7 / 53.3 / 92.2; Q6: 46.7 / 73.1 / 125.6 and 46.8 / 72.5 /
+  124.3 against 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0. The 48 overlap boundaries a graph are unchanged.
+- **A floor for the Vulkan submit size** (`dcbb09167`): graphs under 1 GFLOP are submitted once, larger ones every 1/40 of
+  the previous graph's flops within [100 MFLOP, cap]. **Dropped: `GGML_VK_FLOPS_PER_SUBMIT` and the fork's one-submit rule
+  for graphs within the node limit.** Measured against the fork's 100M setting: Q4 36.8 / 52.6 / 93.1 and 37.1 / 53.2 /
+  93.5 against 36.9 / 53.7 / 92.1 and 36.7 / 52.9 / 96.0; Q6 46.7 / 72.4 / 125.1 and 46.7 / 72.6 / 128.6 against 46.9 /
+  72.2 / 125.4 and 47.0 / 72.9 / 126.0. Today's polaris without the setting (its 1/40 rule) was 38.1 / 54.0 / 95.2 and
+  37.7 / 53.8 / 94.9, so upstream's new floor is what the setting gave. The tuning script's `submits` stage is skipped on
+  such builds.
+- **split_k for small batches on RDNA3 and RDNA4** (`07ec7c8af`, `da3416d80`): k >= 2048 and n <= 32 aim for eight
+  workgroups a CU. **Dropped: `GGML_VK_SPLIT_K_SMALL_N`**, the fork's version for any GPU and any n below a tile; on the
+  R9700 it had measured 273 / 339 / 427 → 168 / 218 / 275 ms for batches of 9 / 16 / 24 tokens, and upstream's covers the
+  same case there. The RX 480s (GCN) are not covered; see [Still to measure](#still-to-measure).
+- **`hv_tensor_requires_copy`** (`806b3c2be`): inputs of nodes that are not computed are not copied. Taken.
+- **Not size checking tensors that are not computed** (in Vulkan's `supports_op`): it broke the hot spare's probe of the
+  largest bank a device takes, which used a bare tensor; the probe is a `MUL_MAT_ID` op now. Found by the first run on the
+  R9700 (a 5.77 GB bank refused), not by the 12 GB card.
+- **The YaRN truncation flag, `ggml_flash_attn_ext_rows`, the models refactor, the MTP device buffers:** taken as they
+  are; the fork's model and context changes were re-applied on top (six hunks in `qwen4exp.cpp` and `models.h`).
+
+**Two tuners, two cache guides.** Upstream's `scripts/moe-cache-tune.py` picks `--moe-cache-mib` and
+`--moe-cache-cpu-share` for its cache (two sizes by three shares, a replay of the routing); the fork's
+`tools/moe-trace/moe-hot-spare-tune.py` (renamed from `moe-cache-tune.py`) searches the hot spare's settings in stages
+with real runs. Upstream's cache is documented in [docs/moe-cache.md](docs/moe-cache.md), the hot spare in
+[docs/moe-hot-spare.md](docs/moe-hot-spare.md).
+
+**The merge against today's polaris.** Verify batches, Q4: 36.9 / 53.7 / 92.1 and 36.7 / 52.9 / 96.0 ms against 37.7 /
+53.6 / 94.2 and 37.5 / 53.6 / 94.4; Q6: 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0 against 48.1 / 73.7 / 128.1 and
+47.6 / 73.4 / 126.6. Logits of the same answer read again in batches of 1 and 3, against a base saved by polaris: round
+1 identical on both quants (Q4 39 flips, KL 0.0414; Q6 41, 0.0433), round 3 within the placement noise (Q4 54 flips,
+KL 0.080 against polaris's own 56, 0.069; Q6 52, 0.079 against 47, 0.080).
+
+**Upstream's cache against the hot spare at the same memory:** CACHE_RESULT_PENDING
+
 ## Still to measure
 
 - **The RX 480s with the current code:** their numbers above used UD-IQ4_XS and predate the predictor. They'll be run
   again with it (after checking that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are
-  back in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N).
+  back in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N), and whether upstream's
+  small-n split_k should also cover GCN (the fork's version did; see [Upstream since 2026-10-29](#upstream-since-2026-10-29)).
 - **One cumulative benchmark:** the numbers above come from different request sets over a month. They'll be redone as
   one ladder, each step added to the last, on the same requests.
 - **The tuning script's second round in full:** in both searches it ran out of time before the answer cap, drafts and
