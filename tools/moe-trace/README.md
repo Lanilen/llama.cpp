@@ -12,7 +12,7 @@ The hot spare cache itself, its options and how to size it: [docs/moe-hot-spare.
 | `hot_spare_sim.py` | [replays a trace through the hot spare's refresh](#hot-spare-refresh-settings) to sweep its settings |
 | `session-bench.py` | [runs a multi-turn chat](#sessions) against a running `llama-server` |
 | `llama-moe-logit-drift` | [compares logits against batch size](#logits-against-batch-size), and times prompts and verify batches |
-| `moe-cache-tune.py` | [searches the hot spare settings](#tuning-a-machine) for a machine and model |
+| `moe-hot-spare-tune.py` | [searches the hot spare settings](#tuning-a-machine) for a machine and model |
 | `llama-upload-bench`, `llama-mv-merge-bench`, `llama-moe-predictor-check` | [smaller tools](#smaller-tools) |
 
 ## Trace
@@ -148,7 +148,7 @@ k = 2560 and 10240, m = 4-10240), for what one product over concatenated weights
 
 ## Tuning a machine
 
-`moe-cache-tune.py` finds the best hot spare settings for your machine and model, the CPU's and Vulkan's included, and
+`moe-hot-spare-tune.py` finds the best hot spare settings for your machine and model, the CPU's and Vulkan's included, and
 writes a file you can share. The best settings depend on the hardware: what it picked for Flash-Next UD-Q4_K_XL and
 UD-Q6_K_XL on an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, stage by stage, is in
 [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine). A newer CPU or a faster link can
@@ -158,7 +158,7 @@ It needs Python 3.8+ and nothing else, so you can copy the one file to another m
 Elsewhere the hardware details will be sparser, and the rest is untested.
 
 ```bash
-python3 moe-cache-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \
+python3 moe-hot-spare-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \
     --predictor pred.gguf --draft-model mtp.gguf --hours 4 \
     -- -c 65536 -ngl 99 --cpu-moe -t 12 -ub 8192 -b 8192 --moe-cache-resize
 ```

@@ -403,6 +403,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        float  moe_cache_cpu_share; // lru mode: share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
         const size_t * moe_cache_sizes; // bytes of the cache on each device of the model, in its device order, instead of the split of moe_cache_size [EXPERIMENTAL]
         size_t n_moe_cache_sizes;
         enum llama_moe_cache_mode moe_cache_mode; // [EXPERIMENTAL]
