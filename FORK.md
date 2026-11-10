@@ -328,7 +328,7 @@ something, against the stage before:
 |---|---|---|---|---|
 | `omp-spin` | `GOMP_SPINCOUNT` | how long the CPU's threads spin before they sleep | 30000000, +1.35 tok/s | 30000000, +0.78 (in the second round) |
 | `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | 128, +0.41 | 128, +0.86 |
-| `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit (upstream's rule since 2026-11-10, the stage is skipped) | 100M, +1.02 | 100M, +0.73 |
+| `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit (unset: upstream's rule since 2026-11-10) | 100M, +1.02 | 100M, +0.73 |
 | `predictor` | `--moe-cache-predictor`, `--moe-cache-predictor-start` | the predictor, or the decayed scores | the predictor, no text start, +1.61 | the same, +1.48 |
 | `refill` | `--moe-cache-refill` | a full rebalance after the first tokens | 0 | 0 |
 | `answer-cap` | `--moe-cache-predictor-answer-cap` | how many swaps an answer's start makes | 500, +1.20 (250 tied) | 125, +1.13 (250 tied) |
@@ -552,14 +552,14 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   the fork's copy-ahead and asynchronous reads 36.5 / 52.7 / 92.9 and 36.7 / 53.3 / 92.2; Q6: 46.7 / 73.1 / 125.6 and
   46.8 / 72.5 / 124.3 against 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0. The 48 overlap boundaries a graph are unchanged.
 - **A floor for the Vulkan submit size** (`dcbb09167`): graphs under 1 GFLOP are submitted once, larger ones every 1/40 of
-  the previous graph's flops within [100 MFLOP, cap]. **Dropped: `GGML_VK_FLOPS_PER_SUBMIT`.** Measured against the
-  fork's 100M setting: Q4 36.8 / 52.6 / 93.1 and 37.1 / 53.2 / 93.5 against 36.9 / 53.7 / 92.1 and 36.7 / 52.9 / 96.0;
-  Q6 46.7 / 72.4 / 125.1 and 46.7 / 72.6 / 128.6 against 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0. Today's polaris
-  without the setting (its 1/40 rule) was 38.1 / 54.0 / 95.2 and 37.7 / 53.8 / 94.9, so upstream's new floor is what the
-  setting gave. **Kept: the fork's one-submit rule for graphs within the node limit** (`GGML_VK_MAX_NODES_PER_SUBMIT`,
-  100): a layer's GPU graph at 3 tokens is around 1 GFLOP, so upstream's rule cuts it into 100 MFLOP submits where the
-  rule submits it once; without it 37.0 / 55.4 / 95.1 and 36.8 / 55.4 / 98.3, with it 36.8 / 52.9 / 93.0 and 37.3 / 53.1 /
-  93.9. The tuning script's `submits` stage is skipped on such builds.
+  the previous graph's flops within [100 MFLOP, cap]. Taken as the default. **Kept: `GGML_VK_FLOPS_PER_SUBMIT`**, the
+  fixed size for every graph, and the fork's one-submit rule for graphs within the node limit (`GGML_VK_MAX_NODES_PER_SUBMIT`,
+  100). The first arms made upstream's rule tie with the fork's 100M setting (Q4 36.8 / 52.6 / 93.1 and 37.1 / 53.2 /
+  93.5 against 36.9 / 53.7 / 92.1 and 36.7 / 52.9 / 96.0), but they had the setting after all: the scripts unset it before
+  the machine's environment set it again. Without it, the merge's verify batches were 36.7 / 55.5 / 97.2 and 36.9 / 56.3 /
+  98.0 against polaris's 37.5 / 53.1 / 93.6 and 37.9 / 53.8 / 94.3 with it (Q6 47.7 / 75.3 / 131.2 against 48.0 / 75.1 /
+  126.5): a layer graph of ~1 GFLOP at 3 tokens recorded as one submit keeps the GPU idle while it is recorded; in the
+  server the CPU side of a layer waited for the GPU 14 ms a verify graph instead of 7 (`GGML_SCHED_TIMING`), 2.4 ms a pass.
 - **split_k for small batches on RDNA3 and RDNA4** (`07ec7c8af`, `da3416d80`): k >= 2048 and n <= 32 aim for eight
   workgroups a CU. **Dropped: `GGML_VK_SPLIT_K_SMALL_N`**, the fork's version for any GPU and any n below a tile; on the
   R9700 it had measured 273 / 339 / 427 → 168 / 218 / 275 ms for batches of 9 / 16 / 24 tokens, and upstream's covers the
@@ -568,8 +568,16 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
 - **Not size checking tensors that are not computed** (in Vulkan's `supports_op`): it broke the hot spare's probe of the
   largest bank a device takes, which used a bare tensor; the probe is a `MUL_MAT_ID` op now. Found by the first run on the
   R9700 (a 5.77 GB bank refused), not by the 12 GB card.
-- **The YaRN truncation flag, `ggml_flash_attn_ext_rows`, the models refactor, the MTP device buffers:** taken as they
-  are; the fork's model and context changes were re-applied on top (six hunks in `qwen4exp.cpp` and `models.h`).
+- **The MTP target rows on the device** (`a8fad21e9`): the draft reads the target's h rows in place from a device buffer
+  (a row per batch token, 640 MiB at `-b 16384`) instead of host copies. Taken, with the two row transfers a pass
+  (the pending row up, one row back) queued on the backend's compute queue (`53ecc74ab`): as synchronous transfers they
+  went through Vulkan's transfer queue behind the hot spare's background uploads, and the draft head took 11.7 ms a pass
+  instead of 5.7 (Q4, 2 drafts; Q6 14.5 instead of 5.8), a pass 70.4 ms instead of 64.2 end to end (Q6 86.8 instead of
+  77.4; polaris 63.0 / 78.5 the same evening). `LLAMA_MTP_DEV_ROWS=0` keeps the host rows (head 5.3 ms). Open: the
+  buffer counts against the cache's headroom, and the merge's 4096-token graph takes 2178 MiB against 1947, so the resize
+  fit of the 1920X + R9700 is 2048 tokens instead of 4096 and prompts of 2049-4096 tokens release the cache.
+- **The YaRN truncation flag, `ggml_flash_attn_ext_rows`, the models refactor:** taken as they are; the fork's model and
+  context changes were re-applied on top (six hunks in `qwen4exp.cpp` and `models.h`).
 
 **Two tuners, two cache guides.** Upstream's `scripts/moe-cache-tune.py` picks `--moe-cache-mib` and
 `--moe-cache-cpu-share` for its cache (two sizes by three shares, a replay of the routing); the fork's
