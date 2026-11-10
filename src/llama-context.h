@@ -352,7 +352,7 @@ private:
 
     // LLAMA_WINDOW_TIMING: host time of the batches that output all their tokens, by step and length, printed when the context is freed
     struct decode_timing {
-        enum step { SETUP, GRAPH, INPUTS, BEFORE, COMPUTE, HIDDEN, UPDATE, EXTRACT, N_STEPS };
+        enum step { SETUP, BUILD, GRAPH, INPUTS, BEFORE, COMPUTE, HIDDEN, UPDATE, EXTRACT, N_STEPS };   // GRAPH: the scheduler's allocation
         static constexpr int N_KINDS = 5; // 1, 2, 3, 4 tokens, longer
 
         bool    enabled = false;

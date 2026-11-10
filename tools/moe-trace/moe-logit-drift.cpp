@@ -14,6 +14,8 @@
 //                     of them), then the rest of -f in batches of S tokens with only the last one output, at most LLAMA_DRIFT_PROMPT_BATCHES (default 64) of them
 // LLAMA_DRIFT_PROFILE N1,N2,...: only time verification batches: LLAMA_DRIFT_PROFILE_DEPTH (default 1024) tokens of -f as a prompt,
 //                     LLAMA_DRIFT_PROFILE_GEN (96) in batches of 1, then LLAMA_DRIFT_PROFILE_BATCHES (64) batches of each size with
+//                     (LLAMA_DRIFT_PROFILE_ALT=1: the sizes taken in turn, batch by batch, so every batch has another length than
+//                     the last: the graph is rebuilt each time, as with drafts of varying length; LLAMA_WINDOW_TIMING=1 splits it)
 //                     every token output; each phase is a label of the Vulkan perf logger (ggml_backend_vk_perf_mark)
 
 #include "arg.h"
@@ -278,6 +280,28 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (geti("LLAMA_DRIFT_PROFILE_ALT", 0) != 0) {
+            // the sizes in turn, batch by batch: each batch's length differs from the last's
+            mark("alternating");
+            std::vector<std::vector<double>> t_alt(sizes.size());
+            for (int k = 0; k < n_batches; ++k) {
+                for (size_t j = 0; j < sizes.size(); ++j) {
+                    const int S = sizes[j];
+                    const int64_t t0 = ggml_time_us();
+                    if (!decode(pos, pos + S, true)) {
+                        LOG_ERR("%s: decode failed\n", __func__);
+                        return 1;
+                    }
+                    t_alt[j].push_back((ggml_time_us() - t0) / 1e3);
+                    pos += S;
+                }
+            }
+            for (size_t j = 0; j < sizes.size(); ++j) {
+                printf("profile batches of %d tokens, alternating with %s: %d batches, median %.2f ms a batch, p10 %.2f, p90 %.2f\n",
+                        sizes[j], env, n_batches, pct(t_alt[j], .5), pct(t_alt[j], .1), pct(t_alt[j], .9));
+            }
+            fflush(stdout);
+        } else {
         for (int S : sizes) {
             mark("batch " + std::to_string(S));
             std::vector<double> t_batches;
@@ -292,6 +316,7 @@ int main(int argc, char ** argv) {
             printf("profile batches of %d tokens at depth %d: %d batches, median %.2f ms a batch, p10 %.2f, p90 %.2f\n",
                     S, pos, n_batches, pct(t_batches, .5), pct(t_batches, .1), pct(t_batches, .9));
             fflush(stdout);
+        }
         }
         mark("end");
         llama_init.reset();
