@@ -168,9 +168,6 @@ apply to any such model, with or without the cache:
 - **MUL_MAT_ID skips unused slots** (id -1), which both cache branches rely on.
 - **Fused f32 adds without fp16 rounding modes**, so GPUs such as the RX 480 get them.
 - **A fused MUL_MAT → SCALE → SiLU/sigmoid** in the mat-vec's store: Flash-Next's hyper-connection products, 97 a pass.
-- **A fixed Vulkan submit size** (`GGML_VK_FLOPS_PER_SUBMIT`, opt-in). The default cuts a split's work at 1/40 of the
-  previous graph's flops. Layer splits alternate large and small, so the cut lands far too fine: 5.4 submits of about
-  20 µs per split.
 - **Polling the GPU instead of sleeping** (`GGML_VK_SPIN_WAIT=N`, opt-in): a split model's host blocks on the GPU once
   a layer, and a blocking wait returns through an interrupt and the scheduler; with this the host polls the semaphore
   for up to N µs first.
@@ -184,8 +181,6 @@ apply to any such model, with or without the cache:
 - Fused adds on the RX 480s: 14.44 → 14.57 tok/s.
 - The mat-vec store fusion: the same logits, and within noise at the settings below. With the GPU's work exposed (one
   submit per split), it's worth 1.5–2.7%.
-- `GGML_VK_FLOPS_PER_SUBMIT=100000000` on the R9700, end to end: Q4 answers 40.25 → 41.07 tok/s (+2.0%) and agent
-  turns +1.8%; Q6 32.62 → 33.01 (+1.2%) and agent turns +1.7%.
 - `GGML_VK_SPIN_WAIT=2000` on the R9700, Flash-Next Q4 verify batches of 1 / 3 / 8 tokens: −1.3 / −1.4 / −0.9% without
   the fused expert FFN and −1.7 / −1.1 / −2.6% with it, every pair of two in its favour: about 10 µs a layer, the wake-up
   of the one blocking wait a layer.
@@ -330,7 +325,7 @@ something, against the stage before:
 |---|---|---|---|---|
 | `omp-spin` | `GOMP_SPINCOUNT` | how long the CPU's threads spin before they sleep | 30000000, +1.35 tok/s | 30000000, +0.78 (in the second round) |
 | `cpu-chunks` | `GGML_CPU_MMID_FLAT` | how the CPU's experts are cut between threads | 128, +0.41 | 128, +0.86 |
-| `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit | 100M, +1.02 | 100M, +0.73 |
+| `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit (upstream's rule since 2026-11-10, the stage is skipped) | 100M, +1.02 | 100M, +0.73 |
 | `predictor` | `--moe-cache-predictor`, `--moe-cache-predictor-start` | the predictor, or the decayed scores | the predictor, no text start, +1.61 | the same, +1.48 |
 | `refill` | `--moe-cache-refill` | a full rebalance after the first tokens | 0 | 0 |
 | `answer-cap` | `--moe-cache-predictor-answer-cap` | how many swaps an answer's start makes | 500, +1.20 (250 tied) | 125, +1.13 (250 tied) |
@@ -387,7 +382,7 @@ published). The cache, draft and CPU settings are the tuning script's picks for 
 ([Tuning a machine](#tuning-a-machine)):
 
 ```bash
-GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_VK_FLOPS_PER_SUBMIT=100000000 GGML_VK_SPIN_WAIT=2000 \
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_VK_SPIN_WAIT=2000 \
   LLAMA_GRAPH_CACHE=8 LLAMA_MOE_RESIZE_SPLIT=3072 \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
