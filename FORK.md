@@ -174,6 +174,10 @@ apply to any such model, with or without the cache:
 - **Polling the GPU instead of sleeping** (`GGML_VK_SPIN_WAIT=N`, opt-in): a split model's host blocks on the GPU once
   a layer, and a blocking wait returns through an interrupt and the scheduler; with this the host polls the semaphore
   for up to N µs first.
+- **A graph per batch length** (`LLAMA_GRAPH_CACHE=N`, opt-in): a verify batch of another length than the last one
+  rebuilt and reallocated the graph (3 + 11 ms on the 1920X, and the compute after a reallocation up to 12 ms slower);
+  with the cache, each small length (up to `LLAMA_GRAPH_CACHE_TOKENS` tokens, 16) keeps a scheduler and graph of its
+  own, about 50 MiB of device memory each, and the main scheduler takes everything else.
 
 **Measured:**
 - Overlap and asynchronous reads, RTX 4070 Ti with the experts on the CPU and no cache: 26.6 → 29.2 tok/s.
@@ -187,6 +191,11 @@ apply to any such model, with or without the cache:
 - `GGML_VK_SPIN_WAIT=2000` on the R9700, Flash-Next Q4 verify batches of 1 / 3 / 8 tokens: −1.3 / −1.4 / −0.9% without
   the fused expert FFN and −1.7 / −1.1 / −2.6% with it, every pair of two in its favour: about 10 µs a layer, the wake-up
   of the one blocking wait a layer.
+- `LLAMA_GRAPH_CACHE=8` on the R9700, Flash-Next Q4 (the setup below, one pass): verify batches alternating 1, 2, 3 and 4
+  tokens 50.0 / 54.3 / 66.7 / 70.4 → 34.1 / 40.0 / 45.5 / 52.7 ms, the same as in uniform blocks; end to end, fixed 2
+  drafts 38.6 → 39.4 tok/s and fixed 5 drafts 33.6 → 34.7, and where the length changes every pass, gated 5 drafts
+  (p-min 0.8) 30.8 → 37.3 and gated 8 (0.9) 28.5 → 33.3. Logits of 1-token batches identical, 3-token batches within
+  placement noise.
 
 ### The expert predictor
 
@@ -349,8 +358,8 @@ Most of this matches the settings found by hand, step by step. The search did be
 
 The values past the ends of the lists lost or tied: 4 drafts, 400M submits, budget 40, an answer cap of 62, spins of
 7.5M and 120M. In both searches the second round ran out of its 8 hours before the answer cap, drafts and budget
-came up again. A `gate` stage for gated longer drafts exists but is left out by default: gates lose to the graph
-rebuild of each new verify length.
+came up again. A `gate` stage for gated longer drafts exists but is left out by default: the gates tried lose to a
+fixed length even with `LLAMA_GRAPH_CACHE` ([Tried and not kept](#tried-and-not-kept)).
 
 ## Build
 
@@ -381,7 +390,7 @@ published). The cache, draft and CPU settings are the tuning script's picks for 
 
 ```bash
 GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_VK_FLOPS_PER_SUBMIT=100000000 GGML_VK_SPIN_WAIT=2000 \
-  LLAMA_MOE_RESIZE_SPLIT=3072 \
+  LLAMA_GRAPH_CACHE=8 LLAMA_MOE_RESIZE_SPLIT=3072 \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
@@ -456,8 +465,11 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
 
 Measured on the 1920X + R9700. These either didn't help or cost more than they gained:
 - **The predictor's text start as a default:** fewer uploads but slower overall. The answer cap does better.
-- **Gated longer drafts** (`--spec-draft-p-min`): each new verify length rebuilds the graph (14–21 ms), and a 9-token
-  pass leaves the mat-vec kernels (`mul_mat_vec_max_cols = 8`).
+- **Gated longer drafts** (`--spec-draft-p-min`): each new verify length rebuilt the graph (14–21 ms), which
+  `LLAMA_GRAPH_CACHE` has since removed; with it the gates tried still lose to a fixed length (on Q4, 5 drafts at p-min
+  0.8: 37.3 tok/s, 8 at 0.9: 33.3, against 39.4 at a fixed 2) because they stop too early (1.4 drafts a pass), while
+  agent turns want 5 drafts (39.3 against 36.0 at 2). A rule that switches the length by what the model is doing is
+  the open item now that switching is free. A 9-token pass also leaves the mat-vec kernels (`mul_mat_vec_max_cols = 8`).
 - **Stacking mat-vecs that read the same input:** 1.1–1.4 ms a pass in isolation; mat-vecs issued back to back already
   read ~500–560 GB/s.
 - **A wider graph optimizer window** (`GGML_VK_GRAPH_OPT_WINDOW`, default 20): 7–9% fewer dispatch groups at 40–320
