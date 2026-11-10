@@ -1549,7 +1549,10 @@ struct llama_moe_cache::impl {
     // compute, once the CPU backend's worker threads exist: a new thread inherits its creator's mask, so a pin at init
     // put every OpenMP worker on that one cpu (12 threads spinning on cpu 0, the run never finished a batch). A worker
     // created later (a larger team, or a threadpool made a graph at a time) finds the pin on itself in the record op
-    // and takes the process's mask back.
+    // and takes the process's mask back. With the pin the workers keep off the main thread's core (a worker spinning
+    // between parallel regions on that core would halve the recording; measured: the pin alone lost 36-123%).
+    // LLAMA_MOE_PREFETCH_MODE=graph (the prediction's ops in the graph only) and =read (plus the read-back, the events
+    // and the launch, no touch) measure the parts' costs against the default, touch.
     struct prefetch_job {
         uint64_t gen = 0;
         int32_t  il  = -1;                  // the layer whose experts are touched
@@ -1569,9 +1572,11 @@ struct llama_moe_cache::impl {
         bool                    quit = false;
         bool                    debug = false;    // LLAMA_MOE_PREFETCH_DEBUG=1: the first arm, launch and touch logged
         int                     main_cpu = -1;    // the main thread's cpu (-1: not pinned)
+        int                     mode = 0;         // LLAMA_MOE_PREFETCH_MODE: 0 touch, 1 read (no touch), 2 graph (no read-back)
         std::atomic<bool>       main_pinned{false};
 #if defined(__linux__)
-        cpu_set_t               full;             // the process's mask before the pin, for threads that inherited the pin
+        cpu_set_t               full;             // the process's mask before the pin
+        cpu_set_t               workers;          // the mask for the CPU backend's other threads once the main thread is pinned
 #endif
         prefetch_job            job;              // posted to the threads
         prefetch_job            pending;          // armed: its read is in flight until the launch synchronizes it
@@ -1606,6 +1611,9 @@ struct llama_moe_cache::impl {
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_THREADS")) { pf.per_group = std::max(1, atoi(e)); }
         int main_cpu = 0;
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_MAIN_CPU")) { main_cpu = atoi(e); }
+        if (const char * e = getenv("LLAMA_MOE_PREFETCH_MODE")) {
+            pf.mode = strcmp(e, "read") == 0 ? 1 : strcmp(e, "graph") == 0 ? 2 : 0;
+        }
         if (const char * e = getenv("LLAMA_MOE_PREFETCH_MIB"))     { pf.budget = (size_t) std::max(1, atoi(e)) << 20; }
         if (const char * e = getenv("GGML_CPU_MMID_FLAT"))         { pf.C = std::max<int64_t>(1, atoll(e)); }
         // the L3 groups as the CPU backend deals its chunks (GGML_CPU_MMID_CCX)
@@ -1655,6 +1663,15 @@ struct llama_moe_cache::impl {
                 fclose(f);
             }
         }
+        pf.workers = pf.full;
+        for (int c : avoid) {
+            if (c >= 0 && c < CPU_SETSIZE) {
+                CPU_CLR(c, &pf.workers);
+            }
+        }
+        if (CPU_COUNT(&pf.workers) == 0) {
+            pf.workers = pf.full;
+        }
 #endif
         int n_threads = 0;
         for (int g = 0; g < pf.n_grp; ++g) {
@@ -1680,8 +1697,8 @@ struct llama_moe_cache::impl {
         }
         GGML_UNUSED(n_threads);
         LLAMA_LOG_INFO("%s: LLAMA_MOE_PREFETCH: the next layer's %d predicted experts touched into the L3 during its attention, %d threads on %d L3 groups, "
-            "chunks of %lld rows, up to %zu MiB a layer; the main thread on cpu %d\n", __func__, pf.n_top, (int) pf.threads.size(), pf.n_grp,
-            (long long) pf.C, pf.budget >> 20, main_cpu);
+            "chunks of %lld rows, up to %zu MiB a layer; the main thread on cpu %d%s\n", __func__, pf.n_top, (int) pf.threads.size(), pf.n_grp,
+            (long long) pf.C, pf.budget >> 20, main_cpu, pf.mode == 1 ? "; MODE=read: no touch" : pf.mode == 2 ? "; MODE=graph: no read-back" : "");
         if (pf.n_grp == 1 && n_cpu > 8) {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_PREFETCH: one L3 group (set GGML_CPU_MMID_CCX=1 so the fused FFN computes each chunk where it was touched)\n", __func__);
         }
@@ -1725,8 +1742,8 @@ struct llama_moe_cache::impl {
 #endif
     }
 
-    // every other thread of the CPU backend, in the record op: one created after the pin inherited it, and takes the
-    // process's mask back (a thread checks once)
+    // every other thread of the CPU backend, in the record op, once the main thread is pinned: it takes the workers'
+    // mask (the process's, less the main thread's core), once a thread; that also undoes an inherited pin
     void prefetch_worker_check() {
 #if defined(__linux__)
         if (!pf.main_pinned.load(std::memory_order_acquire)) {
@@ -1737,10 +1754,7 @@ struct llama_moe_cache::impl {
             return;
         }
         checked = true;
-        cpu_set_t cur;
-        if (pthread_getaffinity_np(pthread_self(), sizeof(cur), &cur) == 0 && CPU_COUNT(&cur) == 1 && CPU_ISSET(pf.main_cpu, &cur)) {
-            pthread_setaffinity_np(pthread_self(), sizeof(pf.full), &pf.full);
-        }
+        pthread_setaffinity_np(pthread_self(), sizeof(pf.workers), &pf.workers);
 #endif
     }
 
@@ -1757,7 +1771,7 @@ struct llama_moe_cache::impl {
         const bool ok = pred != nullptr && layers[il].ig >= 0 && nxt >= 2 && nxt < (int32_t) layers.size() - 1 &&
             layers[nxt].ig >= 0 && layers[nxt].miss_map != nullptr;
         pf.pending.il = -1;
-        if (!ok) {
+        if (!ok || pf.mode == 2) {
             return;
         }
         const int b = (int) (pf.gen.load() & 1);
@@ -1865,7 +1879,7 @@ struct llama_moe_cache::impl {
             int64_t k = 0;
             bool cut = false;
             uint64_t sink = 0;
-            for (size_t j = 0; j < list.size() && !cut && bytes < budget; ++j) {
+            for (size_t j = 0; pf.mode != 1 && j < list.size() && !cut && bytes < budget; ++j) {
                 const int32_t e = list[j];
                 for (const ggml_tensor * w : l.experts) {
                     const int64_t cpe = (w->ne[1] + pf.C - 1)/pf.C;
