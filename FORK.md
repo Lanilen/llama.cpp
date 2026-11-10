@@ -195,7 +195,8 @@ apply to any such model, with or without the cache:
 
 ### The expert predictor
 
-*Branch `moe-predictor`, guide [docs/moe-predictor.md](docs/moe-predictor.md).*
+*Branch `moe-predictor`, guide [docs/moe-predictor.md](docs/moe-predictor.md); the trained Flash-Next files on
+[Hugging Face](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).*
 
 The cache's scores look back. The predictor is a small learned model (a ~35 MB file of its own) that ranks each layer's
 experts by how often the router will pick them over the next tokens. It reads the same counts plus the input of two
@@ -380,8 +381,9 @@ cmake --build build-vk -j
 
 ### 1920X + R9700
 
-Flash-Next UD-Q4_K_XL at 64k context, with a predictor trained for it (`tools/moe-predictor`; the lab's file isn't
-published). The cache, draft and CPU settings are the tuning script's picks for this machine
+Flash-Next UD-Q4_K_XL at 64k context, with the predictor trained for it (`flashnext-pred-v3.moepred` from
+[Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) on
+Hugging Face, trained with `tools/moe-predictor`). The cache, draft and CPU settings are the tuning script's picks for this machine
 ([Tuning a machine](#tuning-a-machine)):
 
 ```bash
@@ -392,7 +394,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
     --moe-cache-hot flashnext.hot \
-    --moe-cache-predictor flashnext-pred.gguf --moe-cache-refill 0 --moe-cache-jit 8 --moe-cache-predictor-answer-cap 500 \
+    --moe-cache-predictor flashnext-pred-v3.moepred --moe-cache-refill 0 --moe-cache-jit 8 --moe-cache-predictor-answer-cap 500 \
     -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -devd Vulkan0 \
     --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 2048 --load-mode mmap+mlock
 ```
