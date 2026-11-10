@@ -630,6 +630,15 @@ The hot spare stays. Upstream's CPU share closes most of the gap to the plain ca
 computes nearly every miss, which is the hot spare's design with a different ranking of the residents), and the rest is
 the predictor's residency and the jit slots. Its cache remains available as `--moe-cache-mode lru`.
 
+**Upstream's checks on a push.** Upstream's Python type check (`.github/workflows/python-type-check.yml`, `ty`) runs on
+every push that touches a `.py` file, and the fork's scripts under `tools/moe-trace`, `tools/moe-predictor` and `scripts`
+pass it (2026-11-11, narrowings only, no change in behaviour). `ty.toml` lists `tools/moe-predictor` in `extra-paths`,
+so the predictor tools' `import common` resolves to their own module and not to the repository's `common/` directory,
+which ty reads as a namespace package, and ignores `invalid-mutable-override` there: torch declares `nn.Module.forward`
+as a `Callable` attribute, so every `forward()` reads as the override of a mutable attribute. The "CI (cann)" workflow
+fails on every push of this fork as it does on upstream's own master: since upstream's PR 23705 commented out its only
+job, `jobs:` is empty and GitHub rejects the file. Nothing of the fork's; it ends when upstream fixes the file.
+
 ## Still to measure
 
 - **The RX 480s with the current code:** their numbers above used UD-IQ4_XS and predate the predictor. They'll be run
