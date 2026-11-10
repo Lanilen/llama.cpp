@@ -14900,6 +14900,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // small graphs gain nothing from splitting, each submit costs CPU time
     uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
+    // a graph within one submit's node limit is submitted once: a model split between the CPU and the GPU computes
+    // a hundred such graphs per generated token, each around 1 GFLOP, and splitting them by their flops costs ~10 queue
+    // submits each (~18 us on RADV) for a GPU that waited for the host anyway
+    if (cgraph->n_nodes <= (int) ctx->device->max_nodes_per_submit) {
+        flops_per_submit = 0;
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
