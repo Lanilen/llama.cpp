@@ -504,6 +504,14 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   so no cache gain could have paid. Pinning the recording thread to a core lost more (+1 / +5 / +45 ms). Archived as
   the tag `archive/early-routing`, with the per-L3-group chunk queues (`GGML_CPU_MMID_CCX`, free on their own but
   useless without the prefetch) and `llama-moe-early-route`, which measures the prediction.
+- **ik_llama.cpp's CPU kernels** for the experts. Its AVX2 K-quant dot does one `maddubs` per 32 weights and a single
+  `madd` per 128, applying the block scales in float afterwards, and reuses each unpacked weight block for up to 8
+  columns; this fork's fused expert op is bound by the kernel's instruction throughput, so a faster kernel would show
+  directly. On the 1920X it is slower where that matters: token generation on Qwen3-30B-A3B with one thread (the kernel
+  alone) 5.09 → 4.43 tok/s on q4_K experts and 4.08 → 3.22 on q6_K (its repacked `-rtr` layout 5.19 and 3.91). With 12
+  threads it reaches 26.96 and 20.66 against this fork's fused op at 25.84 and 21.31 (plain ggml 20.98 and 20.64): its
+  gain there is work distribution, which the fused op already has. Its design pays off on cores with AVX-512 `dpbusd`;
+  on Zen 1 the extra unpacking, shuffles and float work cost more than the multiplies it saves.
 
 ## Still to measure
 
