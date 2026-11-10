@@ -52,7 +52,7 @@ def load(prefix):
 
 
 def ubatches(meta, n_tokens, prompt_ub, gen_ub):
-    segs = meta.get("segments") or [[0, meta["n_prompt"], "prompt"], [meta["n_prompt"], n_tokens, "generated"]]
+    segs = meta.get("segments") or [(0, meta["n_prompt"], "prompt"), (meta["n_prompt"], n_tokens, "generated")]
     res = []
     for start, end, kind in segs:
         step = prompt_ub if kind == "prompt" else gen_ub
