@@ -21,11 +21,15 @@ int main(int argc, char ** argv) {
     int n_threads = 12;
     bool glu_ref = false;   // --glu-ref: the reference has the GLU fusion (GGML_CPU_MMID_GLU=1), only down apart: the
                             // whole-FFN fusion must then match it exactly
+    int n_random = 0;       // --random N: after the fixed pattern, N random ones a shape (0-10 experts a token, repeats
+                            // across tokens, experts in any slot): the fused ops' races, if any
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             n_threads = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--glu-ref")) {
             glu_ref = true;
+        } else if (!strcmp(argv[i], "--random") && i + 1 < argc) {
+            n_random = atoi(argv[++i]);
         }
     }
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -50,6 +54,7 @@ int main(int argc, char ** argv) {
             ggml_quantize_chunk(tk, wf.data(), wq[k].data(), 0, rows*n_expert, cols, nullptr);
         }
         for (int64_t n_tokens : { 1, 3, 8 }) {
+        for (int pattern = 0; pattern <= n_random; ++pattern) {
             std::vector<float> x(n_embd*n_tokens);
             for (float & v : x) {
                 v = uni(rng);
@@ -57,9 +62,27 @@ int main(int argc, char ** argv) {
             // each token: a few distinct experts, the other slots -1 (the hits of the CPU branch)
             std::vector<int32_t> ids(n_slots*n_tokens, -1);
             for (int64_t t = 0; t < n_tokens; ++t) {
-                const int n = 1 + (int) (t % 4);
+                if (pattern == 0) {
+                    const int n = 1 + (int) (t % 4);
+                    for (int j = 0; j < n; ++j) {
+                        ids[t*n_slots + j*2] = (int32_t) ((t*7 + j*13 + 1) % n_expert);
+                    }
+                    continue;
+                }
+                // random: n distinct experts of a small pool (so tokens share some), in random slots
+                std::vector<int32_t> pool(n_expert);
+                for (int e = 0; e < n_expert; ++e) {
+                    pool[e] = e;
+                }
+                std::shuffle(pool.begin(), pool.end(), rng);
+                std::vector<int32_t> slots(n_slots);
+                for (int j = 0; j < n_slots; ++j) {
+                    slots[j] = j;
+                }
+                std::shuffle(slots.begin(), slots.end(), rng);
+                const int n = (int) (rng() % (n_slots + 1));
                 for (int j = 0; j < n; ++j) {
-                    ids[t*n_slots + j*2] = (int32_t) ((t*7 + j*13 + 1) % n_expert);
+                    ids[t*n_slots + slots[j]] = pool[j % 12];
                 }
             }
             auto run = [&](bool reference, std::vector<float> & out) {
@@ -108,9 +131,15 @@ int main(int argc, char ** argv) {
             // against the unfused ops, an int8 step of down's input can flip: within 1e-3 of the largest output
             const bool ok = glu_ref ? err == 0.0 : err <= 1e-3*std::max(mag, 1.0);
             all_ok = all_ok && ok;
-            printf("%-5s + %-5s %lld tokens: max abs diff %.3e (max %.3e)%s\n", ggml_type_name(type), ggml_type_name(type_dn),
-                   (long long) n_tokens, err, mag, ok ? "" : " FAIL");
+            if (pattern == 0 || !ok) {
+                printf("%-5s + %-5s %lld tokens%s: max abs diff %.3e (max %.3e)%s\n", ggml_type_name(type), ggml_type_name(type_dn),
+                       (long long) n_tokens, pattern ? " (random)" : "", err, mag, ok ? "" : " FAIL");
+            }
         }
+        }
+    }
+    if (n_random > 0) {
+        printf("%d random patterns a shape\n", n_random);
     }
     printf(all_ok ? "fused = unfused\n" : "MISMATCH\n");
     ggml_backend_free(cpu);
