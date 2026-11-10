@@ -581,7 +581,10 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   against 1947 (the graph's tensors are the same: 3898 nodes and 226.7 GB of tensor bytes in both builds' dumps at a
   65536 context, and `ggml-alloc.c` is unchanged: the scheduler's splits place them differently), so the resize fit of the 1920X + R9700 is 2048 tokens instead of
   4096, with 57 MiB to spare before, and prompts of 2049-4096 tokens release the cache (q2k 31.9 against 32.4 tok/s).
-  A slightly smaller cache (`--moe-cache-mib`, the tuner's `mib` stage) buys the 4096 fit back.
+  A slightly smaller cache (`--moe-cache-mib`, the tuner's `mib` stage) buys the 4096 fit back. The benchmark harness's
+  per-request generation rate on short turns right after a long prompt reads 4-15% lower on the merge while the pass laps
+  are within polaris's run-to-run spread and the wall time is equal or better (prompts 5-11% faster): the draft's catch-up
+  of the prompt is accounted to generation instead of the prompt, an accounting difference, not a cost.
 - **The YaRN truncation flag, `ggml_flash_attn_ext_rows`, the models refactor:** taken as they are; the fork's model and
   context changes were re-applied on top (six hunks in `qwen4exp.cpp` and `models.h`).
 
