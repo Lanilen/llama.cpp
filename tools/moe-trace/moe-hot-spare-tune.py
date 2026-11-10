@@ -6,7 +6,7 @@ the second pass. One setting changes per stage and the best one so far carries o
 larger than the noise measured between the passes, and a last stage compares the result with the starting point. Python
 3.8+, standard library only: copy this file to another machine. Stop it at any time, the next start skips complete runs.
 
-    python3 moe-cache-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \\
+    python3 moe-hot-spare-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \\
         --predictor pred.gguf --draft-model mtp.gguf --hours 4 \\
         -- -c 65536 -ngl 99 --cpu-moe -t 12 -ub 8192 -b 8192 --moe-cache-resize
 

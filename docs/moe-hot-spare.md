@@ -232,9 +232,10 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: asynchronous reads into memory not pinned for the device use a staging ring and copy at synchronization | all Vulkan GPUs, including the logits reads | none |
 | Vulkan: the matrix-vector MUL_MAT_ID shaders skip slots with id -1 | all Vulkan GPUs, one check per workgroup | none |
 | Vulkan: fused f32 adds no longer need `shaderRoundingModeRTEFloat16` | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
-| Vulkan: split_k also for a matrix multiplication with fewer columns than a tile (9-31 tokens), not only from a whole tile | all Vulkan GPUs | `GGML_VK_SPLIT_K_SMALL_N=0` |
 
 On the RTX 4070 Ti, a model with its experts on the CPU and no cache generated 29.2 instead of 26.6 tok/s with these.
+The branch also had split_k for matrix multiplications with fewer columns than a tile (9-31 tokens) on every GPU; upstream
+added its own (RDNA3 and RDNA4, k >= 2048 and n <= 32, 2026-11), which covers the R9700, and ours is gone with it.
 
 The split_k change: a 4x10240 f32 weight times 9-31 tokens ran on one workgroup (0.9-1.1 ms on the R9700, against 0.15
 ms at 32 tokens split 8 ways), about 90 ms of a 9-24 token batch of Flash-Next; batches of 9, 16 and 24 tokens (short
@@ -312,7 +313,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
   13.95 and 13.76 tok/s. The copies and uploads cost about what the extra hits save. Keep the budget at 5-10.
 - the margin hardly matters.
 
-**Finding the settings for your machine.** These numbers come from one machine, and the best settings depend on the CPU, the link and the model. `tools/moe-trace/moe-cache-tune.py` searches them with real runs in stages, within a time budget, and writes a results file you can share: [Tuning a machine](../tools/moe-trace/README.md#tuning-a-machine).
+**Finding the settings for your machine.** These numbers come from one machine, and the best settings depend on the CPU, the link and the model. `tools/moe-trace/moe-hot-spare-tune.py` searches them with real runs in stages, within a time budget, and writes a results file you can share: [Tuning a machine](../tools/moe-trace/README.md#tuning-a-machine).
 
 ### Environment variables
 
@@ -341,7 +342,6 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
-| `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops |
 | `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
 | `GGML_VK_PERF_LOGGER_NODES=1` | Vulkan: the perf logger also keys each timing by the node and its sources' names; `ggml_backend_vk_perf_mark(label)` (proc address) labels the timings from then on, for `llama-moe-logit-drift`'s `LLAMA_DRIFT_PROFILE` |

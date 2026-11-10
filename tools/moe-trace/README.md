@@ -112,12 +112,12 @@ k = 2560 and 10240, m = 4-10240), for what one product over concatenated weights
 
 ## Tuning a machine
 
-`moe-cache-tune.py` finds the best cache settings for your machine and model, and writes a file you can share. The best settings depend on the hardware: on an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, the predictor without the refill won on Flash-Next, budget 10 was best on Q4 and 5 on Q6, and 3 drafts lost to 2 ([results](../../docs/moe-predictor.md#live-on-the-r9700)). A newer CPU or a faster link can change all of that.
+`moe-hot-spare-tune.py` finds the best cache settings for your machine and model, and writes a file you can share. The best settings depend on the hardware: on an R9700 on PCIe 3.0 x16 with a Threadripper 1920X, the predictor without the refill won on Flash-Next, budget 10 was best on Q4 and 5 on Q6, and 3 drafts lost to 2 ([results](../../docs/moe-predictor.md#live-on-the-r9700)). A newer CPU or a faster link can change all of that.
 
 It needs Python 3.8+ and nothing else, so you can copy the one file to another machine. It has been run on Linux only. Elsewhere the hardware details will be sparser, and the rest is untested.
 
 ```bash
-python3 moe-cache-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \
+python3 moe-hot-spare-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \
     --predictor pred.gguf --draft-model mtp.gguf --hours 4 \
     -- -c 65536 -ngl 99 --cpu-moe -t 12 -ub 8192 -b 8192 --moe-cache-resize
 ```

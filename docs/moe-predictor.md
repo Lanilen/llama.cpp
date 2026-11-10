@@ -122,7 +122,7 @@ In short, for Flash-Next on the R9700:
   and chat ([More traces](#more-traces)).
 
 These results are for one machine. To find the settings for yours, use
-[`moe-cache-tune.py`](../tools/moe-trace/README.md#tuning-a-machine).
+[`moe-hot-spare-tune.py`](../tools/moe-trace/README.md#tuning-a-machine).
 
 ### Live, on the R9700
 
