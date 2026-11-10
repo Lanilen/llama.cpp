@@ -236,11 +236,12 @@ saved 8 ms of recording but the GPU started 10 ms later, 2–3% slower. A fixed 
 Hit rates and text were unchanged. Upstream then changed its rule (2026-11): a graph under 1 GFLOP is submitted once,
 the others are cut at 1/40 of the previous graph's flops but at least every 100 MFLOP. Against the fixed 100M target
 it first seemed to tie, but those runs had the setting after all (the scripts unset it before the machine's environment
-set it again). Really without it, Flash-Next Q4 verify batches of 1 / 3 / 8 tokens took 36.7 / 55.5 / 97.2 ms against
-37.5 / 53.1 / 93.6 with it (two passes each, 4% at 3 and 8 tokens): a layer graph of ~1 GFLOP at 3 tokens recorded as
-one submit keeps the GPU idle while it is recorded, and in the server the CPU side of a layer waited for the GPU 14 ms a
-verify graph instead of 7. So the switch stays; unset, upstream's rule applies, and `moe-hot-spare-tune.py` sweeps the
-`submits` stage on builds that have the switch.
+set it again). Really without it, the merged build's Flash-Next Q4 verify batches of 1 / 3 / 8 tokens took 36.7 /
+55.3 / 96.6 ms against 37.1 / 54.4 / 93.6 with it (two passes each: 1.6% at 3 tokens, 3% at 8; Q6 74.6 / 130.3 against
+72.9 / 125.4), and in the server, where the draft head's graphs come between the verify decodes, the verify decode took
+50.5 ms a pass instead of 46.9: a layer graph of ~1 GFLOP at 3 tokens recorded as one submit keeps the GPU idle while
+it is recorded, and the CPU side of a layer waited for the GPU 14 ms a verify graph instead of 7. So the switch stays;
+unset, upstream's rule applies, and `moe-hot-spare-tune.py` sweeps the `submits` stage on builds that have the switch.
 
 With asynchronous reads and the overlap, the host blocks on the GPU once a layer, for the main split's end and the CPU
 split's reads; a blocking wait returns through an interrupt and the scheduler. `GGML_VK_SPIN_WAIT=N` polls the
