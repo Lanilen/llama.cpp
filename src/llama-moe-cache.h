@@ -19,6 +19,7 @@ struct llama_moe_cache_params {
     std::string save;   // hot spare mode: file the resident experts are written to at exit
     int64_t refill = 0; // hot spare mode: generated tokens after a prompt for one rebalance from their scores alone, 0 = none
     bool resize = false; // hot spare mode: release the device memory for large batches (see llama_moe_cache::release)
+    float cpu_share = 0.0f; // lru mode: share of the misses computed on the CPU instead of uploaded, 0 = all uploaded
 
     // hot spare mode: refresh of the resident experts between ubatches
     float  half_life = 0.0f; // tokens, 0 = the resident experts never change
@@ -82,11 +83,16 @@ public:
     void release();
     void restore();
 
-    // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+    // lru mode: the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
+    // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
+
+    // lru mode: the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
+    // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
+    ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
