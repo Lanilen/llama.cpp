@@ -94,7 +94,7 @@ for ep in range(args.epochs):
         a = torch.from_numpy(perm[i:i + 32]).to(dev)
         z0 = torch.zeros_like(a)
         logp, x = pre_inputs(TR, PTR, a)
-        loss = 0.0
+        loss = torch.zeros((), device=dev)
         for H in HS:
             tgt = T.target(TR, a, z0, H)
             q = tgt / tgt.sum(-1, keepdim=True).clamp(min=1)

@@ -39,6 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, fields, replace
+from typing import Any
 
 try:
     import ctypes
@@ -527,7 +528,8 @@ class Server:
         if port_busy(self.port):
             raise Fatal(f"port {self.port} is busy: stop what listens there or use --port")
         def die_with_parent():
-            LIBC.prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG: no server left behind if this script is killed
+            if LIBC is not None:
+                LIBC.prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG: no server left behind if this script is killed
         self.logf = open(self.log_path, "w")
         self.proc = subprocess.Popen(self.cmd, stdout=self.logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=self.env,
                                      start_new_session=True, preexec_fn=die_with_parent if LIBC else None)
@@ -551,10 +553,13 @@ class Server:
         time.sleep(self.o.settle)
 
     def wait_ready(self):
+        proc = self.proc
+        if proc is None:
+            raise RunFailed("the server was not started")
         t0 = time.time()
         while time.time() - t0 < self.o.load_timeout:
-            if self.proc.poll() is not None:
-                raise RunFailed(f"the server exited with code {self.proc.returncode} while loading")
+            if proc.poll() is not None:
+                raise RunFailed(f"the server exited with code {proc.returncode} while loading")
             try:
                 with self.opener.open(f"http://127.0.0.1:{self.port}/health", timeout=5) as r:
                     if json.loads(r.read()).get("status") == "ok":
@@ -623,7 +628,7 @@ class Tuner:
         self.runs, self.failed = {}, {}
         self.failed_now = set()
         self.links = {}
-        self.hw = None
+        self.hw: dict | None = None
         self.t_start = time.time()
         self.draft_on = bool(o.draft_model) or "--spec-type" in extra
         self.warnings = []
@@ -958,6 +963,7 @@ class Tuner:
         def past(v, up):
             if step == "+1":
                 return v + 1 if up else v - 1
+            assert isinstance(step, (int, float))  # a factor; "+1" is handled above and the mib stage, whose step is None, returned earlier
             i = vals.index(v)
             nb = vals[i - 1] if up and i > 0 else vals[i + 1] if not up and i + 1 < len(vals) else None
             k = max(step, round(v / nb if up else nb / v)) if nb else step  # the list's own spacing, at least the step
@@ -1128,7 +1134,7 @@ class Tuner:
 
     def decide(self, stage, cands, cur, pids):
         metric = STAGE_METRIC.get(stage, self.o.objective)
-        d = dict(stage=stage, metric=metric, incumbent=cur.name(), tried={}, status="not run", winner=cur.name())
+        d: dict[str, Any] = dict(stage=stage, metric=metric, incumbent=cur.name(), tried={}, status="not run", winner=cur.name())
         done = []
         for c in cands:
             n = len(self.values(c, pids))
@@ -1379,7 +1385,7 @@ class Tuner:
 
     def write_reports(self, version):
         os.makedirs(self.o.out, exist_ok=True)
-        self.hw["pcie"] = {g: {"link": v["link"], "link_max": v["link_max"]} for g, v in self.links.items()}
+        self.hw = dict(self.hw or {}, pcie={g: {"link": v["link"], "link_max": v["link_max"]} for g, v in self.links.items()})
         self.walk(execute=False)
         text = self.summary()
         with open(os.path.join(self.o.out, "summary.txt"), "w") as f:

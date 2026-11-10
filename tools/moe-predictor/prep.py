@@ -96,7 +96,7 @@ def one(name):
         allc += counts(chunk)
         ctx_pre.append(np.stack([sc[0], sc[1], allc]).reshape(3, NL, NE).astype(np.float16))
         r = np.nonzero(hpos < turn_start)[0] if hid is not None else []
-        hid_pre.append(np.asarray(hid[r[-1]]) if len(r) else np.zeros((len(HID_LAYERS), N_EMBD), np.float16))
+        hid_pre.append(np.asarray(hid[r[-1]]) if hid is not None and len(r) else np.zeros((len(HID_LAYERS), N_EMBD), np.float16))
         tt = toks[turn_start:s]
         turn_emb.append(np.asarray(EMB[tt], dtype=np.float32).mean(0).astype(np.float16) if len(tt) and EMB is not None
                         else np.zeros(N_EMBD, np.float16))
@@ -114,6 +114,7 @@ def one(name):
         if hid is not None:
             r = np.nonzero((hpos >= s - 16 * 8) & (hpos < s + L))[0]
             hid_out.append(np.asarray(hid[r])); hid_rel.append(hpos[r] - s); hid_ans.append(np.full(len(r), i))
+    assert OUT is not None  # set by main() before the workers start
     os.makedirs(OUT, exist_ok=True)
     off = np.concatenate([[0], np.cumsum(lens)[:-1]])
     np.savez(f"{OUT}/{name}.npz", starts=np.array(starts), lens=np.array(lens), ctx=np.stack(ctx),
