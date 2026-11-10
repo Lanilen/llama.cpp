@@ -178,7 +178,10 @@ class Model(nn.Module):
             out = out + (w.unsqueeze(-1) * logp).sum(1)
         if not args.no_hidden:
             oh = F.one_hot(bucket, len(BUCKETS)).float()
-            parts = [self.norm(hid.view(B, -1)), oh] + ([F.one_hot(src, len(SRCS)).float()] if SRCS else [])
+            parts = [self.norm(hid.view(B, -1)), oh]
+            if SRCS:
+                assert src is not None  # the answer's source (--source-input)
+                parts.append(F.one_hot(src, len(SRCS)).float())
             z = self.mlp(torch.cat(parts, 1))
             out = out + (z @ self.V[str(H)].t()).view(B, NL, NE)
         return out
@@ -231,7 +234,7 @@ if __name__ == "__main__":
             logp, maps = features(TR, a, t, prior)
             hid = hidden(TR, a, t) if not args.no_hidden else None
             bucket = torch.tensor([bidx[int(x)] for x in t.tolist()], device=dev)
-            loss = 0.0
+            loss = torch.zeros((), device=dev)
             for H in HS:
                 tgt = target(TR, a, t, H)
                 q = tgt / tgt.sum(-1, keepdim=True).clamp(min=1)
