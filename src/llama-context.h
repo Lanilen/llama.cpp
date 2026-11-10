@@ -412,6 +412,31 @@ private:
 
     bool sched_need_reserve = true;
 
+    // LLAMA_GRAPH_CACHE=N: a scheduler and graph of its own for each of up to N small batch lengths (of up to
+    // LLAMA_GRAPH_CACHE_TOKENS tokens, 16), so that a verify batch of another length than the last one reuses its graph
+    // instead of rebuilding and reallocating it (3 + 11 ms on a 1920X, and the compute after a reallocation up to 12 ms
+    // slower); the main scheduler keeps everything else. The slots go with every re-reserve.
+    struct graph_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        uint32_t n_tokens    = 0;
+        bool     has_outputs = false;
+        bool     active      = false;   // res holds a graph allocated in sched
+        int64_t  last_used   = 0;
+    };
+    std::vector<graph_slot> graph_slots;
+    int                     graph_cache_n          = 0;
+    uint32_t                graph_cache_max_tokens = 16;
+    int64_t                 graph_cache_clock      = 0;
+    int64_t                 n_graph_slots_made     = 0;
+    ggml_backend_sched_t    sched_cur = nullptr;   // the scheduler of the ubatch being or last processed: a slot's, else the main one
+
+    ggml_backend_sched_t   sched_active() const { return sched_cur ? sched_cur : sched.get(); }
+    ggml_backend_sched_ptr make_sched(size_t max_nodes, bool parallel);
+    graph_slot *           graph_slot_for(const llama_ubatch & ubatch);
+    void                   graph_slots_clear();
+    void                   sched_drop();   // the main scheduler and the slots
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
