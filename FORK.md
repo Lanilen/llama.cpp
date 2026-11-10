@@ -559,7 +559,10 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   the machine's environment set it again. Without it, the merge's verify batches were 36.7 / 55.5 / 97.2 and 36.9 / 56.3 /
   98.0 against polaris's 37.5 / 53.1 / 93.6 and 37.9 / 53.8 / 94.3 with it (Q6 47.7 / 75.3 / 131.2 against 48.0 / 75.1 /
   126.5): a layer graph of ~1 GFLOP at 3 tokens recorded as one submit keeps the GPU idle while it is recorded; in the
-  server the CPU side of a layer waited for the GPU 14 ms a verify graph instead of 7 (`GGML_SCHED_TIMING`), 2.4 ms a pass.
+  server the CPU side of a layer waited for the GPU 14 ms a verify graph instead of 7 (`GGML_SCHED_TIMING`). On the final
+  build itself, with the setting 37.0 / 55.1 / 93.4 and 37.2 / 53.7 / 93.8 against polaris's 37.5 / 53.4 / 94.0 and 37.8 /
+  54.0 / 95.1, without it 36.7 / 55.3 / 96.9 and 36.8 / 55.3 / 96.3 (Q6 with 46.8 / 72.9 / 125.4, without 46.8 / 74.6 /
+  130.3); the server's verify decode 46.9 ms a pass with it, 50.5 without (polaris 46.0).
 - **split_k for small batches on RDNA3 and RDNA4** (`07ec7c8af`, `da3416d80`): k >= 2048 and n <= 32 aim for eight
   workgroups a CU. **Dropped: `GGML_VK_SPLIT_K_SMALL_N`**, the fork's version for any GPU and any n below a tile; on the
   R9700 it had measured 273 / 339 / 427 → 168 / 218 / 275 ms for batches of 9 / 16 / 24 tokens, and upstream's covers the
@@ -574,8 +577,11 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   went through Vulkan's transfer queue behind the hot spare's background uploads, and the draft head took 11.7 ms a pass
   instead of 5.7 (Q4, 2 drafts; Q6 14.5 instead of 5.8), a pass 70.4 ms instead of 64.2 end to end (Q6 86.8 instead of
   77.4; polaris 63.0 / 78.5 the same evening). `LLAMA_MTP_DEV_ROWS=0` keeps the host rows (head 5.3 ms). Open: the
-  buffer counts against the cache's headroom, and the merge's 4096-token graph takes 2178 MiB against 1947, so the resize
-  fit of the 1920X + R9700 is 2048 tokens instead of 4096 and prompts of 2049-4096 tokens release the cache.
+  buffer counts against the cache's headroom, and the measuring reserve of the merge's 4096-token graph takes 2178 MiB
+  against 1947 (the graph's tensors are the same: 3898 nodes and 226.7 GB of tensor bytes in both builds' dumps at a
+  65536 context, and `ggml-alloc.c` is unchanged: the scheduler's splits place them differently), so the resize fit of the 1920X + R9700 is 2048 tokens instead of
+  4096, with 57 MiB to spare before, and prompts of 2049-4096 tokens release the cache (q2k 31.9 against 32.4 tok/s).
+  A slightly smaller cache (`--moe-cache-mib`, the tuner's `mib` stage) buys the 4096 fit back.
 - **The YaRN truncation flag, `ggml_flash_attn_ext_rows`, the models refactor:** taken as they are; the fork's model and
   context changes were re-applied on top (six hunks in `qwen4exp.cpp` and `models.h`).
 
