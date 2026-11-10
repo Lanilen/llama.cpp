@@ -4362,13 +4362,6 @@ vk_device ggml_vk_get_device(size_t idx) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
         }
-        // GGML_VK_FLOPS_PER_SUBMIT: fixed flops between submits instead of the estimate from the previous graph, 0 disables flop based submits
-        device->flops_per_submit_override = -1;
-        const char* GGML_VK_FLOPS_PER_SUBMIT = getenv("GGML_VK_FLOPS_PER_SUBMIT");
-        if (GGML_VK_FLOPS_PER_SUBMIT != nullptr) {
-            device->flops_per_submit_override = std::stoll(GGML_VK_FLOPS_PER_SUBMIT);
-        }
-
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -14740,15 +14733,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // small graphs gain nothing from splitting, each submit costs CPU time
     uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
-    // a graph within one submit's node limit is submitted once: a model split between the CPU and the GPU computes
-    // a hundred such graphs per generated token, and splitting them by their flops cost ~8 queue submits each (~18 us
-    // on RADV) for a GPU that waited for the host anyway
-    if (cgraph->n_nodes <= (int) ctx->device->max_nodes_per_submit) {
-        flops_per_submit = 0;
-    }
-    if (ctx->device->flops_per_submit_override >= 0) {
-        flops_per_submit = (uint64_t) ctx->device->flops_per_submit_override;
-    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {

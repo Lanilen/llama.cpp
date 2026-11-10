@@ -604,7 +604,6 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `GGML_CPU_MMID_FFN=1` | with `GGML_CPU_MMID_GLU=1`: down joins the op, without a barrier between the halves ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
 | `GGML_CPU_MMID_GLU=1` | with `GGML_CPU_MMID_FLAT`, up to 8 tokens: the CPU's MUL_MAT_ID of gate and up and their SWIGLU in one op ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
 | `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the 1920X + R9700 ([The CPU's experts](#the-cpus-experts)) |
-| `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the 1920X + R9700) |
 | `GGML_VK_SPIN_WAIT=N` | Vulkan: when the host synchronizes an event, poll its semaphore for up to N µs before blocking ([Vulkan submits](#vulkan-submits)) |
 | `LLAMA_GRAPH_CACHE=N` | a scheduler and graph of its own for each of up to N small batch lengths (`LLAMA_GRAPH_CACHE_TOKENS`, 16), so a verify batch of another length than the last one reuses its graph instead of rebuilding and reallocating it ([Graphs by batch length](#graphs-by-batch-length)) |
 | `GGML_VK_ASYNC_TRANSFER_MIN=N` | Vulkan, with the cache's background uploads: asynchronous writes smaller than N bytes go through the compute queue, so they don't wait behind the uploads on the transfer queue; larger ones stay there (default 1048576) |

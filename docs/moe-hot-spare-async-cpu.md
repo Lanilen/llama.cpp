@@ -84,7 +84,7 @@ record.
   generation splits.
 - One submit per call fixes that without this design, and is now the default: a graph of up to
   `GGML_VK_MAX_NODES_PER_SUBMIT` nodes (100) is submitted once; `GGML_VK_FLOPS_PER_SUBMIT` still overrides it. Measured
-  with `GGML_VK_FLOPS_PER_SUBMIT=0`: submits 8.13 -> 1.85 per call, the Vulkan calls' host time 24.5 -> 13.2 ms per
+  with one submit per split (`GGML_VK_FLOPS_PER_SUBMIT=0`, a switch of the time): submits 8.13 -> 1.85 per call, the Vulkan calls' host time 24.5 -> 13.2 ms per
   step, but the wait for the GPU 10.9 -> 21.0 ms: compute part 54.2 -> 51.6 ms, 25.9 -> 26.9 tok/s, and 27.1 with
   `GGML_VK_MAX_NODES_PER_SUBMIT=1000` too (one submit per call, what the default now does for these splits); 16 GB
   cache 24.3 -> 24.8; prompts unchanged. The host's savings became GPU waiting.
