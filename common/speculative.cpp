@@ -1649,14 +1649,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_row0.assign(n_seq, -1);
 
         // shared memory and chained heads keep the host rows
-        if (!is_mem_shared && !chain_heads) {
+        // LLAMA_MTP_DEV_ROWS=0 keeps them too: the device buffer holds a row per batch token (640 MiB at a 16k batch), which
+        // a GPU whose memory is the MoE cache's budget may need more
+        const char * env_dev_rows = getenv("LLAMA_MTP_DEV_ROWS");
+        if (!is_mem_shared && !chain_heads && (env_dev_rows == nullptr || atoi(env_dev_rows) != 0)) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_embd_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
             }
         }
-        SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
+        LOG_INF("%s: draft-mtp target h rows via %s\n", __func__, dev_rows ? "device buffer" : "host copies");
     }
 
     ~common_speculative_impl_draft_mtp() override {
