@@ -542,19 +542,24 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   of the `lru` mode. The hot spare ranks its residents with the predictor's decayed counts instead.
 - **An input prefetch in the scheduler** (`ggml_backend_sched_prefetch_inputs`): before a split runs, the inputs of the
   next split that its backend already holds are read asynchronously, and the next split waits for that read only. The
-  same idea as the fork's copy-ahead for the cache branch and its asynchronous reads. **Dropped: the fork's copy-ahead
-  and asynchronous reads.** Kept: the split boundary that puts the cache branch in a split of its own
-  (`ggml_backend_sched_set_tensor_overlap`), which the prefetch needs and cannot force, and `GGML_SCHED_TIMING`.
-  Measured, Q4: upstream's prefetch with the boundary alone 36.7 / 53.2 / 93.0 and 36.9 / 53.2 / 92.9 ms, the fork's
-  copy-ahead and asynchronous reads 36.5 / 52.7 / 92.9 and 36.7 / 53.3 / 92.2; Q6: 46.7 / 73.1 / 125.6 and 46.8 / 72.5 /
-  124.3 against 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0. The 48 overlap boundaries a graph are unchanged.
+  same idea as the fork's copy-ahead for the cache branch. **Dropped: the fork's copy-ahead.** Kept: the split boundary
+  that puts the cache branch in a split of its own (`ggml_backend_sched_set_tensor_overlap`), which the prefetch needs
+  and cannot force, `GGML_SCHED_TIMING`, and **the queued asynchronous reads** for the inputs the prefetch does not cover
+  (those the split just before computed): read synchronously they go through Vulkan's transfer queue, behind the hot
+  spare's expert uploads, and wait for them, which took the MTP draft head from 5.6 to 12.9 ms a pass (Q4, 2 drafts) and
+  a pass from 63.6 to 71.3 ms end to end; the asynchronous reads stay on the compute queue. Measured on the verify
+  batches (no draft head), Q4: upstream's prefetch with the boundary alone 36.7 / 53.2 / 93.0 and 36.9 / 53.2 / 92.9 ms,
+  the fork's copy-ahead and asynchronous reads 36.5 / 52.7 / 92.9 and 36.7 / 53.3 / 92.2; Q6: 46.7 / 73.1 / 125.6 and
+  46.8 / 72.5 / 124.3 against 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0. The 48 overlap boundaries a graph are unchanged.
 - **A floor for the Vulkan submit size** (`dcbb09167`): graphs under 1 GFLOP are submitted once, larger ones every 1/40 of
-  the previous graph's flops within [100 MFLOP, cap]. **Dropped: `GGML_VK_FLOPS_PER_SUBMIT` and the fork's one-submit rule
-  for graphs within the node limit.** Measured against the fork's 100M setting: Q4 36.8 / 52.6 / 93.1 and 37.1 / 53.2 /
-  93.5 against 36.9 / 53.7 / 92.1 and 36.7 / 52.9 / 96.0; Q6 46.7 / 72.4 / 125.1 and 46.7 / 72.6 / 128.6 against 46.9 /
-  72.2 / 125.4 and 47.0 / 72.9 / 126.0. Today's polaris without the setting (its 1/40 rule) was 38.1 / 54.0 / 95.2 and
-  37.7 / 53.8 / 94.9, so upstream's new floor is what the setting gave. The tuning script's `submits` stage is skipped on
-  such builds.
+  the previous graph's flops within [100 MFLOP, cap]. **Dropped: `GGML_VK_FLOPS_PER_SUBMIT`.** Measured against the
+  fork's 100M setting: Q4 36.8 / 52.6 / 93.1 and 37.1 / 53.2 / 93.5 against 36.9 / 53.7 / 92.1 and 36.7 / 52.9 / 96.0;
+  Q6 46.7 / 72.4 / 125.1 and 46.7 / 72.6 / 128.6 against 46.9 / 72.2 / 125.4 and 47.0 / 72.9 / 126.0. Today's polaris
+  without the setting (its 1/40 rule) was 38.1 / 54.0 / 95.2 and 37.7 / 53.8 / 94.9, so upstream's new floor is what the
+  setting gave. **Kept: the fork's one-submit rule for graphs within the node limit** (`GGML_VK_MAX_NODES_PER_SUBMIT`,
+  100): a layer's GPU graph at 3 tokens is around 1 GFLOP, so upstream's rule cuts it into 100 MFLOP submits where the
+  rule submits it once; without it 37.0 / 55.4 / 95.1 and 36.8 / 55.4 / 98.3, with it 36.8 / 52.9 / 93.0 and 37.3 / 53.1 /
+  93.9. The tuning script's `submits` stage is skipped on such builds.
 - **split_k for small batches on RDNA3 and RDNA4** (`07ec7c8af`, `da3416d80`): k >= 2048 and n <= 32 aim for eight
   workgroups a CU. **Dropped: `GGML_VK_SPLIT_K_SMALL_N`**, the fork's version for any GPU and any n below a tile; on the
   R9700 it had measured 273 / 339 / 427 → 168 / 218 / 275 ms for batches of 9 / 16 / 24 tokens, and upstream's covers the
