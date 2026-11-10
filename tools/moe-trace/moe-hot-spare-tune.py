@@ -963,6 +963,7 @@ class Tuner:
         def past(v, up):
             if step == "+1":
                 return v + 1 if up else v - 1
+            assert isinstance(step, (int, float))  # a factor; "+1" is handled above and the mib stage, whose step is None, returned earlier
             i = vals.index(v)
             nb = vals[i - 1] if up and i > 0 else vals[i + 1] if not up and i + 1 < len(vals) else None
             k = max(step, round(v / nb if up else nb / v)) if nb else step  # the list's own spacing, at least the step
