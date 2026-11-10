@@ -185,7 +185,7 @@ with both against without (two passes each):
 By verify batch size (`llama-moe-logit-drift`, 1/3/8 tokens), `GGML_CPU_MMID_FLAT` 128 was the best of 64–512 (512 was
 7–16% slower), and the spin was worth as much as `OMP_WAIT_POLICY=active`, which spins forever. The chunks don't suit every
 CPU: on the 14600KF + RTX 4070 Ti (6 performance and 8 efficiency cores, 10 threads), Qwen3-Coder-30B-A3B entirely on
-the CPU wrote the same text at 6.36 tok/s with 128 against 7.07 without (one run each). `moe-cache-tune.py`'s
+the CPU wrote the same text at 6.36 tok/s with 128 against 7.07 without (one run each). `moe-hot-spare-tune.py`'s
 `cpu-chunks` stage keeps them off where they lose. `GGML_CPU_OP_STATS=1` prints, per batch size at exit, each CPU op's
 wall time, its threads' work and the time before they start, and MUL_MAT_ID's experts and GB/s by weight type.
 
@@ -229,7 +229,7 @@ saved 8 ms of recording but the GPU started 10 ms later, 2–3% slower. A fixed 
 | Q6_K_XL, 100M | 33.01 (+1.2%) | 31.85 (+1.7%) |
 
 Hit rates and text were unchanged. The best target depends on how fast the CPU records against how fast the GPU runs;
-`moe-cache-tune.py` tries 25M and 100M.
+`moe-hot-spare-tune.py` tries 25M and 100M.
 
 With asynchronous reads and the overlap, the host blocks on the GPU once a layer, for the main split's end and the CPU
 split's reads; a blocking wait returns through an interrupt and the scheduler. `GGML_VK_SPIN_WAIT=N` polls the
@@ -259,11 +259,12 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: asynchronous reads into memory not pinned for the device use a staging ring and copy at synchronization | all Vulkan GPUs, including the logits reads | none |
 | Vulkan: the matrix-vector MUL_MAT_ID shaders skip slots with id -1 | all Vulkan GPUs, one check per workgroup | none |
 | Vulkan: fused f32 adds no longer need `shaderRoundingModeRTEFloat16` | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
-| Vulkan: split_k also for a matrix multiplication with fewer columns than a tile (9-31 tokens), not only from a whole tile | all Vulkan GPUs | `GGML_VK_SPLIT_K_SMALL_N=0` |
 | Vulkan: a mat-vec MUL_MAT followed by SCALE and SiLU or sigmoid runs as one dispatch, the two in its store (`moe-tuning`) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1` |
 
 On the 14600KF + RTX 4070 Ti, a model with its experts on the CPU and no cache generated 29.2 instead of 26.6 tok/s
 with the first four.
+The branch also had split_k for matrix multiplications with fewer columns than a tile (9-31 tokens) on every GPU; upstream
+added its own (RDNA3 and RDNA4, k >= 2048 and n <= 32, 2026-11), which covers the R9700, and ours is gone with it.
 
 The split_k change: a 4x10240 f32 weight times 9-31 tokens ran on one workgroup (0.9-1.1 ms on the R9700, against 0.15
 ms at 32 tokens split 8 ways), about 90 ms of a 9-24 token batch of Flash-Next; batches of 9, 16 and 24 tokens (short
@@ -603,7 +604,6 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `GGML_CPU_MMID_FFN=1` | with `GGML_CPU_MMID_GLU=1`: down joins the op, without a barrier between the halves ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
 | `GGML_CPU_MMID_GLU=1` | with `GGML_CPU_MMID_FLAT`, up to 8 tokens: the CPU's MUL_MAT_ID of gate and up and their SWIGLU in one op ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
 | `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the 1920X + R9700 ([The CPU's experts](#the-cpus-experts)) |
-| `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the 1920X + R9700) |
 | `GGML_VK_SPIN_WAIT=N` | Vulkan: when the host synchronizes an event, poll its semaphore for up to N µs before blocking ([Vulkan submits](#vulkan-submits)) |
 | `LLAMA_GRAPH_CACHE=N` | a scheduler and graph of its own for each of up to N small batch lengths (`LLAMA_GRAPH_CACHE_TOKENS`, 16), so a verify batch of another length than the last one reuses its graph instead of rebuilding and reallocating it ([Graphs by batch length](#graphs-by-batch-length)) |
@@ -644,7 +644,7 @@ with `--moe-cache-jit` its uploads, and with `LLAMA_OFFLOAD_FAST=1` the fast cop
 ### Tuning
 
 **Finding the settings for your machine.** The numbers in this guide come from a few machines, and the best settings
-depend on the CPU, the link and the model. `tools/moe-trace/moe-cache-tune.py` searches them with real runs in stages,
+depend on the CPU, the link and the model. `tools/moe-trace/moe-hot-spare-tune.py` searches them with real runs in stages,
 within a time budget, and writes a results file you can share. It covers the cache's settings (predictor, refill,
 answer cap, budget, size, `--moe-cache-jit`, copy threads), the MTP drafts, and the CPU and Vulkan settings above
 (`GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `GGML_VK_FLOPS_PER_SUBMIT`, `-t`). What each stage does and what it picked on
