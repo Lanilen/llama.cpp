@@ -111,9 +111,13 @@ overrides `LLAMA_MOE_PREDICTOR_ANSWER_CAP`.
 ### The two branches at the same time
 
 On its own, the scheduler would run the cache branch together with the layer's attention, and the CPU's input copy would
-wait for both. The cache branch is marked as an overlapping split: the scheduler records an event after the attention,
-launches the cache branch at once, and the CPU's input copy waits for that event only. The CPU computes its experts while
-the GPU computes the resident ones (`GGML_SCHED_OVERLAP=0` turns this off).
+wait for both. The cache branch is marked as a split of its own (`ggml_backend_sched_set_tensor_overlap`): upstream's
+scheduler then reads the CPU split's inputs before the cache branch is launched (its input prefetch, 2026-11), and the
+CPU computes its experts while the GPU computes the resident ones (`GGML_SCHED_OVERLAP=0` turns the boundary off).
+Until the merge of 2026-11-10 the fork copied those inputs ahead itself, with an event after the attention, and queued
+every split's reads into host memory as asynchronous reads waited for once per GPU (about 140 us a read on the RX 480's
+driver, 49 a token, before that); upstream's prefetch measured the same on the 1920X + R9700 (Flash-Next Q4 verify
+batches of 1 / 3 / 8 tokens, two passes: 36.7 / 53.3 / 92.9 ms against 36.7 / 53.3 / 92.2), so both went.
 
 The cache branch is short (about 80 us a layer for a 3-token verify of Flash-Next on the R9700, against about 500 us of CPU
 experts), so the GPU mostly waits for the CPU. A model can give `build_moe_ffn` tensors that read the MoE's input but not
@@ -126,11 +130,8 @@ and their inputs don't change, so neither do the logits (`LLAMA_MOE_SIDE=0` turn
 
 ### Faster copies to the CPU
 
-Every split that runs on the CPU first reads its inputs from the GPUs. These reads were synchronous, a submission and a
-fence wait each, about 140 us on the RX 480's driver, 49 times per token. The scheduler now queues them as asynchronous
-reads and waits once per GPU; with the overlap, the reads are queued before the event, so the event wait delivers them.
-On Vulkan, an asynchronous read into memory that is not pinned for that GPU now gets its own part of a staging ring, and its
-copy runs when the GPU or the event is synchronized (`GGML_SCHED_ASYNC_READS=0` restores the synchronous reads).
+On Vulkan, an asynchronous read into memory that is not pinned for that GPU gets its own part of a staging ring, and its
+copy runs when the GPU or the event is synchronized; the prefetch's reads go through it.
 
 ### Prompts: `--moe-cache-resize`
 
@@ -228,7 +229,6 @@ These change behaviour for every model and GPU, with or without the cache:
 
 | Change | Applies to | Switch |
 | --- | --- | --- |
-| The scheduler queues the reads of split inputs into host memory and waits once per backend | every backend with asynchronous reads (Vulkan, CUDA, ...) | `GGML_SCHED_ASYNC_READS=0` |
 | Vulkan: asynchronous reads into memory not pinned for the device use a staging ring and copy at synchronization | all Vulkan GPUs, including the logits reads | none |
 | Vulkan: the matrix-vector MUL_MAT_ID shaders skip slots with id -1 | all Vulkan GPUs, one check per workgroup | none |
 | Vulkan: fused f32 adds no longer need `shaderRoundingModeRTEFloat16` | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
@@ -319,8 +319,7 @@ The refill moves up to the whole cache in one step, and the generation waits for
 
 | Variable | Effect |
 | --- | --- |
-| `GGML_SCHED_OVERLAP=0` | the cache branch no longer runs while the CPU computes the misses |
-| `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU are synchronous reads again |
+| `GGML_SCHED_OVERLAP=0` | the cache branch is not a split of its own, so it no longer runs while the CPU computes the misses |
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
 | `LLAMA_MOE_CACHE_BG=0` | expert uploads on the compute queue instead of in the background |
 | `LLAMA_MOE_CACHE_ASYNC=0` | expert copies to the staging memory on the generation thread |
@@ -528,8 +527,8 @@ here), and the matmul+add patterns do not occur in this model's graph.
 ## Measured
 
 Greedy decoding of one coding prompt, 256 tokens, and a 5-turn coding session with `session-bench.py` (a 9.6k-token
-paste of a source file, then four turns of up to 1024 tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes (overlapping
-splits, asynchronous reads), which also speed up a model with its experts on the CPU and no cache.
+paste of a source file, then four turns of up to 1024 tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes of the time (overlapping
+splits, asynchronous reads), which also sped up a model with its experts on the CPU and no cache.
 
 | Machine | Setup | tok/s |
 | --- | --- | --- |
