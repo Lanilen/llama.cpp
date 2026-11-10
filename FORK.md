@@ -578,7 +578,20 @@ with real runs. Upstream's cache is documented in [docs/moe-cache.md](docs/moe-c
 1 identical on both quants (Q4 39 flips, KL 0.0414; Q6 41, 0.0433), round 3 within the placement noise (Q4 54 flips,
 KL 0.080 against polaris's own 56, 0.069; Q6 52, 0.079 against 47, 0.080).
 
-**Upstream's cache against the hot spare at the same memory:** CACHE_RESULT_PENDING
+**Upstream's cache against the hot spare at the same memory.** Both in this tree, 20900 MiB on the R9700, the experts
+of all 49 layers in host memory, upstream's `scripts/moe-cache-tune.py` picking its CPU share (six server runs a quant,
+`-b 1024 -ub 1024`, its own prompt): Q4 `--moe-cache-cpu-share 0.9` (its measure 24.7 tok/s at 1-token passes, 21.2 at
+share 0), Q6 `0.95` (22.1, 12.8). Verify batches of 1 / 3 / 8 tokens at 1024 tokens of context, the hot spare with the
+production settings (predictor, jit, resize):
+
+| | hot spare | upstream's cache, its tuner's share | upstream's cache, share 0 |
+|---|---|---|---|
+| Q4_K_XL | 37.1 / 55.6 / 98.2 ms | 49.5 / 72.1 / 117.8 (1.34 / 1.30 / 1.20× slower) | 75.1 / 162.5 / 332.2 |
+| Q6_K_XL | 47.1 / 75.3 / 131.3 ms | 58.7 / 88.5 / 150.7 (1.25 / 1.18 / 1.15× slower) | 112.6 / 282.3 / 635.1 |
+
+The hot spare stays. Upstream's CPU share closes most of the gap to the plain cache (a share of 0.9-0.95 means the CPU
+computes nearly every miss, which is the hot spare's design with a different ranking of the residents), and the rest is
+the predictor's residency and the jit slots. Its cache remains available as `--moe-cache-mode lru`.
 
 ## Still to measure
 
