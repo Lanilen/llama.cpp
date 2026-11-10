@@ -900,6 +900,10 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 }
 
 static bool vk_host_timing_enabled = getenv("GGML_VK_HOST_TIMING") != nullptr;
+// GGML_VK_SPIN_WAIT=N: when the host synchronizes an event, poll its semaphore for up to N us before blocking on it. A
+// blocking wait returns through an interrupt and the scheduler, tens of us after the device is done; a model split
+// between the device and the CPU waits like that once a layer.
+static const int64_t vk_spin_wait_us = getenv("GGML_VK_SPIN_WAIT") ? atoll(getenv("GGML_VK_SPIN_WAIT")) : 0;
 // spin this long at each graph_compute: if a pass slows by all of it, host time on the Vulkan side is on its critical path
 static const int64_t vk_host_delay_us = getenv("GGML_VK_HOST_DELAY_US") ? atoll(getenv("GGML_VK_HOST_DELAY_US")) : 0;
 // with background uploads, async writes smaller than this go through the compute queue, so they don't wait behind the uploads on the transfer queue
@@ -16951,7 +16955,26 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
-        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+        bool done = false;
+        if (vk_spin_wait_us > 0) {
+            const int64_t t0 = ggml_time_us();
+            for (;;) {
+                const vk::Result r = device->device.waitSemaphores(swi, 0);
+                if (r == vk::Result::eSuccess) {
+                    done = true;
+                    break;
+                }
+                if (r != vk::Result::eTimeout || ggml_time_us() - t0 > vk_spin_wait_us) {
+                    break;  // an error surfaces in the blocking wait below
+                }
+                for (uint32_t i = 0; i < 8; ++i) {
+                    YIELD();
+                }
+            }
+        }
+        if (!done) {
+            VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+        }
 
         for (auto & cpys : vkev->out_memcpys) {
             for (auto & cpy : *cpys) {
