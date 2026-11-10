@@ -1570,6 +1570,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
+    // LLAMA_SPEC_TIMING=1: host time of the head's steps, averages per call at exit
+    struct timing {
+        bool    enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+        int64_t n_process = 0, n_draft = 0, n_draft_decode = 0;
+        int64_t t_batch = 0, t_catchup = 0, t_rows = 0, t_draft = 0, t_draft_decode = 0;
+        int64_t now() const { return enabled ? ggml_time_us() : 0; }
+    } tm;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1663,6 +1671,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (tm.enabled && tm.n_process > 0) {
+            LOG_INF("draft-mtp timing: process %" PRId64 " calls: ms batch %.3f catch-up decode %.3f target rows %.3f; draft %" PRId64 " calls: ms %.3f, of which decodes %.3f (%.2f a call)\n",
+                    tm.n_process, tm.t_batch/1e3/tm.n_process, tm.t_catchup/1e3/tm.n_process, tm.t_rows/1e3/tm.n_process,
+                    tm.n_draft, tm.n_draft > 0 ? tm.t_draft/1e3/tm.n_draft : 0.0, tm.n_draft > 0 ? tm.t_draft_decode/1e3/tm.n_draft : 0.0,
+                    tm.n_draft > 0 ? (double) tm.n_draft_decode/tm.n_draft : 0.0);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         if (dev_rows) {
             llama_set_embd_state_src(ctx_dft, nullptr);
@@ -1711,6 +1725,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.size();
+
+        const int64_t t0 = tm.now();
+        int64_t t1 = t0;
+        int64_t t2 = t0;
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -1777,6 +1795,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
+            t1 = tm.now();
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
@@ -1802,6 +1821,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            t2 = tm.now();
             if (!ok) {
                 return false;
             }
@@ -1845,10 +1865,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (h_rows - 1) * n_embd, row_bytes);
         }
 
+        if (tm.enabled) {
+            tm.n_process++;
+            tm.t_batch   += t1 - t0;
+            tm.t_catchup += t2 - t1;
+            tm.t_rows    += tm.now() - t2;
+        }
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        const int64_t td0 = tm.now();
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -1910,7 +1937,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t tdd = tm.now();
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (tm.enabled) {
+                tm.t_draft_decode += tm.now() - tdd;
+                tm.n_draft_decode++;
+            }
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2011,6 +2043,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+        }
+        if (tm.enabled) {
+            tm.n_draft++;
+            tm.t_draft += tm.now() - td0;
         }
     }
 
