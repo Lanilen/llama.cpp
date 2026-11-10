@@ -231,6 +231,12 @@ saved 8 ms of recording but the GPU started 10 ms later, 2–3% slower. A fixed 
 Hit rates and text were unchanged. The best target depends on how fast the CPU records against how fast the GPU runs;
 `moe-cache-tune.py` tries 25M and 100M.
 
+With asynchronous reads and the overlap, the host blocks on the GPU once a layer, for the main split's end and the CPU
+split's reads; a blocking wait returns through an interrupt and the scheduler. `GGML_VK_SPIN_WAIT=N` polls the
+semaphore for up to N µs before blocking. On the 1920X + R9700 with N = 2000, Flash-Next Q4 verify batches of 1 / 3 / 8
+tokens were 1.3 / 1.4 / 0.9% faster without the fused expert FFN and 1.7 / 1.1 / 2.6% faster with it, every pair of
+two in its favour: about 10 µs a layer, the wake-up of that one wait.
+
 ### Changes that apply without any option
 
 These change behaviour for every model and GPU, with or without the cache:
@@ -587,6 +593,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the 1920X + R9700 ([The CPU's experts](#the-cpus-experts)) |
 | `GGML_VK_SPLIT_K_SMALL_N=0` | Vulkan: split_k only from a whole tile of columns, as upstream |
 | `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops ([Vulkan submits](#vulkan-submits); 100000000 on the 1920X + R9700) |
+| `GGML_VK_SPIN_WAIT=N` | Vulkan: when the host synchronizes an event, poll its semaphore for up to N µs before blocking ([Vulkan submits](#vulkan-submits)) |
 | `GGML_VK_ASYNC_TRANSFER_MIN=N` | Vulkan, with the cache's background uploads: asynchronous writes smaller than N bytes go through the compute queue, so they don't wait behind the uploads on the transfer queue; larger ones stay there (default 1048576) |
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
 | `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid in the mat-vec's store |
