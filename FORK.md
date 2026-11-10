@@ -39,6 +39,7 @@ generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's t
 - [Build](#build)
 - [Setups](#setups)
 - [Tried and not kept](#tried-and-not-kept)
+- [Upstream since 2026-10-29](#upstream-since-2026-10-29)
 - [Still to measure](#still-to-measure)
 - [How it was made](#how-it-was-made)
 
@@ -49,7 +50,7 @@ generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's t
 | `polaris` | everything, the one to use | this file |
 | [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan support for the sparse-attention ops on GPUs without fp16 | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
 | [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | the hot spare cache, `--moe-cache-resize` and `--moe-cache-batch`, the scheduler and Vulkan changes for models with experts on the CPU (overlapping splits, asynchronous reads, fused adds, the submit size), trace tools | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
-| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus the expert predictor and its training pipeline, `--moe-cache-jit`, the cache fit shared with a draft context, the work beside the MoE, split_k for small batches, the tuning script with the cache's and the drafts' stages | [docs/moe-predictor.md](docs/moe-predictor.md) |
+| [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus the expert predictor and its training pipeline, `--moe-cache-jit`, the cache fit shared with a draft context, the work beside the MoE, the tuning script with the cache's and the drafts' stages | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`moe-tuning`](https://github.com/Lanilen/llama.cpp/tree/moe-tuning) | `moe-predictor` plus the CPU's expert chunks and op counters, the mat-vec store fusion, the split of large prompts, the shared jit slots and the fast expert copies, and the tuning script's CPU and Vulkan stages | [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts), [tools/moe-trace](tools/moe-trace/README.md#tuning-a-machine) |
 | [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4, **work in progress, stable** | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
 | `master` | upstream, unchanged | |
@@ -166,7 +167,6 @@ apply to any such model, with or without the cache:
   memory that isn't pinned goes through a staging ring.
 - **MUL_MAT_ID skips unused slots** (id -1), which both cache branches rely on.
 - **Fused f32 adds without fp16 rounding modes**, so GPUs such as the RX 480 get them.
-- **split_k for 9–31 columns**, not only from a whole tile.
 - **A fused MUL_MAT → SCALE → SiLU/sigmoid** in the mat-vec's store: Flash-Next's hyper-connection products, 97 a pass.
 - **A fixed Vulkan submit size** (`GGML_VK_FLOPS_PER_SUBMIT`, opt-in). The default cuts a split's work at 1/40 of the
   previous graph's flops. Layer splits alternate large and small, so the cut lands far too fine: 5.4 submits of about
@@ -182,8 +182,6 @@ apply to any such model, with or without the cache:
 **Measured:**
 - Overlap and asynchronous reads, RTX 4070 Ti with the experts on the CPU and no cache: 26.6 → 29.2 tok/s.
 - Fused adds on the RX 480s: 14.44 → 14.57 tok/s.
-- split_k, R9700, Flash-Next Q4 batches of 9, 16 and 24 tokens (short prompts, tool outputs): 273, 339 and 427 →
-  168, 218 and 275 ms.
 - The mat-vec store fusion: the same logits, and within noise at the settings below. With the GPU's work exposed (one
   submit per split), it's worth 1.5–2.7%.
 - `GGML_VK_FLOPS_PER_SUBMIT=100000000` on the R9700, end to end: Q4 answers 40.25 → 41.07 tok/s (+2.0%) and agent
@@ -286,19 +284,19 @@ In `tools/moe-trace` ([README](tools/moe-trace/README.md)) and `tools/moe-predic
 - `llama-moe-logit-drift`: the logits of one answer read again in other batch sizes or placements, and timings of
   verify passes and prompt batches;
 - `llama-mv-merge-bench`: what stacking mat-vecs that read the same input would save;
-- `moe-cache-tune.py`: the search for a machine's settings ([Tuning a machine](#tuning-a-machine));
+- `moe-hot-spare-tune.py`: the search for a machine's settings ([Tuning a machine](#tuning-a-machine));
 - `tools/moe-predictor`: the predictor's training pipeline.
 
 ## Tuning a machine
 
 The settings in [Setups](#setups) were picked for one machine, and most of them depend on the hardware: how fast the
 link uploads, how fast the CPU reads its experts, how the GPU keeps up with the recording.
-[`tools/moe-trace/moe-cache-tune.py`](tools/moe-trace/README.md#tuning-a-machine) searches them for yours with real
+[`tools/moe-trace/moe-hot-spare-tune.py`](tools/moe-trace/README.md#tuning-a-machine) searches them for yours with real
 runs, and writes a results file you can share. It's on `moe-tuning` with all its stages (on `moe-predictor` with the
 cache's and the drafts' only):
 
 ```bash
-python3 tools/moe-trace/moe-cache-tune.py --server build-vk/bin/llama-server -m model.gguf --mib 8000 --out tune \
+python3 tools/moe-trace/moe-hot-spare-tune.py --server build-vk/bin/llama-server -m model.gguf --mib 8000 --out tune \
     --predictor pred.gguf --draft-model mtp.gguf --hours 6 \
     -- -c 65536 -ngl 99 --cpu-moe -t 12 -ub 8192 -b 8192 --moe-cache-resize --moe-cache-batch 0
 ```
