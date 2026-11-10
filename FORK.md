@@ -171,6 +171,9 @@ apply to any such model, with or without the cache:
 - **A fixed Vulkan submit size** (`GGML_VK_FLOPS_PER_SUBMIT`, opt-in). The default cuts a split's work at 1/40 of the
   previous graph's flops. Layer splits alternate large and small, so the cut lands far too fine: 5.4 submits of about
   20 µs per split.
+- **Polling the GPU instead of sleeping** (`GGML_VK_SPIN_WAIT=N`, opt-in): a split model's host blocks on the GPU once
+  a layer, and a blocking wait returns through an interrupt and the scheduler; with this the host polls the semaphore
+  for up to N µs first.
 
 **Measured:**
 - Overlap and asynchronous reads, RTX 4070 Ti with the experts on the CPU and no cache: 26.6 → 29.2 tok/s.
@@ -181,6 +184,9 @@ apply to any such model, with or without the cache:
   submit per split), it's worth 1.5–2.7%.
 - `GGML_VK_FLOPS_PER_SUBMIT=100000000` on the R9700, end to end: Q4 answers 40.25 → 41.07 tok/s (+2.0%) and agent
   turns +1.8%; Q6 32.62 → 33.01 (+1.2%) and agent turns +1.7%.
+- `GGML_VK_SPIN_WAIT=2000` on the R9700, Flash-Next Q4 verify batches of 1 / 3 / 8 tokens: −1.3 / −1.4 / −0.9% without
+  the fused expert FFN and −1.7 / −1.1 / −2.6% with it, every pair of two in its favour: about 10 µs a layer, the wake-up
+  of the one blocking wait a layer.
 
 ### The expert predictor
 
