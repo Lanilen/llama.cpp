@@ -4444,6 +4444,12 @@ vk_device ggml_vk_get_device(size_t idx) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
         }
+        // GGML_VK_FLOPS_PER_SUBMIT: fixed flops between submits for every graph, instead of the rules below, 0 = none
+        device->flops_per_submit_override = -1;
+        const char* GGML_VK_FLOPS_PER_SUBMIT = getenv("GGML_VK_FLOPS_PER_SUBMIT");
+        if (GGML_VK_FLOPS_PER_SUBMIT != nullptr) {
+            device->flops_per_submit_override = std::stoll(GGML_VK_FLOPS_PER_SUBMIT);
+        }
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -14905,6 +14911,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // submits each (~18 us on RADV) for a GPU that waited for the host anyway
     if (cgraph->n_nodes <= (int) ctx->device->max_nodes_per_submit) {
         flops_per_submit = 0;
+    }
+    // a fixed size for every graph, the small ones included: on a 1920X + R9700 100 MFLOP submits of the ~1 GFLOP layer
+    // graphs of a 3-token batch overlap their recording with the GPU (the CPU side of a hot-spare MoE layer waits
+    // for the GPU 7 ms less a graph than with one submit each)
+    if (ctx->device->flops_per_submit_override >= 0) {
+        flops_per_submit = (uint64_t) ctx->device->flops_per_submit_override;
     }
 
     auto const submit_after = [&](int start, int end) {
