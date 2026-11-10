@@ -201,7 +201,7 @@ the confirm stage measures everything the search found.
 | --- | --- | --- |
 | `omp-spin` | `--spin-counts 30000000` against not set (`GOMP_SPINCOUNT`) | GCC's OpenMP spins ~1 ms before its threads sleep, about the gap between two layers' CPU work. Only with a build that links libgomp. |
 | `cpu-chunks` | `--cpu-chunks 64,128,256` against not set (`GGML_CPU_MMID_FLAT`) | How the CPU's experts are cut between its threads; depends on the memory system. |
-| `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan device. |
+| `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan build that has the switch; since 2026-11-10 upstream's own rule does this and the stage is skipped. |
 | `predictor` | none, `--moe-cache-predictor`, also `--moe-cache-predictor-start` | The largest effect of the cache's settings. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
 | `refill` | `--refills 0,64,128` | Tested at the predictor setting just chosen. |
 | `answer-cap` | `--answer-cap-shares 0.075,0.15,0.3` of the cache's slots, against 0, all (`--moe-cache-predictor-answer-cap`) | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. The slots come from the warm-up's log, so the caps scale with the cache (500, 1000 and 2000 swaps of 6731 slots on the 1920X + R9700); `--answer-caps` gives swap counts instead. |

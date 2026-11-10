@@ -209,10 +209,10 @@ and the same.
 
 ### Vulkan submits
 
-The Vulkan backend submits a graph's work in pieces so that the GPU starts while the rest is recorded. By default it
-cuts at 1/40 of the previous graph's flops (doubling for the first three submits). With the experts on the CPU a pass is
-many splits that alternate large and small, so a large split is cut by a small one's measure: on Flash-Next, 5.4
-submits of ~20 µs each per split. `GGML_VK_FLOPS_PER_SUBMIT=N` sets a fixed target instead (0 = not by flops).
+The Vulkan backend submits a graph's work in pieces so that the GPU starts while the rest is recorded. Until 2026-11
+it cut at 1/40 of the previous graph's flops (doubling for the first three submits). With the experts on the CPU a pass
+is many splits that alternate large and small, so a large split was cut by a small one's measure: on Flash-Next, 5.4
+submits of ~20 µs each per split. This fork had `GGML_VK_FLOPS_PER_SUBMIT=N` for a fixed target instead.
 
 On the 1920X + R9700, a 3-token verify pass of Q4 was 21.1 ms of recording and submitting, 2.1 ms of copies, 5.1 ms
 waiting for the GPU and 20.9 ms of CPU experts (`GGML_SCHED_TIMING=1`, `GGML_VK_HOST_TIMING=1`). One submit per split
@@ -228,8 +228,10 @@ saved 8 ms of recording but the GPU started 10 ms later, 2–3% slower. A fixed 
 | Q6_K_XL, 25M | 32.78 (+0.5%) | 31.60 (+0.9%) |
 | Q6_K_XL, 100M | 33.01 (+1.2%) | 31.85 (+1.7%) |
 
-Hit rates and text were unchanged. The best target depends on how fast the CPU records against how fast the GPU runs;
-`moe-hot-spare-tune.py` tries 25M and 100M.
+Hit rates and text were unchanged. Upstream then changed its rule (2026-11): a graph under 1 GFLOP is submitted once,
+the others are cut at 1/40 of the previous graph's flops but at least every 100 MFLOP. Against the fixed 100M target on
+the same machine (Flash-Next Q4 and Q6, verify batches of 1 / 3 / 8 tokens, two passes each) it was within noise in all
+twelve pairs, so the fork's switch is gone, and `moe-hot-spare-tune.py` skips its `submits` stage on such a build.
 
 With asynchronous reads and the overlap, the host blocks on the GPU once a layer, for the main split's end and the CPU
 split's reads; a blocking wait returns through an interrupt and the scheduler. `GGML_VK_SPIN_WAIT=N` polls the
@@ -646,7 +648,7 @@ with `--moe-cache-jit` its uploads, and with `LLAMA_OFFLOAD_FAST=1` the fast cop
 depend on the CPU, the link and the model. `tools/moe-trace/moe-hot-spare-tune.py` searches them with real runs in stages,
 within a time budget, and writes a results file you can share. It covers the cache's settings (predictor, refill,
 answer cap, budget, size, `--moe-cache-jit`, copy threads), the MTP drafts, and the CPU and Vulkan settings above
-(`GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `GGML_VK_FLOPS_PER_SUBMIT`, `-t`). What each stage does and what it picked on
+(`GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `-t`). What each stage does and what it picked on
 the 1920X + R9700: [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine); the method
 and options: [tools/moe-trace](../tools/moe-trace/README.md#tuning-a-machine).
 
