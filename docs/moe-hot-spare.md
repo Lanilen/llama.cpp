@@ -342,7 +342,6 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
-| `GGML_VK_FLOPS_PER_SUBMIT=N` | Vulkan: submit work every N flops instead of the estimate from the previous graph, 0 = not by flops |
 | `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
 | `GGML_VK_PERF_LOGGER_NODES=1` | Vulkan: the perf logger also keys each timing by the node and its sources' names; `ggml_backend_vk_perf_mark(label)` (proc address) labels the timings from then on, for `llama-moe-logit-drift`'s `LLAMA_DRIFT_PROFILE` |
 | `GGML_VK_DISABLE_MULTI_ADD=1` | Vulkan (upstream): no fused adds |
