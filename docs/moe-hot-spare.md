@@ -234,9 +234,13 @@ saved 8 ms of recording but the GPU started 10 ms later, 2–3% slower. A fixed 
 | Q6_K_XL, 100M | 33.01 (+1.2%) | 31.85 (+1.7%) |
 
 Hit rates and text were unchanged. Upstream then changed its rule (2026-11): a graph under 1 GFLOP is submitted once,
-the others are cut at 1/40 of the previous graph's flops but at least every 100 MFLOP. Against the fixed 100M target on
-the same machine (Flash-Next Q4 and Q6, verify batches of 1 / 3 / 8 tokens, two passes each) it was within noise in all
-twelve pairs, so the fork's switch is gone, and `moe-hot-spare-tune.py` skips its `submits` stage on such a build.
+the others are cut at 1/40 of the previous graph's flops but at least every 100 MFLOP. Against the fixed 100M target
+it first seemed to tie, but those runs had the setting after all (the scripts unset it before the machine's environment
+set it again). Really without it, Flash-Next Q4 verify batches of 1 / 3 / 8 tokens took 36.7 / 55.5 / 97.2 ms against
+37.5 / 53.1 / 93.6 with it (two passes each, 4% at 3 and 8 tokens): a layer graph of ~1 GFLOP at 3 tokens recorded as
+one submit keeps the GPU idle while it is recorded, and in the server the CPU side of a layer waited for the GPU 14 ms a
+verify graph instead of 7. So the switch stays; unset, upstream's rule applies, and `moe-hot-spare-tune.py` sweeps the
+`submits` stage on builds that have the switch.
 
 With asynchronous reads and the overlap, the host blocks on the GPU once a layer, for the main split's end and the CPU
 split's reads; a blocking wait returns through an interrupt and the scheduler. `GGML_VK_SPIN_WAIT=N` polls the
@@ -606,6 +610,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | --- | --- |
 | `GGML_SCHED_OVERLAP=0` | the cache branch is not a split of its own, so it no longer runs while the CPU computes the misses |
 | `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU that the prefetch does not cover are synchronous reads |
+| `LLAMA_MTP_DEV_ROWS=0` | the MTP draft keeps the target's h rows on the host instead of upstream's device buffer (640 MiB at `-b 16384`), see [Speculative decoding with MTP](#speculative-decoding-with-mtp) |
 | `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
 | `GGML_CPU_MMID_FLAT=C` | the CPU's MUL_MAT_ID (the missed experts) hands out the rows of all active experts in C-row chunks instead of a slice of each expert per thread, for up to 8 tokens per expert ([The CPU's experts](#the-cpus-experts); 128 on the 1920X + R9700) |
 | `GGML_CPU_MMID_FFN=1` | with `GGML_CPU_MMID_GLU=1`: down joins the op, without a barrier between the halves ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
@@ -801,6 +806,13 @@ that borrows the main model's embedding and output head). The draft context has 
   much that costs. One (`--spec-draft-n-max 1`) was best on the 1920X + RX480x2. On the 1920X + R9700, with the CPU's
   experts as in [The CPU's experts](#the-cpus-experts), three were best: 43.6 tok/s against 41.6 with two, a pass
   yielding 2.92 tokens in 67 ms against 2.44 in 59.
+- Upstream's draft-mtp keeps the target's h rows in a device buffer (a row per batch token, 640 MiB at `-b 16384`)
+  and the catch-up reads them in place; each pass it uploads the pending row and reads one back. This fork queues
+  those two transfers on the backend's compute queue (`llama_context::set_h_nextn_rows`, `get_h_nextn_rows`): as
+  synchronous transfers they went through Vulkan's transfer queue, behind the hot spare's background uploads, and on
+  the 1920X + R9700 the head took 11.7 ms a pass instead of 5.7 (Q4, 2 drafts; Q6 14.5 instead of 5.8).
+  `LLAMA_MTP_DEV_ROWS=0` keeps the rows on the host as before (head 5.3 ms). The buffer counts against the cache's
+  headroom ([Prompts](#prompts---moe-cache-resize)).
 
 ## Fusion
 
