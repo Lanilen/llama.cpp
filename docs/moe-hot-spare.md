@@ -120,10 +120,9 @@ On its own, the scheduler would run the cache branch together with the layer's a
 wait for both. The cache branch is marked as a split of its own (`ggml_backend_sched_set_tensor_overlap`): upstream's
 scheduler then reads the CPU split's inputs before the cache branch is launched (its input prefetch, 2026-11), and the
 CPU computes its experts while the GPU computes the resident ones (`GGML_SCHED_OVERLAP=0` turns the boundary off).
-Until the merge of 2026-11-10 the fork copied those inputs ahead itself, with an event after the attention, and queued
-every split's reads into host memory as asynchronous reads waited for once per GPU (about 140 us a read on the RX 480's
-driver, 49 a token, before that); upstream's prefetch measured the same on the 1920X + R9700 (Flash-Next Q4 verify
-batches of 1 / 3 / 8 tokens, two passes: 36.7 / 53.3 / 92.9 ms against 36.7 / 53.3 / 92.2), so both went.
+Until the merge of 2026-11-10 the fork copied those inputs ahead itself, with an event after the attention; upstream's
+prefetch measured the same on the 1920X + R9700 (Flash-Next Q4 verify batches of 1 / 3 / 8 tokens, two passes: 36.7 /
+53.3 / 92.9 ms against 36.7 / 53.3 / 92.2), so that went.
 
 ### Work beside the MoE
 
@@ -155,8 +154,14 @@ positions gave the same flips and the same KL with and without it.
 
 ### Faster copies to the CPU
 
-On Vulkan, an asynchronous read into memory that is not pinned for that GPU gets its own part of a staging ring, and its
-copy runs when the GPU or the event is synchronized; the prefetch's reads go through it.
+Every split that runs on the CPU first reads its inputs from the GPUs. The prefetch reads the ones an earlier split
+computed; the ones the split just before computed (an MTP head with its experts on the CPU reads the layer's output that
+way) it cannot, and a synchronous read of those goes through Vulkan's transfer queue, behind the expert uploads queued
+there, and waits for them: with the hot spare's uploads in flight that was 4-22 ms a read on the 1920X + R9700, and the
+draft head's catch-up decode took 12-15 ms a pass instead of 6. The scheduler queues such reads as asynchronous reads on
+the GPU's compute queue and waits once per GPU (`GGML_SCHED_ASYNC_READS=0` restores the synchronous reads). On Vulkan,
+an asynchronous read into memory that is not pinned for that GPU gets its own part of a staging ring, and its copy runs
+when the GPU or the event is synchronized; the prefetch's reads go through it too.
 
 ### The CPU's experts
 
@@ -257,6 +262,7 @@ These change behaviour for every model and GPU, with or without the cache:
 
 | Change | Applies to | Switch |
 | --- | --- | --- |
+| The scheduler queues the reads of split inputs into host memory and waits once per backend, where upstream's prefetch does not cover them | every backend with asynchronous reads (Vulkan, CUDA, ...) | `GGML_SCHED_ASYNC_READS=0` |
 | Vulkan: asynchronous reads into memory not pinned for the device use a staging ring and copy at synchronization | all Vulkan GPUs, including the logits reads | none |
 | Vulkan: the matrix-vector MUL_MAT_ID shaders skip slots with id -1 | all Vulkan GPUs, one check per workgroup | none |
 | Vulkan: fused f32 adds no longer need `shaderRoundingModeRTEFloat16` | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
@@ -599,6 +605,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | Variable | Effect |
 | --- | --- |
 | `GGML_SCHED_OVERLAP=0` | the cache branch is not a split of its own, so it no longer runs while the CPU computes the misses |
+| `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU that the prefetch does not cover are synchronous reads |
 | `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
 | `GGML_CPU_MMID_FLAT=C` | the CPU's MUL_MAT_ID (the missed experts) hands out the rows of all active experts in C-row chunks instead of a slice of each expert per thread, for up to 8 tokens per expert ([The CPU's experts](#the-cpus-experts); 128 on the 1920X + R9700) |
 | `GGML_CPU_MMID_FFN=1` | with `GGML_CPU_MMID_GLU=1`: down joins the op, without a barrier between the halves ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
