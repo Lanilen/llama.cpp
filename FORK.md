@@ -579,7 +579,8 @@ session, with the drift tool's verify batches of 1 / 3 / 8 tokens at 1024 tokens
   77.4; polaris 63.0 / 78.5 the same evening). `LLAMA_MTP_DEV_ROWS=0` keeps the host rows (head 5.3 ms). Open: the
   buffer counts against the cache's headroom, and the measuring reserve of the merge's 4096-token graph takes 2178 MiB
   against 1947 (the graph's tensors are the same: 3898 nodes and 226.7 GB of tensor bytes in both builds' dumps at a
-  65536 context, and `ggml-alloc.c` is unchanged: the scheduler's splits place them differently), so the resize fit of the 1920X + R9700 is 2048 tokens instead of
+  65536 context, `ggml-alloc.c` is unchanged, and on the 14600KF + RTX 4070 Ti both builds measure the same 3334 MiB for
+  Qwen3-Coder-30B's 4096-token graph, with and without the jit: it is Flash-Next's graph at that context, placed differently), so the resize fit of the 1920X + R9700 is 2048 tokens instead of
   4096, with 57 MiB to spare before, and prompts of 2049-4096 tokens release the cache (q2k 31.9 against 32.4 tok/s).
   A slightly smaller cache (`--moe-cache-mib`, the tuner's `mib` stage) buys the 4096 fit back. The benchmark harness's
   per-request generation rate on short turns right after a long prompt reads 4-15% lower on the merge while the pass laps
