@@ -367,7 +367,12 @@ Most of this matches the settings found by hand, step by step. The search did be
 - **3 drafts, not 2:** 43.07 against 42.00 tok/s on Q4. With the CPU's experts faster, a third draft is cheap: a pass
   yields 2.92 tokens in 67 ms, against 2.44 in 59 ms.
 - **A small answer cap:** on Q6, 125 and 250 beat 500 and 1000 by 0.4–0.5 tok/s, and 62 was slower; on Q4, 250 and
-  500 tied.
+  500 tied. Compared again on the same requests with every later setting in place (2026-11-12, two passes), the caps
+  hold: against 500, a cap of 1000 moves Q4's balance by −1.1%; against 125, caps of 500 and 1000 move Q6's by +0.2%
+  and −0.4%. The cap is a trade between kinds of work. At 1000 the agent's answers are 4.8% slower on Q4 and 8.5% on
+  Q6, long answers 3.4% and 1.9% faster, and Q6's answers after a large prompt 6.0% faster; the agent's whole turns
+  don't move. Long answers with changes of topic and no agent would take a larger cap: on eleven such requests, 1000
+  made Q6's set 4.0% shorter and Q4's 1.1%, and no cap at all gained nothing.
 - **`--moe-cache-jit 8`, not off:** with the shared slots it costs generation little (Q4: 42.71 against 43.07 tok/s
   off), and the prompts gain a lot. Q4's agent prompts went from 334 to 410 tok/s and its fills from 282 to 453.
 
@@ -779,13 +784,12 @@ job, `jobs:` is empty and GitHub rejects the file. Nothing of the fork's; it end
   small-n split_k should also cover GCN (the fork's version did; see [Upstream since 2026-10-29](#upstream-since-2026-10-29)).
 - **The ladder on the 1920X + RX480x2:** [the ladder](#the-ladder) covers the R9700. The numbers of the other sections
   still come from different request sets over a month.
-- **The answer cap on the tuning set again:** on eleven requests with more changes of topic than the tuning set has,
-  two passes, a cap of 1000 instead of 125 made Q6's set 4.0% shorter and a verify step 3.9% shorter, with 75.4% of the
-  experts in the cache instead of 70.1%. On Q4, 1000 instead of 500 gave 1.1% and 2.2%. No cap at all left both sets
-  within 1% of where they were. The caps of the [setup](#1920x--r9700) were picked on the tuning set, whose agent
-  turns this set doesn't have, so they stay until the caps are compared there.
 - **The tuning script's second round in full:** in both searches it ran out of time before the answer cap, drafts and
-  budget came up again.
+  budget came up again. The answer cap has been compared by hand since ([Tuning a machine](#tuning-a-machine)); the
+  drafts and the budget haven't.
+- **An answer's start that swaps by expected gain, not by count:** the cap takes the same number of swaps at a change
+  of topic, where they pay over a long answer, and in an agent's next turn, where they cost its short answer more than
+  they give.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
