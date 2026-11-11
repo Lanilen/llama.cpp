@@ -565,11 +565,14 @@ What it shows:
 - **`--moe-cache-jit` alone reaches only the prompt that keeps the cache,** the 949-token one, which takes a third (Q4)
   and less than half (Q6) of the time. The split then brings the prompts of up to 3072 tokens to it, and the fast
   copies take 6 s (Q4) and 10 s (Q6) off the 18.6k one.
-- **The split has a price at a change of topic.** The first question about code comes right after the story, and from
-  rung 6 its 2.3k prompt keeps the cache. Its answer's step goes from 66 to 88 ms on Q4 and from 83 to 131 ms on Q6,
-  where the cache without a predictor gave 107 and 136; the next question, about more code, doesn't change (66 and 81
-  ms). The request still ends sooner (18.9 → 16.4 s, 24.2 → 19.1 s with a 128-token answer). The answer cap is the
-  likely reason and hasn't been isolated ([Still to measure](#still-to-measure)).
+- **After the split, the answer at a change of topic starts slower; the request doesn't take longer.** The first
+  question about code comes right after the story, and from rung 6 its 2.3k prompt keeps the cache. Its answer's step
+  goes from 66 to 88 ms on Q4 and from 83 to 131 ms on Q6; the next question, about more code, doesn't change (66 and
+  81 ms). A released prompt's restore loads the predictor's whole pick before the first token, and that time counts as
+  the prompt's. After a kept prompt the answer starts at once and makes at most `--moe-cache-predictor-answer-cap`
+  swaps, while it generates. Measured apart on rung 9's setup, two passes: that request takes 12.9 s kept and 13.6 s
+  released on Q4, 17.0 s and 16.3 s on Q6. A question about more code takes 9.8 s kept against 12.9 s on Q4, and 12.6 s
+  against 16.0 s on Q6.
 - **The CPU settings** shorten a step by 9.3% and 8.5%, **the Vulkan settings** by 5.6% and 3.4%, with prompts 1–3%
   slower.
 - **Rung 9 is for prompts:** the ones of 1k to 3k tokens arrive 12–27% sooner on Q4 and 10–28% on Q6, the 18.6k one 4%
@@ -776,9 +779,11 @@ job, `jobs:` is empty and GitHub rejects the file. Nothing of the fork's; it end
   small-n split_k should also cover GCN (the fork's version did; see [Upstream since 2026-10-29](#upstream-since-2026-10-29)).
 - **The ladder on the 1920X + RX480x2:** [the ladder](#the-ladder) covers the R9700. The numbers of the other sections
   still come from different request sets over a month.
-- **The answer cap after a kept prompt:** at a change of topic, the answer after a prompt that kept the cache starts
-  with a step 33% (Q4) and 58% (Q6) longer than after a released one ([the ladder](#the-ladder), rung 6). A larger cap
-  for that case hasn't been tried.
+- **The answer cap on the tuning set again:** on eleven requests with more changes of topic than the tuning set has,
+  two passes, a cap of 1000 instead of 125 made Q6's set 4.0% shorter and a verify step 3.9% shorter, with 75.4% of the
+  experts in the cache instead of 70.1%. On Q4, 1000 instead of 500 gave 1.1% and 2.2%. No cap at all left both sets
+  within 1% of where they were. The caps of the [setup](#1920x--r9700) were picked on the tuning set, whose agent
+  turns this set doesn't have, so they stay until the caps are compared there.
 - **The tuning script's second round in full:** in both searches it ran out of time before the answer cap, drafts and
   budget came up again.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
