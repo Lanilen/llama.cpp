@@ -76,6 +76,10 @@ full-attention layer.
 **Measured:** on one RX 480 (Flash-Next UD-IQ4_XS, experts partly on the CPU), generation 8% faster at an empty
 context and 19% faster at 16k tokens of context, because upstream runs the indexer on the CPU over every cached key.
 
+With the two, nothing else of Flash-Next falls back: with the model's dense layers on one RX 480 and its whole MTP
+draft on the other, the scheduler's node list for generation batches and for a 1410-token prompt has only the experts
+(kept in RAM by `-ncmoe`) and the token lookups on the CPU.
+
 ### The hot spare cache
 
 *Branch `moe-hot-spare` (the work beside the MoE on `moe-predictor`), guide
@@ -113,7 +117,8 @@ and +3.9% ([the guide](docs/moe-hot-spare.md#work-beside-the-moe)).
 ### Prompts with the cache
 
 *`--moe-cache-resize` and `--moe-cache-batch` on `moe-hot-spare`; the fit shared with a draft context and
-`--moe-cache-jit` on `moe-predictor`; the split, the shared jit slots and the fast copies on `moe-tuning`. Guide:
+`--moe-cache-jit` on `moe-predictor`; the split, the shared jit slots, the fast copies, the CPU's sum and the draft's
+share on `moe-tuning`. Guide:
 [prompts](docs/moe-hot-spare.md#prompts---moe-cache-resize) and
 [medium prompts](docs/moe-hot-spare.md#medium-prompts---moe-cache-jit).*
 
@@ -126,6 +131,12 @@ depends on its size:
 - **Batches of up to `LLAMA_MOE_RESIZE_SPLIT=N` tokens keep it too,** in ubatches of the size that fits. They skip the
   release, the 1.9 s restore and the copy of every expert; the cache and the jit serve them. The MTP draft's context
   follows the same rule.
+- **How large a kept batch can be is what fits beside the cache,** and larger ones cost less per token, since each
+  batch reads the experts it touches from RAM again. The fit tries the powers of two and the steps between them.
+  With `LLAMA_MOE_RESIZE_DRAFT=N` the draft's context takes kept prompts in ubatches of at most N tokens (its part is
+  one layer's attention, as fast in small pieces), and the memory its reserve leaves goes to the main context's batch.
+- **In a kept batch the CPU sums its own experts' outputs** (`LLAMA_MOE_HOST_SUM=N`, from N tokens a batch) and sends
+  the GPU one vector a token instead of one per expert slot, a sixth of such a batch's time on Q4.
 - **Larger batches release the cache** to the compute buffers (`--moe-cache-resize`), and it comes back for generation.
   Such a batch copies every used expert to the GPU; with `LLAMA_OFFLOAD_FAST=1` those copies go through the cache's
   pinned staging memory and background uploads, instead of the backend's synchronous copy from the mmapped weights.
@@ -151,6 +162,10 @@ the uploads, and the slots lent, at one per N tokens of the ubatch (at least 64)
 - The shared slots, 128 of them with 8 tokens a slot: 2k prompts another 29–31% faster on Q4, a set of requests 7%
   shorter on Q4 and 5% on Q6. Q4's short answers after a large prompt were 1.9% slower while the lent slots refill;
   other generation was within 0.8 tok/s.
+- The CPU's sum and the draft's share (64 and 512), with the draft's catch-up no longer running its FFN: the main
+  context keeps 1536 tokens on Q4 and 2048 on Q6 instead of 1024; new prompts of 912 and 1873 tokens 4.41 → 3.87 s and
+  7.56 → 6.51 s on Q4 (−12%, −14%), 5.61 → 5.16 s and 9.66 → 7.56 s on Q6 (−8%, −22%), with generation and a 13k
+  prompt within 1–2%. The sum alone: 1024-token kept batches −13.6% on Q4, −3.7% on Q6.
 - The fast copies: a released prompt's expert copies 93 → 21 s (5.8 → 26 GiB/s), prompts of 2.5k–31k tokens 14–40%
   faster, a set of requests 218.7 → 178.2 s. Every uploaded part read back the same as the host weights.
 
@@ -388,7 +403,7 @@ Hugging Face, trained with `tools/moe-predictor`). The cache, draft and CPU sett
 
 ```bash
 GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_VK_SPIN_WAIT=2000 \
-  LLAMA_GRAPH_CACHE=8 LLAMA_MOE_RESIZE_SPLIT=3072 \
+  LLAMA_GRAPH_CACHE=8 LLAMA_MOE_RESIZE_SPLIT=3072 LLAMA_MOE_HOST_SUM=64 LLAMA_MOE_RESIZE_DRAFT=512 \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
@@ -414,6 +429,10 @@ request's tokens), agent turns at 36.75 tok/s, whole agent turns at 4.99 tok/s, 
   tokens, gained nothing.
 - **The draft head's experts are on the GPU** (no `-cmoed`), and the cache is smaller by their 2550 MiB. Against
   `-cmoed` with 23500 MiB: usual answers 31.5 → 32.6 tok/s and agent turns 27.9 → 28.6, at 83.6% hits instead of 86.5%.
+- **`LLAMA_MOE_HOST_SUM=64` and `LLAMA_MOE_RESIZE_DRAFT=512`** are for prompts of up to 3072 tokens, the ones that keep
+  the cache ([Prompts with the cache](#prompts-with-the-cache)): 12–14% sooner on Q4, 8–22% on Q6.
+- **The RX 480s in the same machine stay out of this setup.** Whatever of Flash-Next was moved to them cost more than
+  it gave ([Tried and not kept](#tried-and-not-kept)).
 - **`-b`/`-ub 16384`:** a 59k-token fill at 334 against 243 tok/s at 8192 (PCIe x8), with the same generation after it.
 - **`--load-mode mmap+mlock`** keeps the experts in RAM. Unlocked, switching between the two quants re-read 17–23 GB of
   evicted experts on the first request. It needs a memlock limit of 110 GiB.
@@ -485,9 +504,17 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   the OpenMP threads pinned to cores (`OMP_PLACES`, 3–8% slower). With the experts on the CPU alone, loading the weights
   instead of mapping them gave 2–3%. With the hot spare, loading them, putting them on 2 MiB pages, and cutting the
   CPU's work into chunks of 96–192 KB (as Strata's CPU pool does) each came within 1% of the mapped weights.
-- **The CPU summing its own experts' outputs** before sending them to the GPU (one vector a token instead of one an
-  expert slot, 10x less over the bus): as one op it costs 8–19 µs a layer and saved nothing (verify batches within
-  1%); the copy it removed was already hidden behind other work.
+- **The CPU summing its own experts' outputs in verify batches** before sending them to the GPU (one vector a token
+  instead of one an expert slot, 10x less over the bus): as one op it costs 8–19 µs a layer and saved nothing (verify
+  batches within 1%); the copy it removed was already hidden behind other work. Kept for prompt batches, where the
+  copy is 80 MiB a layer (`LLAMA_MOE_HOST_SUM=64`).
+- **The MTP draft's experts on an RX 480 beside the R9700,** with the 2550 MiB they free given to the cache (23450
+  MiB, 17 more slots a layer on Q4 and 12 on Q6). It is the one use of a second card that leaves the R9700's own chain
+  alone: only the draft crosses to the other card. Four arms (the residual handed from GPU to GPU or through the
+  host, the RX 480's memory clock held or its shader clock too), three passes, ms a verify step: Q4 +0.4% to +2.6%,
+  Q6 +0.0% to +0.5%, 13k prompts 3–5% slower, and the RX 480 at 28–39 W instead of 8. The slots remove 10–15% of the
+  misses, about what the hop costs each draft. Whole layers, the whole draft and the predictor on an RX 480 had lost
+  before it.
 - **Keeping the GPU busy** with one sleeping wave from a second process held it at about 3.28 GHz: Q4 answers +1.3%,
   Q6 nothing, prompts −16–17%.
 - **Prefetching a token's misses from its n-grams,** what Flash-Next's engram (its per-layer n-gram table, read at
