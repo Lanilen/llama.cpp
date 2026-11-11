@@ -934,8 +934,9 @@ here), and the matmul+add patterns do not occur in this model's graph.
 
 ## Measured
 
-On the 1920X + RX480x2 and the 14600KF + RTX 4070 Ti. The 1920X + R9700's numbers are in the sections above and in
-[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md). Greedy decoding of one coding prompt, 256 tokens,
+On the 1920X + RX480x2 and the 14600KF + RTX 4070 Ti first; the 1920X + R9700's ladder is after the table, and its
+other numbers are in the sections above and in [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md).
+Greedy decoding of one coding prompt, 256 tokens,
 and a 5-turn coding session with `session-bench.py` (a 9.6k-token paste of a source file, then four turns of up to 1024
 tokens each, generation speed over the whole session). "Before" is the code without this branch's scheduler changes of the
 time (overlapping splits, asynchronous reads), which also sped up a model with its experts on the CPU and no cache.
@@ -953,3 +954,24 @@ time (overlapping splits, asynchronous reads), which also sped up a model with i
 | 14600KF + RTX 4070 Ti 12 GB, Qwen3-Coder-30B-A3B UD-Q4_K_XL | experts on the CPU, before | 26.6 |
 | | experts on the CPU | 29.2 |
 | | hot spare 3000 MiB | 43.3 |
+
+The 1920X + R9700 has one ladder for all of it: one request set, each rung added to the one before, with
+Qwen3.8-Flash-Next and 3 MTP drafts on every rung (2026-11-12). The rungs' flags, the requests and what each column
+means are in [FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder). Prompts are every
+prompt's tokens over every prompt's time; a step is one verify step of the long answers:
+
+| Rung | Q4 prompts | Q4 step | Q6 prompts | Q6 step |
+| --- | --- | --- | --- | --- |
+| upstream llama.cpp `3b4d6ab3f`, experts on the CPU | 53.3 tok/s | 154.6 ms | 39.2 tok/s | 176.0 ms |
+| upstream's own cache | 98.6 | 130.8 | 69.4 | 152.6 |
+| the fork with no option set | 53.1 | 142.6 | 38.7 | 166.7 |
+| + hot spare 20900 MiB, `--moe-cache-resize` | 265.9 | 79.7 | 214.1 | 94.6 |
+| + the predictor | 264.8 | 77.8 | 213.9 | 96.1 |
+| + `--moe-cache-jit 8` | 277.4 | 75.9 | 221.2 | 96.9 |
+| + `LLAMA_MOE_RESIZE_SPLIT=3072`, `LLAMA_OFFLOAD_FAST=1` | 369.3 | 76.5 | 307.2 | 96.3 |
+| + the CPU settings | 386.0 | 69.3 | 320.5 | 88.2 |
+| + the Vulkan settings | 381.3 | 65.4 | 311.8 | 85.2 |
+| + `LLAMA_MOE_HOST_SUM=64`, `LLAMA_MOE_RESIZE_DRAFT=512` | 414.7 | 65.4 | 350.6 | 84.4 |
+
+The predictor's rung shows in the answers that follow a prompt, where a step goes from 87.4 to 68.9 ms on Q4 and from
+109.2 to 83.2 ms on Q6.
