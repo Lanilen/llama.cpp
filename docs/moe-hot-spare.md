@@ -33,6 +33,8 @@ this guide and the [predictor](moe-predictor.md)
   [changes that apply without any option](#changes-that-apply-without-any-option)
 - [Prompts](#prompts---moe-cache-resize): [which batches keep the cache](#which-batches-keep-the-cache---moe-cache-batch),
   [medium prompts](#medium-prompts---moe-cache-jit), [splitting a prompt](#splitting-a-prompt-llama_moe_resize_split),
+  [the CPU's sum in kept batches](#the-cpus-sum-in-kept-batches-llama_moe_host_sum),
+  [the draft's share](#the-drafts-share-llama_moe_resize_draft),
   [released prompts](#released-prompts-the-fast-expert-copies)
 - [Reference](#reference): [options](#options), [environment variables](#environment-variables), [tuning](#tuning)
 - [Sizing the cache](#sizing-the-cache)
@@ -334,7 +336,8 @@ is small again before the cache of the main context comes back, whatever the ord
 `--moe-cache-batch N` (default 512, 0 = `-ub`) is the most it tries. After the cache comes back the first time and 64
 tokens have been generated (until then the free memory that RADV reports can still drop by about a GB), the context
 measures the compute buffers of a reserve for N tokens without allocating them. It reserves them if they fit in the free
-GPU memory with 256 MiB to spare, and otherwise tries half the size, down to 32. Batches up to the size that fits keep
+GPU memory with 256 MiB to spare, and otherwise tries the next smaller size, down to 32: the powers of two and, from 512
+tokens up, the steps between them (2048, 1536, 1024, 768, 512, 256, ...). Batches up to the size that fits keep
 the cache and run on the hot spare, so a medium prompt such as a tool output neither copies every expert to the GPU nor
 uploads the cache again. The log says `MoE cache resize: batches of up to N tokens keep the cache`.
 
@@ -342,6 +345,15 @@ uploads the cache again. The log says `MoE cache resize: batches of up to N toke
 at 32 tokens, the draft picks the largest size that fits both, and the main context takes its share. If either then
 finds less room, the other follows it down. (The draft's buffers for a batch can be larger than the main context's: on
 the R9700, 2048-token reserves for both spilled into system memory and generation fell from 26 to 8.5 tok/s.)
+[`LLAMA_MOE_RESIZE_DRAFT`](#the-drafts-share-llama_moe_resize_draft) caps the draft's own batch instead, and leaves the
+memory to the main context.
+
+**The fit is a threshold.** The same graph's buffer moves by 8-16 MiB with small changes (the allocator's packing: on the
+1920X + R9700, UD-Q4_K_XL's 1024-token graph measures 474 MiB and allocates 466; with
+[`LLAMA_MOE_HOST_SUM`](#the-cpus-sum-in-kept-batches-llama_moe_host_sum) it measures 466 and allocates 482). With the draft
+loaded that setup had 737 MiB free for the main context's reserve, so 1024 tokens fit with 15 MiB to spare, and the graph
+that was 16 MiB larger missed by 0.08 MiB: while the fit only halved, the kept batch fell to 512 tokens and 1k and 2k
+prompts took 25% longer. The steps between the powers of two make a near miss cost a quarter of the batch.
 
 **What the measure counts.** The measured size is the sum of the compute buffer's chunks: the Vulkan backend hands out
 buffers of at most its suballocation block size (`GGML_VK_SUBALLOCATION_BLOCK_SIZE`, 1 GiB by default), so a graph with
@@ -482,6 +494,48 @@ or faster, and a set of requests with agent turns took 14 s less on Q4 and 27 s 
 more still released the cache, at the same speed as without the split. 8192 measured the same as 4096, since no request
 fell between the two.
 
+### The CPU's sum in kept batches: `LLAMA_MOE_HOST_SUM`
+
+*On the `moe-tuning` branch.*
+
+The CPU branch hands the GPU its experts' outputs as one vector per expert slot and token (zero where the cache branch
+has the expert), and the GPU adds the two branches and sums. At verify sizes that copy is hidden behind other work. In a
+prompt batch that keeps the cache it is not: ~80 MiB a layer at 1024 tokens. Where the 3881 ms of such a batch went on
+UD-Q4_K_XL (1920X + R9700, 20900 MiB cache, jit 8, the scheduler's timing):
+
+| | ms |
+|---|---|
+| the CPU's experts (the ~250 experts a layer that are neither resident nor uploaded by the jit, each read once from RAM) | 2004 |
+| the GPU splits' input copies: the CPU branch's output | ~640 |
+| the GPU splits' input copies: the jit's uploads (115 experts a layer) | ~555 |
+| the GPU splits' input copies: the rest, with the waits for the GPU's own work | ~610 |
+| recording | 57 |
+
+`LLAMA_MOE_HOST_SUM=N`: in batches of N tokens and more the CPU weights and sums its own outputs in one op (each thread
+a range of tokens) and sends one vector a token; the GPU sums its own and adds the two. It is the same sum in another
+order. Off by default; 64 on the 1920X + R9700, so verify batches keep the old path (there it measured nothing).
+
+Kept batches in the drift tool, two runs each: 1024 tokens 3925 → 3391 ms on Q4 (−13.6%) and 4862 → 4683 on Q6 (−3.7%),
+256 tokens −7.6% and −2.7%; flips and KL against the reference at the level of the path without it. A 1024-token batch
+touches every one of a layer's 512 experts, so its floor is reading them from RAM once: larger kept batches cost less
+per token (Q4 5.34 ms a token at 256, 3.83 at 1024, 3.48 at 4096; Q6 7.12, 4.75, 4.13).
+
+### The draft's share: `LLAMA_MOE_RESIZE_DRAFT`
+
+*On the `moe-tuning` branch.*
+
+With an MTP draft the two contexts share the memory beside the cache, and the draft's small reserve was sized for the
+same batch as the main context's: 428 MiB at 1024 tokens on Flash-Next (the attention's tensors over its four
+hyper-connection streams), 170 at 512, 122 at 256. The draft's part of a prompt, its catch-up, is one layer's attention
+and costs the same in small ubatches (63 ms for 2048 tokens). `LLAMA_MOE_RESIZE_DRAFT=N`: a context without the cache
+takes the prompts that keep the cache in ubatches of at most N tokens, limits the main context only if even that doesn't
+fit, and what its reserve leaves goes to the main context's kept batch.
+
+On the 1920X + R9700 with N = 512 the main context keeps 1536 tokens on Q4 and 2048 on Q6 (1024 before). With the host
+sum, two passes, new prompts of 912 and 1873 tokens: Q4 4.41 → 3.87 s and 7.56 → 6.51 s (−12%, −14%), Q6 5.61 → 5.16 s
+and 9.66 → 7.56 s (−8%, −22%: one ubatch instead of two); a 13k prompt and the verify steps within 1–2%, the same
+answers. 256 measured the same.
+
 ### Released prompts: the fast expert copies
 
 *On the `moe-tuning` branch.*
@@ -604,6 +658,8 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | --- | --- |
 | `LLAMA_MOE_RESIZE_SPLIT=N` | with `--moe-cache-resize`: batches of up to N tokens keep the cache and run in ubatches of the size that fits next to it, instead of releasing it (default 0, off; 3072 on the 1920X + R9700) ([Splitting a prompt](#splitting-a-prompt-llama_moe_resize_split)) |
 | `LLAMA_OFFLOAD_FAST=1` | in hot spare mode, the scheduler's copies of host experts to a GPU (prompts that release the cache) go through the cache's pinned staging memory and background uploads ([Released prompts](#released-prompts-the-fast-expert-copies)) |
+| `LLAMA_MOE_HOST_SUM=N` | in batches of N tokens and more the CPU branch sums its own experts' outputs and sends one vector a token (default 0, off; 64 on the 1920X + R9700) ([The CPU's sum in kept batches](#the-cpus-sum-in-kept-batches-llama_moe_host_sum)) |
+| `LLAMA_MOE_RESIZE_DRAFT=N` | with `--moe-cache-resize`: a context without the cache (the MTP draft) takes kept prompts in ubatches of at most N tokens, so the main context's kept batch can grow (default 0, the draft follows the main context; 512 on the 1920X + R9700) ([The draft's share](#the-drafts-share-llama_moe_resize_draft)) |
 
 **`--moe-cache-jit`**
 
@@ -629,6 +685,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | --- | --- |
 | `GGML_SCHED_OVERLAP=0` | the cache branch is not a split of its own, so it no longer runs while the CPU computes the misses |
 | `GGML_SCHED_ASYNC_READS=0` | the copies of split inputs to the CPU that the prefetch does not cover are synchronous reads |
+| `LLAMA_MTP_FFN_ALL=1` | Flash-Next's MTP draft runs its FFN on the catch-up's rows too, as before the crop ([Speculative decoding with MTP](#speculative-decoding-with-mtp)), to compare |
 | `LLAMA_MTP_DEV_ROWS=0` | the MTP draft keeps the target's h rows on the host instead of upstream's device buffer (640 MiB at `-b 16384`), see [Speculative decoding with MTP](#speculative-decoding-with-mtp) |
 | `GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296` | Vulkan (upstream): one allocator chunk per compute buffer instead of 1 GiB chunks, so the resize fit does not pay for the unused tail of each chunk (see [Which batches keep the cache](#which-batches-keep-the-cache---moe-cache-batch)) |
 | `LLAMA_MOE_SIDE=0` | the tensors a model computes beside the MoE (Flash-Next's shared expert) stay after the CPU experts instead of joining the cache branch, to compare |
@@ -826,6 +883,15 @@ that borrows the main model's embedding and output head). The draft context has 
   much that costs. One (`--spec-draft-n-max 1`) was best on the 1920X + RX480x2. On the 1920X + R9700, with the CPU's
   experts as in [The CPU's experts](#the-cpus-experts), three were best: 43.6 tok/s against 41.6 with two, a pass
   yielding 2.92 tokens in 67 ms against 2.44 in 59.
+- The draft's catch-up (the accepted tokens after each pass, and every prompt) adds its tokens without an output row:
+  the attention has to write their KV cells, but nobody reads the FFN's result there. Flash-Next's draft graph ran it
+  anyway, with the draft layer's 512 experts; those rows now stop after the attention (`LLAMA_MTP_FFN_ALL=1` for the
+  old behaviour). The same answers; 1k and 2k prompts 2% sooner on the 1920X + R9700, a verify step within the noise
+  (−0.9% in one run of three passes, +0.3% in another of two).
+- After a prompt that released the cache, the first token waits for more than the decode. A 13k-token prompt on Q4
+  (19.7 s): release and the large reserve 0.4 s, the decode 15.2 s, the h rows handed to the draft through the host
+  1.0 s, the draft's catch-up 0.8 s and its reserve back to small 0.3 s, then a checkpoint, the cache's restore and its
+  reserve, 2.0 s before the first token. Without the draft the same prompt takes 17.2 s.
 - Upstream's draft-mtp keeps the target's h rows in a device buffer (a row per batch token, 640 MiB at `-b 16384`)
   and the catch-up reads them in place; each pass it uploads the pending row and reads one back. This fork queues
   those two transfers on the backend's compute queue (`llama_context::set_h_nextn_rows`, `get_h_nextn_rows`): as
