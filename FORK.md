@@ -394,7 +394,8 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
     --moe-cache-hot flashnext.hot \
-    --moe-cache-predictor flashnext-pred-v3.moepred --moe-cache-refill 0 --moe-cache-jit 8 --moe-cache-predictor-answer-cap 500 \
+    --moe-cache-predictor flashnext-pred-v3.moepred --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-jit 8 \
+    --moe-cache-predictor-answer-cap 500 \
     -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -devd Vulkan0 \
     --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 2048 --load-mode mmap+mlock
 ```
@@ -408,6 +409,9 @@ UD-Q6_K_XL takes the same placement, cache size, hot set, predictor and draft he
 request's tokens), agent turns at 36.75 tok/s, whole agent turns at 4.99 tok/s, 71.5% of the experts in the cache.
 
 - **`--moe-cache-hot`** starts the cache from a set saved with `--moe-cache-save` on the same kind of work.
+- **The predictor runs on the GPU** (`--moe-cache-predictor-device`), not on the CPU: a verify step 1.0% faster on Q4
+  (69.57 → 68.89 ms) and 0.6% on Q6, its ~3.2 ms every 16 tokens. More CPU threads for it, or predicting every 8 or 4
+  tokens, gained nothing.
 - **The draft head's experts are on the GPU** (no `-cmoed`), and the cache is smaller by their 2550 MiB. Against
   `-cmoed` with 23500 MiB: usual answers 31.5 → 32.6 tok/s and agent turns 27.9 → 28.6, at 83.6% hits instead of 86.5%.
 - **`-b`/`-ub 16384`:** a 59k-token fill at 334 against 243 tok/s at 8192 (PCIe x8), with the same generation after it.
