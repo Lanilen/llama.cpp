@@ -966,10 +966,20 @@ static int64_t moe_resize_fit_next(int64_t n) {
     return p;
 }
 
+// LLAMA_MOE_RESIZE_DRAFT=N: a context without the cache (the MTP draft) takes the prompts that keep the cache in ubatches
+// of at most N tokens, whatever the context with the cache keeps. Its catch-up is one layer's attention, cheap in small
+// ubatches, and the device memory its small reserve leaves goes to the cache's context: a larger kept batch
+static int64_t moe_resize_draft_max(int64_t n_min) {
+    static const int64_t n = getenv("LLAMA_MOE_RESIZE_DRAFT") ? atoll(getenv("LLAMA_MOE_RESIZE_DRAFT")) : 0;
+    return n > 0 ? std::max(n, 2*n_min) : INT64_MAX;
+}
+
 int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
     const size_t headroom = 256u*1024*1024;
     // a context without the cache picks for both while the one with the cache waits at its smallest reserve
     const bool joint = !moe_cache && g_moe_resize.pending;
+    // this context's own ubatch for a batch size n of the fit (LLAMA_MOE_RESIZE_DRAFT)
+    const int64_t n_cap = moe_cache ? INT64_MAX : moe_resize_draft_max(n_min);
     const uint32_t n_seqs = cparams.n_seq_max;
 
     // the free memory of each GPU, with the current compute buffers given back; SIZE_MAX = not a GPU
@@ -1030,10 +1040,12 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
     std::map<int64_t, std::vector<size_t>> measures;
     int64_t n_fit = 0;
     for (int64_t n = n_max; n > n_min && (plan || n_fit == 0); n = moe_resize_fit_next(n)) {
-        set_batch(n);
+        // n is the batch the cache's context keeps; this context's reserve is for n_own tokens
+        const int64_t n_own = std::min(n, n_cap);
+        set_batch(n_own);
 
         // measure first, without allocating
-        const size_t max_nodes = graph_max_nodes(n);
+        const size_t max_nodes = graph_max_nodes(n_own);
         for (auto & res : gf_res_prev) {
             res.reset();
         }
@@ -1046,8 +1058,8 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
             mctx = memory->init_full();
         }
         std::fill(sizes.begin(), sizes.end(), 0);
-        const bool measured = graph_reserve(n, n_seqs, std::min<uint32_t>(n, cparams.n_outputs_max), mctx.get(), true, sizes.data()) != nullptr;
-        LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB measured, %.2f MiB free\n", __func__, n, gpu_mib(sizes, true), gpu_mib(free_dev, false));
+        const bool measured = graph_reserve(n_own, n_seqs, std::min<uint32_t>(n_own, cparams.n_outputs_max), mctx.get(), true, sizes.data()) != nullptr;
+        LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB measured, %.2f MiB free\n", __func__, n_own, gpu_mib(sizes, true), gpu_mib(free_dev, false));
         mctx.reset();
         if (!measured || !fits(sizes, n)) {
             continue;
@@ -1068,7 +1080,7 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             sizes[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
         }
-        LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB allocated\n", __func__, n, gpu_mib(sizes, true));
+        LLAMA_LOG_DEBUG("%s: batch %" PRId64 ": %.2f MiB allocated\n", __func__, n_own, gpu_mib(sizes, true));
         if (fits(sizes, n)) {
             n_fit = n;
         }
@@ -1102,7 +1114,7 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
     }
 
     LLAMA_LOG_INFO("%s: MoE cache resize: batches of up to %" PRId64 " tokens %s%s (compute buffer %.2f MiB, %.2f MiB free for it%s)\n",
-            __func__, n_fit, moe_cache ? "keep the cache" : "use the small reserve", n_fit < n_max ? ", larger ones don't fit" : "",
+            __func__, std::min(n_fit, n_cap), moe_cache ? "keep the cache" : "use the small reserve", n_fit < n_max ? ", larger ones don't fit" : "",
             gpu_mib(sizes, true), gpu_mib(free_dev, false), joint ? " and the cache's context" : "");
 
     return n_fit;
@@ -2747,10 +2759,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // llama_moe_cache::resize_batch() tokens: a large reserve then would not fit next to the cache, so its small
             // reserve takes those batches, as far as its buffers fit in what is left
             const int64_t n_main = llama_moe_cache::resize_batch();
-            if (n_main > n_min && n_main != resize_small_max && !moe_resize_large) {
+            // LLAMA_MOE_RESIZE_DRAFT: this context's own ubatch stays at the cap, and limits the main context's batch
+            // only if even that doesn't fit
+            const int64_t n_want = std::min(n_main, moe_resize_draft_max(n_min));
+            if (n_main > n_min && n_want != resize_small_max && !moe_resize_large) {
                 synchronize();
-                const int64_t n = moe_resize_fit(n_main, n_min);
-                if (n < n_main) {
+                // while the main context waits for this pick, the fit goes down the main context's sizes
+                const int64_t n_top = g_moe_resize.pending ? n_main : n_want;
+                const int64_t n = moe_resize_fit(n_top, n_min);
+                if (n < n_top) {
                     llama_moe_cache::limit_resize_batch(n);
                 }
                 g_moe_resize.pending = false;
@@ -2764,7 +2781,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // restoring it then goes, and the cache's experts serve the prompt); the draft's context follows the same rule,
         // so its buffers stay small too. Only once the small batches have grown past the hot spare's own limit
         static const int64_t split_max = getenv("LLAMA_MOE_RESIZE_SPLIT") ? atoll(getenv("LLAMA_MOE_RESIZE_SPLIT")) : 0;
-        const bool split = split_max > 0 && resize_small_max > n_min && balloc->get_n_tokens() <= split_max;
+        // a context without the cache whose ubatch is capped (LLAMA_MOE_RESIZE_DRAFT) cuts the batches the main context keeps
+        const bool split = resize_small_max > n_min &&
+            ((split_max > 0 && balloc->get_n_tokens() <= split_max) || (!moe_cache && balloc->get_n_tokens() <= llama_moe_cache::resize_batch()));
         const bool large = balloc->get_n_tokens() > resize_small_max && !split;
         if (large != moe_resize_large) {
             synchronize();
