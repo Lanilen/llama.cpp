@@ -2241,6 +2241,35 @@ static bool moe_side_weights_on(const ggml_tensor * t, ggml_backend_dev_t dev, i
     return true;
 }
 
+// LLAMA_MOE_HOST_SUM: dst [n_embd, n_tokens] = the sum over the slots of src[0] [n_embd, n_slots, n_tokens], each slot
+// scaled by src[1] [1, n_slots, n_tokens] when given; each thread a range of tokens, or a slice of the embedding when
+// there are fewer tokens than threads
+static void llm_moe_host_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const ggml_tensor * h = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const int64_t n_embd = h->ne[0], n_slots = h->ne[1], n_tokens = h->ne[2];
+    const bool by_token = n_tokens >= nth;
+    const int64_t per = ((n_embd + nth - 1)/nth + 15) & ~15;
+    const int64_t i0 = by_token ? 0      : std::min<int64_t>(n_embd, ith*per);
+    const int64_t i1 = by_token ? n_embd : std::min<int64_t>(n_embd, i0 + per);
+    const int64_t t0 = by_token ? n_tokens*ith/nth       : 0;
+    const int64_t t1 = by_token ? n_tokens*(ith + 1)/nth : n_tokens;
+    for (int64_t t = t0; t < t1; ++t) {
+        float * o = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = i0; i < i1; ++i) {
+            o[i] = 0.0f;
+        }
+        for (int64_t u = 0; u < n_slots; ++u) {
+            const float * r = (const float *) ((const char *) h->data + u*h->nb[1] + t*h->nb[2]);
+            const float wu = w ? *(const float *) ((const char *) w->data + u*w->nb[1] + t*w->nb[2]) : 1.0f;
+            for (int64_t i = i0; i < i1; ++i) {
+                o[i] += wu*r[i];
+            }
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2777,6 +2806,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (t == experts_h) {
                     break;
                 }
+            }
+
+            // LLAMA_MOE_HOST_SUM=N: in batches of N tokens and more the CPU weights and sums its own experts' outputs, so it
+            // sends the device one vector a token instead of one an expert slot (10x less over the bus); the device sums
+            // its own, and the two sums are added: the same sum as below, in another order
+            static const int64_t host_sum = [] { const char * e = getenv("LLAMA_MOE_HOST_SUM"); return e != nullptr ? atoll(e) : 0; }();
+            if (host_sum > 0 && experts_h->ne[2] >= host_sum && post_exp_norm == nullptr && (int64_t) hparams.n_expert_used(il) == experts_h->ne[1]) {
+                // one op (llm_moe_host_sum), the slots summed in order as the device's adds do; MUL + CONT(PERMUTE) +
+                // SUM_ROWS cost 50-190 us a layer at 1-8 tokens. Worth it for prompt batches that keep the cache (at 1024
+                // tokens the unsummed copy is ~80 MiB a layer), not for verify batches, where the copy hides behind other work
+                ggml_tensor * args[2] = { experts_h, weight_before_ffn ? nullptr : weights };
+                ggml_tensor * h = ggml_custom_4d(ctx0, GGML_TYPE_F32, experts_h->ne[0], experts_h->ne[2], 1, 1, args,
+                    weight_before_ffn ? 1 : 2, llm_moe_host_sum, GGML_N_TASKS_MAX, nullptr);
+                cb(h, "ffn_moe_out_host", il);
+                ggml_backend_sched_set_tensor_backend(sched, h, backend_cpu);
+
+                ggml_backend_t backend_layer = moe_cache->layer_backend(il);
+                ggml_tensor * moe_c = aggregate_experts(experts_c);
+                ggml_tensor * moe_out = ggml_add(ctx0, moe_c, h);
+                if (backend_layer) {
+                    // the device's sum and the add run where the layer runs, as the add of the branches did
+                    for (ggml_tensor * t = ggml_get_next_tensor(ctx0, h); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+                        if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                            ggml_backend_sched_set_tensor_backend(sched, t, backend_layer);
+                        }
+                    }
+                }
+                cb(moe_out, "ffn_moe_out", il);
+                return moe_out;
             }
 
             // each expert output comes from one branch and is zero in the other, so the sum is exact
