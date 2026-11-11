@@ -22,6 +22,8 @@ also tested on an NVIDIA RTX 4070 Ti with Vulkan. They are listed, with how to s
 **Where it stands.** Qwen3.8-Flash-Next UD-Q4_K_XL on the R9700, with 72 GiB of its experts in system memory,
 generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's turns; UD-Q6_K_XL at 33 and 37 tok/s
 ([Setups](#setups)). With the experts on the CPU and no cache, a single answer ran at 16.8 tok/s (PCIe x8, one draft).
+On one request set, from upstream llama.cpp to this setup: prompts 53 → 415 tok/s and generation 18.7 → 44.7 tok/s on
+Q4, 39 → 351 and 16.2 → 34.6 on Q6 ([The ladder](#the-ladder)).
 
 ## Contents
 
@@ -38,6 +40,7 @@ generates at 42 tok/s over a mix of coding requests and 45 tok/s in an agent's t
 - [Tuning a machine](#tuning-a-machine)
 - [Build](#build)
 - [Setups](#setups)
+- [The ladder](#the-ladder)
 - [Tried and not kept](#tried-and-not-kept)
 - [Upstream since 2026-10-29](#upstream-since-2026-10-29)
 - [Still to measure](#still-to-measure)
@@ -482,6 +485,99 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
     --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 2048
 ```
 
+## The ladder
+
+One request set on the 1920X + R9700, each rung adding one thing to the rung before it. Every rung has the same
+placement (the experts in system memory, the n-gram table on the CPU, 12 threads, `mmap+mlock`, 64k context) and the
+same MTP draft head on the GPU with 3 drafts. The R9700 is on the COMPUTE profile, except in the last row. Measured on
+2026-11-12: one pass for rungs 0–2 and the last row, two passes for the others.
+
+The requests, one after another: a 512-token story, a question after 2.3k tokens of code, one after 18.6k tokens, one
+after another 2.2k, a 400-token function, a 400-token essay, and five prompts of 1k to 7.5k tokens that the server
+hasn't seen, with 32-token answers.
+
+| | rung | what it adds |
+|---|---|---|
+| 0 | upstream | llama.cpp `3b4d6ab3f` with its default batch sizes, the experts on the CPU |
+| 1 | upstream's cache | upstream's own MoE cache at its tuner's pick (`--moe-cache-mib 11584 --moe-cache-cpu-share 0.95` on Q4, `10624` and `0.98` on Q6) with `-ub 1024`. The R9700's 4 GiB limit for one buffer caps its size |
+| 2 | the fork | the fork's build with rung 0's flags: what it changes with no option set |
+| 3 | hot spare | `--moe-cache-mode hot-spare --moe-cache-mib 20900` from a saved set, `--moe-cache-resize` with `-ub 16384`, the draft's ubatch at 2048, the fit's two settings (`GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296 LLAMA_MTP_DEV_ROWS=0`). Without the resize a cache of this size leaves no room for a prompt's buffers |
+| 4 | predictor | `--moe-cache-predictor` on the GPU, with its answer cap (500 on Q4, 125 on Q6) |
+| 5 | jit | `--moe-cache-jit 8` with the shared slots |
+| 6 | split | `LLAMA_MOE_RESIZE_SPLIT=3072` and `LLAMA_OFFLOAD_FAST=1` |
+| 7 | CPU settings | `GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1` |
+| 8 | Vulkan settings | `GGML_VK_FLOPS_PER_SUBMIT=100000000 GGML_VK_SPIN_WAIT=2000 LLAMA_GRAPH_CACHE=8` |
+| 9 | kept prompts | `LLAMA_MOE_HOST_SUM=64 LLAMA_MOE_RESIZE_DRAFT=512`, the fit's finer steps, the draft's catch-up without its FFN: [the setup above](#1920x--r9700) |
+
+The columns:
+- **prompts:** every prompt's tokens over every prompt's time. The three after it are the seconds for the new prompts
+  of 949, 1921 and 18,619 tokens.
+- **generation:** tok/s over the three long answers (story, function, essay).
+- **step:** ms a verify step over the same three, 1000 × tokens a step / tok/s. The text differs between rungs, and how
+  well a text drafts moves tok/s; the step doesn't depend on it.
+- **after a prompt:** the same step for the three answers of about 128 tokens that follow the 2k and 18.6k prompts.
+- **hits:** the share of the selected experts found in the cache while generating.
+- **set:** the whole request set, in seconds.
+
+UD-Q4_K_XL:
+
+| rung | prompts | 1k | 2k | 18.6k | generation | step | after a prompt | hits | set |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 upstream | 53.3 tok/s | 17.64 s | 35.79 s | 352.4 s | 18.7 tok/s | 154.6 ms | 158.0 ms | | 866 s |
+| 1 upstream's cache | 98.6 | 9.16 | 18.30 | 186.4 | 21.9 | 130.8 | 133.3 | | 500 |
+| 2 the fork | 53.1 | 17.63 | 35.84 | 354.6 | 19.1 | 142.6 | 147.0 | | 865 |
+| 3 hot spare | 265.9 | 10.59 | 14.77 | 41.9 | 37.1 | 79.7 | 87.4 | 74.5% | 207 |
+| 4 predictor | 264.8 | 11.77 | 14.75 | 41.8 | 36.3 | 77.8 | 68.9 | 78.6% | 205 |
+| 5 jit | 277.4 | 4.14 | 14.85 | 41.9 | 36.6 | 75.9 | 68.7 | 79.3% | 198 |
+| 6 split | 369.3 | 4.10 | 8.01 | 35.6 | 37.0 | 76.5 | 76.4 | 77.6% | 162 |
+| 7 CPU settings | 386.0 | 3.61 | 7.22 | 35.1 | 41.6 | 69.3 | 69.0 | 77.4% | 152 |
+| 8 Vulkan settings | 381.3 | 3.60 | 7.35 | 35.4 | 44.2 | 65.4 | 65.3 | 77.1% | 151 |
+| 9 kept prompts | 414.7 | 3.16 | 6.40 | 34.0 | 44.7 | 65.4 | 65.7 | 77.4% | 142 |
+| 8 on the default profile | 367.3 | 3.87 | 7.61 | 35.9 | 40.0 | 73.3 | 72.9 | 77.4% | 160 |
+
+UD-Q6_K_XL:
+
+| rung | prompts | 1k | 2k | 18.6k | generation | step | after a prompt | hits | set |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 upstream | 39.2 tok/s | 23.97 s | 48.57 s | 482.6 s | 16.2 tok/s | 176.0 ms | 181.7 ms | | 1155 s |
+| 1 upstream's cache | 69.4 | 13.17 | 26.08 | 264.8 | 18.8 | 152.6 | 157.8 | | 688 |
+| 2 the fork | 38.7 | 24.28 | 49.25 | 489.6 | 17.0 | 166.7 | 172.4 | | 1161 |
+| 3 hot spare | 214.1 | 12.43 | 18.79 | 50.5 | 30.3 | 94.6 | 109.2 | 67.7% | 256 |
+| 4 predictor | 213.9 | 12.37 | 18.99 | 50.7 | 29.9 | 96.1 | 83.2 | 70.2% | 253 |
+| 5 jit | 221.2 | 5.23 | 19.03 | 51.1 | 29.6 | 96.9 | 84.3 | 70.7% | 247 |
+| 6 split | 307.2 | 5.23 | 10.30 | 40.7 | 29.9 | 96.3 | 100.6 | 68.6% | 195 |
+| 7 CPU settings | 320.5 | 4.73 | 9.48 | 40.0 | 33.1 | 88.2 | 89.1 | 68.9% | 186 |
+| 8 Vulkan settings | 311.8 | 5.00 | 10.11 | 40.6 | 34.6 | 85.2 | 85.0 | 68.9% | 187 |
+| 9 kept prompts | 350.6 | 4.51 | 7.27 | 37.9 | 34.6 | 84.4 | 84.4 | 68.9% | 172 |
+| 8 on the default profile | 302.8 | 5.35 | 10.70 | 41.0 | 31.6 | 91.7 | 93.4 | 68.9% | 195 |
+
+What it shows:
+- **Upstream to rung 9:** prompts 7.8× faster on Q4 and 8.9× on Q6, a verify step 58% and 52% shorter, and the set done
+  in a sixth of the time. Generation gains less than the step (2.4× and 2.1×) because the texts differ.
+- **Upstream's own cache** shortens a step by 15% and 13% and nearly doubles the prompts, with half the memory the hot
+  spare gets.
+- **The fork with no option set** makes a step 7.8% and 5.3% shorter than upstream's, and prompts the same: the
+  [scheduler and Vulkan changes](#scheduler-and-vulkan-changes-for-split-models).
+- **The hot spare with the resize is the largest rung:** against rung 2, a step 44% and 43% shorter, and prompts 5.0×
+  and 5.5× faster.
+- **The predictor pays where the topic changes.** After a prompt a step is 21% shorter on Q4 and 24% on Q6. On the long
+  answers it's −2.4% on Q4 and +1.6% on Q6.
+- **`--moe-cache-jit` alone reaches only the prompt that keeps the cache,** the 949-token one, which takes a third (Q4)
+  and less than half (Q6) of the time. The split then brings the prompts of up to 3072 tokens to it, and the fast
+  copies take 6 s (Q4) and 10 s (Q6) off the 18.6k one.
+- **The split has a price at a change of topic.** The first question about code comes right after the story, and from
+  rung 6 its 2.3k prompt keeps the cache. Its answer's step goes from 66 to 88 ms on Q4 and from 83 to 131 ms on Q6,
+  where the cache without a predictor gave 107 and 136; the next question, about more code, doesn't change (66 and 81
+  ms). The request still ends sooner (18.9 → 16.4 s, 24.2 → 19.1 s with a 128-token answer). The answer cap is the
+  likely reason and hasn't been isolated ([Still to measure](#still-to-measure)).
+- **The CPU settings** shorten a step by 9.3% and 8.5%, **the Vulkan settings** by 5.6% and 3.4%, with prompts 1–3%
+  slower.
+- **Rung 9 is for prompts:** the ones of 1k to 3k tokens arrive 12–27% sooner on Q4 and 10–28% on Q6, the 18.6k one 4%
+  and 7%. A step stays where it was (0.0% and −0.9%, inside the spread between passes).
+- **The default power profile** costs 12.0% of a step on Q4 and 7.6% on Q6.
+
+The 1920X + RX480x2 has no ladder yet ([Still to measure](#still-to-measure)).
+
 ## Tried and not kept
 
 Measured on the 1920X + R9700. These either didn't help or cost more than they gained:
@@ -678,8 +774,11 @@ job, `jobs:` is empty and GitHub rejects the file. Nothing of the fork's; it end
   again with it (after checking that the predictor, trained on Q4_K_XL routing, holds on IQ4_XS), once the RX 480s are
   back in the lab. That includes `--moe-cache-jit` (PCIe x8, slower uploads, probably a higher N), and whether upstream's
   small-n split_k should also cover GCN (the fork's version did; see [Upstream since 2026-10-29](#upstream-since-2026-10-29)).
-- **One cumulative benchmark:** the numbers above come from different request sets over a month. They'll be redone as
-  one ladder, each step added to the last, on the same requests.
+- **The ladder on the 1920X + RX480x2:** [the ladder](#the-ladder) covers the R9700. The numbers of the other sections
+  still come from different request sets over a month.
+- **The answer cap after a kept prompt:** at a change of topic, the answer after a prompt that kept the cache starts
+  with a step 33% (Q4) and 58% (Q6) longer than after a released one ([the ladder](#the-ladder), rung 6). A larger cap
+  for that case hasn't been tried.
 - **The tuning script's second round in full:** in both searches it ran out of time before the answer cap, drafts and
   budget came up again.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
