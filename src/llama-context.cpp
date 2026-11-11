@@ -953,6 +953,19 @@ void llama_context::release_scratch() {
     moe_scratch_grown = false;
 }
 
+// the batch sizes the fit tries, downwards: the powers of two and, from 512 tokens up, the step halfway to the next one
+// (768, 1536, ...), so that a batch that misses by a few MiB loses a quarter of its size and not half
+static int64_t moe_resize_fit_next(int64_t n) {
+    if ((n & (n - 1)) == 0) {
+        return n >= 1024 ? n/4*3 : n/2;
+    }
+    int64_t p = 1;
+    while (p*2 < n) {
+        p *= 2;
+    }
+    return p;
+}
+
 int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
     const size_t headroom = 256u*1024*1024;
     // a context without the cache picks for both while the one with the cache waits at its smallest reserve
@@ -1016,7 +1029,7 @@ int64_t llama_context::moe_resize_fit(int64_t n_max, int64_t n_min, bool plan) {
     std::vector<size_t> sizes(backend_ptrs.size());
     std::map<int64_t, std::vector<size_t>> measures;
     int64_t n_fit = 0;
-    for (int64_t n = n_max; n > n_min && (plan || n_fit == 0); n /= 2) {
+    for (int64_t n = n_max; n > n_min && (plan || n_fit == 0); n = moe_resize_fit_next(n)) {
         set_batch(n);
 
         // measure first, without allocating
