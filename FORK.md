@@ -330,8 +330,13 @@ pass in reverse order: a story, questions after 2k and 18k tokens of code, a 4-t
 (made-up ones, or recorded ones with `--agent`). The search starts from llama.cpp's defaults with your cache size and
 placement, changes one setting per stage, and carries the best one forward only if its gain beats the noise measured
 between the passes. A stage whose best value is at an end of its list goes on past it, so the lists, spaced around what
-suited the 1920X + R9700, don't bound the result. `--rounds 2` goes through the stages again from the first round's
-pick, and a last stage runs the result against the starting point again.
+suited the 1920X + R9700, don't bound the result.
+
+The stages run in the order of what depends on what: the cost of the CPU's experts, the drafts of a pass, what the
+cache holds (the predictor, judged with its answer's start), then how the cache is kept. When a stage still moves the
+result by 5% or more, the earlier stages that depend on it are tried again with that move in place. `--rounds 2` goes
+through every stage again from the first round's pick, and a last stage runs the result against the starting point
+again.
 
 The pick is the best balance of three kinds of request: answers after a large prompt, long answers and agent turns,
 each counting the same (their geometric mean), so long answers, which have most of the tokens, don't outvote the rest.
@@ -347,8 +352,8 @@ hardware and the timings but no prompts and no answers. The method, the options 
 
 **On the 1920X + R9700,** each model was searched in two rounds by the balance, with ten recorded agent turns, runs of
 about 5 minutes, and the split and the shared jit slots ([Prompts with the cache](#prompts-with-the-cache)) in place.
-The stages, in the order they run, with what the search picked for Flash-Next and the gain of each stage that changed
-something, against the stage before:
+The stages, in the order those searches ran them (the drafts and the submits have traded places since), with what the
+search picked for Flash-Next and the gain of each stage that changed something, against the stage before:
 
 | stage | setting | what it changes | UD-Q4_K_XL | UD-Q6_K_XL |
 |---|---|---|---|---|
