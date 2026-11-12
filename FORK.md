@@ -504,6 +504,12 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
     --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-n-ubatch 2048
 ```
 
+A model that fits whole on one RX 480 gains from upstream's `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`. Qwen3.5-9B UD-Q4_K_XL,
+alone on the machine, generated at 25.9 tok/s against 24.8 (+4%, nine passes), with the same prompt speed and the same
+answers. RADV offers two queue families that compute: the backend computes on the compute-only one and transfers on the
+graphics one, and the switch swaps them. With a hot spare cache on the R9700 the swap costs more than it gives
+([Tried and not kept](#tried-and-not-kept)); it isn't measured with the cache on the RX 480s.
+
 ## The ladder
 
 One request set on the 1920X + R9700, each rung adding one thing to the rung before it. Every rung has the same
@@ -626,6 +632,13 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   instead of one an expert slot, 10x less over the bus): as one op it costs 8–19 µs a layer and saved nothing (verify
   batches within 1%); the copy it removed was already hidden behind other work. Kept for prompt batches, where the
   copy is 80 MiB a layer (`LLAMA_MOE_HOST_SUM=64`).
+- **Upstream's `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` on the R9700.** The backend then computes on RADV's graphics family
+  and transfers on its compute family, the other way round from its default. Generation got faster: 45.16 → 46.28
+  tok/s by the tuning requests' balance on Q4 and 35.18 → 36.22 on Q6, both passes ahead. But the cache's uploads on
+  the compute family were three times slower. A restore took 3.3 s instead of 2.3, prompts took 18–21% longer, and an
+  agent's whole turns were 15–18% slower. The graphics family has one queue, so both on it would leave no queue for
+  the uploads in the background. It pays where nothing is uploaded after the load
+  ([1920X + RX480x2](#1920x--rx480x2)).
 - **The MTP draft's experts on an RX 480 beside the R9700,** with the 2550 MiB they free given to the cache (23450
   MiB, 17 more slots a layer on Q4 and 12 on Q6). It is the one use of a second card that leaves the R9700's own chain
   alone: only the draft crosses to the other card. Four arms (the residual handed from GPU to GPU or through the
