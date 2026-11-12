@@ -174,8 +174,8 @@ python3 moe-hot-spare-tune.py --server build/bin/llama-server -m model.gguf --mi
   `{"prompt": [token ids of the whole prompt], "n": answer tokens}`, sent to `/completion`. Token ids belong to one
   model's vocabulary.
 - **The environment** the tool sweeps (`GOMP_SPINCOUNT`, `OMP_WAIT_POLICY`, `GGML_CPU_MMID_FLAT`,
-  `GGML_VK_FLOPS_PER_SUBMIT`, `LLAMA_MOE_CACHE_COPY_THREADS`, `LLAMA_MOE_PREDICTOR_ANSWER_CAP` and the `LLAMA_ARG_`
-  variables of the options it sets) is ignored with a warning. Anything else carries through to every run and is
+  `GGML_VK_FLOPS_PER_SUBMIT`, `LLAMA_MOE_CACHE_COPY_THREADS`, `LLAMA_MOE_PREDICTOR_ANSWER_CAP`,
+  `LLAMA_MOE_PREDICTOR_ANSWER_GAIN` and the `LLAMA_ARG_` variables of the options it sets) is ignored with a warning. Anything else carries through to every run and is
   recorded: settings the tool doesn't search, such as `LLAMA_MOE_CACHE_REFILL_BG=1`, `LLAMA_MOE_RESIZE_SPLIT=3072`, the
   shared jit slots (`LLAMA_MOE_CACHE_JIT_SHARE=1` and its companions) or `LLAMA_OFFLOAD_FAST=1`, go there.
 - **`--dry-run`** prints the plan and what's missing. **`--summary`** rewrites the reports from the runs on disk.
