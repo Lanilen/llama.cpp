@@ -1788,6 +1788,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_predictor_device = params.moe_cache_predictor_device.empty() ? nullptr : params.moe_cache_predictor_device.c_str();
     cparams.moe_cache_predictor_start  = params.moe_cache_predictor_start.empty()  ? nullptr : params.moe_cache_predictor_start.c_str();
     cparams.moe_cache_predictor_answer_cap = params.moe_cache_predictor_answer_cap;
+    cparams.moe_cache_predictor_answer_gain = params.moe_cache_predictor_answer_gain;
     cparams.moe_cache_jit              = params.moe_cache_jit;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 

@@ -763,6 +763,15 @@ struct llama_moe_cache::impl {
     size_t  answer_cap  = 0;     // --moe-cache-predictor-answer-cap: swaps of the answer's start without one (0: all)
     bool    turn_seen   = false; // the turn's first prompt ubatch came (the text start ran or was skipped)
     bool    text_started = false; // the text start ran for this turn
+    float   answer_gain = 0.0f;  // --moe-cache-predictor-answer-gain: the answer's start only makes the swaps that bring
+                                 // at least this many more of the predicted selections (0: every swap over the margin)
+    bool    answer_log  = false; // LLAMA_MOE_PREDICTOR_ANSWER_LOG: a line for each answer's start, its swaps by gain
+    float   full_gain   = 0.0f;  // the least gain of the running full rebalance's swaps
+    bool    full_start  = false; // the running full rebalance is an answer's start
+    bool    full_log    = false; // and its swaps have not been counted yet
+    size_t  n_start     = 0;     // answers' starts, the swaps the prediction asked for at them and the ones they made
+    size_t  n_start_all = 0;
+    size_t  n_start_made = 0;
     size_t  full_left   = SIZE_MAX; // swaps left to the running full rebalance
     size_t  full_cap    = SIZE_MAX; // the swaps of the next full rebalance (the answer's start after a text start)
     std::thread installer;       // fills the staging memory of a text start while the prompt computes
@@ -888,6 +897,12 @@ struct llama_moe_cache::impl {
                 } else if (const char * env = getenv("LLAMA_MOE_PREDICTOR_ANSWER_CAP")) {
                     answer_cap = (size_t) std::max(0, atoi(env));
                 }
+                if (params.answer_gain >= 0.0f) {
+                    answer_gain = params.answer_gain;
+                } else if (const char * env = getenv("LLAMA_MOE_PREDICTOR_ANSWER_GAIN")) {
+                    answer_gain = std::max(0.0f, (float) atof(env));
+                }
+                answer_log = getenv("LLAMA_MOE_PREDICTOR_ANSWER_LOG") != nullptr;
                 if (!params.predictor_start.empty()) {
                     predictor_start = llama_moe_predictor::load(params.predictor_start, params.predictor_device, (int32_t) model.hparams.n_layer(),
                                                                 (int32_t) model.hparams.n_expert, (int32_t) model.hparams.n_embd);
@@ -1767,7 +1782,10 @@ struct llama_moe_cache::impl {
                     }
                     full = true;
                 }
-                // an answer started with a prediction: its experts replace the others
+                // an answer started with a prediction: its experts replace the others, the ones that gain enough with
+                // --moe-cache-predictor-answer-gain (one count of swaps is too few where the topic changed and too
+                // many in the next turn of the same work, whose short answer ends before they pay)
+                const bool answer_start = pred_start;
                 full = full || pred_start;
                 pred_start = false;
                 rebalance = false;
@@ -1775,6 +1793,9 @@ struct llama_moe_cache::impl {
                     full_bg   = true;
                     full_left = full_cap;
                     full_cap  = SIZE_MAX;
+                    full_gain  = answer_start ? answer_gain : 0.0f;
+                    full_start = answer_start;
+                    full_log   = answer_start;
                     st.n_full++;
                 }
                 if (full_bg) {
@@ -1882,9 +1903,34 @@ struct llama_moe_cache::impl {
         const std::vector<swap> swaps = plan_swaps(budget_bytes);
         size_t spent = 0;
         bool complete = true;
+        if (no_wait && full_log) {
+            // the swaps the prediction asks for at this answer's start, by how many selections each brings
+            full_log = false;
+            static const float steps[] = { 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f };
+            size_t n_empty = 0, n_ge[std::size(steps)] = {};
+            for (const swap & sw : swaps) {
+                if (std::isinf(sw.gain)) {
+                    n_empty++;
+                    continue;
+                }
+                for (size_t i = 0; i < std::size(steps); ++i) {
+                    n_ge[i] += sw.gain >= steps[i];
+                }
+            }
+            n_start++;
+            n_start_all += swaps.size() - n_empty;
+            if (answer_log) {
+                std::string by;
+                for (size_t i = 0; i < std::size(steps); ++i) {
+                    by += format(" %g: %zu,", steps[i], n_ge[i]);
+                }
+                LLAMA_LOG_INFO("%s: answer start: %zu swaps over the margin, %zu more into empty slots; by gain of at least%s at most %s swaps, least gain %g\n",
+                        __func__, swaps.size() - n_empty, n_empty, by.c_str(), full_left == SIZE_MAX ? "all" : std::to_string(full_left).c_str(), (double) full_gain);
+            }
+        }
         for (const swap & sw : swaps) {
-            if (no_wait && full_left == 0) {
-                break;
+            if (no_wait && (full_left == 0 || sw.gain < full_gain)) {
+                break; // (the swaps come best gain first)
             }
             group & g = groups[sw.ig];
             const int32_t n_expert = g.ref[0]->ne[2];
@@ -1918,6 +1964,7 @@ struct llama_moe_cache::impl {
             }
             st.swaps++;
             st.bytes += expert_size;
+            n_start_made += no_wait && full_start && old_key >= 0;
             // the slots lent to the jit come back empty after a batch that used it: filling them is not one of the answer's
             // capped swaps, which the cache had without them
             bool refill = false;
@@ -3325,6 +3372,11 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu predictions, %.2f ms each%s\n",
                 n_pred, n_pred > 0 ? t_pred_us/1000.0/n_pred : 0.0,
                 answer_cap > 0 ? format(" (an answer's start without a text start: at most %zu swaps)", answer_cap).c_str() : "");
+            if (n_start > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu answers' starts, %.0f swaps asked for and %.0f made at each%s\n",
+                    n_start, (double) n_start_all/n_start, (double) n_start_made/n_start,
+                    answer_gain > 0.0f ? format(" (the ones that bring at least %g more selections)", (double) answer_gain).c_str() : "");
+            }
         }
         if (predictor_start) {
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, text starts: %zu, %.0f swaps each, %.2f ms each on the generation thread "
