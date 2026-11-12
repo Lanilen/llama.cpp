@@ -696,7 +696,9 @@ class Tuner:
                     cpu=(self.hw or {}).get("cpu"), devices=[d["description"] for d in (self.hw or {}).get("devices", [])])
 
     def user_env(self):
-        return {k: base_name(v) for k, v in sorted(self.env.items()) if k.startswith(("LLAMA_", "GGML_"))}
+        """The settings the search runs with and doesn't set itself: llama.cpp's and ggml's variables, and the RADV driver's
+        (RADV_PERFTEST=transfer_queue changes which queue the cache's uploads run on)."""
+        return {k: base_name(v) for k, v in sorted(self.env.items()) if k.startswith(("LLAMA_", "GGML_", "RADV_"))}
 
     def open_out(self, version, create):
         """Results of another setup must not mix with these."""
