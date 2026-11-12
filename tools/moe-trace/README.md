@@ -213,9 +213,9 @@ The rest of this section: [the search](#the-search), [the method](#the-method), 
 
 ### The search
 
-A run takes about 5 minutes and each configuration runs at least twice, so all the combinations of the default values
-would take months. The search instead changes one setting per stage and carries the best one forward. A configuration
-that a stage carries over isn't run again.
+A run takes about 5 minutes on the 1920X + R9700 and each configuration runs at least twice, so all the combinations of
+the default values would take months. The search instead changes one setting per stage and carries the best one forward.
+A configuration that a stage carries over isn't run again.
 
 **The starting point** is llama.cpp's defaults with your `--mib` and your placement: nothing set for the CPU and Vulkan
 variables, no `--moe-cache-jit`, no predictor, the refill at its default, budget 10, 3 drafts, 4 copy threads and your
@@ -241,11 +241,15 @@ variables, no `--moe-cache-jit`, no predictor, the refill at its default, budget
 | confirm | the result against the starting point | See [the method](#the-method). |
 
 **How many runs.** With a predictor and a draft model, and a build and machine that every stage can act on, `--dry-run`
-counts 53 runs for one round on a 12-core CPU, 4h25m at 5 minutes a run. That count is a floor: it assumes every stage
-keeps the starting point, so it has no `answer-cap` stage, no value past the end of a list and no stage tried again. The
-lab's three searches made 57 to 91 runs
-([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)). The default `--hours 4` is a
-little less than that plan, so a default start leaves its last stages for the next one.
+counts 53 runs for one round on a 12-core CPU. That count is a floor: it assumes every stage keeps the starting point,
+so it has no `answer-cap` stage, no value past the end of a list and no stage tried again. The lab's three searches
+made 57 to 91 runs ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
+
+**How long** depends on the machine. The plan counts `--run-minutes` (5) for a run until one has been timed, and the
+median of the real runs after that. On the 1920X + R9700 a run does take about 5 minutes, so the 53 runs are 4h25m
+there, a little more than the default `--hours 4`. On the 1920X + RX480x2 the same requests take about 17 minutes a
+run; its searches ran with `--scale 0.5`, which shortens the requests, at 5 to 6 minutes a run. On your machine, look
+at the first runs' times and at what the summary lists as not searched.
 
 **The order, and what is tried again.** One setting at a time finds the best combination only while each stage's
 choice still holds after the later ones are made. So the stages run in the order of what depends on what: first the
