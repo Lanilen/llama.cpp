@@ -204,7 +204,7 @@ the confirm stage measures everything the search found.
 | `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan build that has the switch; since 2026-11-10 upstream's own rule does this and the stage is skipped. |
 | `predictor` | none, `--moe-cache-predictor`, also `--moe-cache-predictor-start` | The largest effect of the cache's settings. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
 | `refill` | `--refills 0,64,128` | Tested at the predictor setting just chosen. |
-| `answer-cap` | `--answer-cap-shares 0.075,0.15,0.3` of the cache's slots, against 0, all (`--moe-cache-predictor-answer-cap`) | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. The slots come from the warm-up's log, so the caps scale with the cache (500, 1000 and 2000 swaps of 6731 slots on the 1920X + R9700); `--answer-caps` gives swap counts instead. The tuner doesn't search `--moe-cache-predictor-answer-gain` (the answer's start by what each swap gains, [docs/moe-predictor.md](../../docs/moe-predictor.md#the-answers-start-by-gain)); given after `--`, it applies to every run, and each cap tried counts on top of it. |
+| `answer-cap` | `--answer-cap-shares 0.075,0.15,0.3` of the cache's slots (`--moe-cache-predictor-answer-cap`) and `--answer-gains 4,8,16` (`--moe-cache-predictor-answer-gain`), against a full rebalance | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. The stage limits it by a count of swaps or by what each swap gains ([docs/moe-predictor.md](../../docs/moe-predictor.md#the-answers-start-by-gain)), one or the other: the two compete, and which wins depends on the machine and the work. The slots come from the warm-up's log, so the caps scale with the cache (500, 1000 and 2000 swaps of 6731 slots on the 1920X + R9700); `--answer-caps` gives swap counts instead. A build without the gain option tries the caps only. Names read `a500` for a cap and `a0g8` for a gain of 8. |
 | `drafts` | `--draft-n 1,2` and the start, 3 | Sets how much each pass verifies, which the budget and the hit rate then count. |
 | `gate` | `--draft-gates 3:0.6,5:0.8,8:0.9` (`--spec-draft-n-max`:`--spec-draft-p-min`) | Not in the defaults: gates lose to the graph rebuild that each new verify length costs. `--stages` adds it. |
 | `budget` | `--budgets 5,20` and the start, 10 | After the drafts, because the budget counts every token of a verify batch. |
@@ -219,7 +219,8 @@ nothing set for the CPU and Vulkan variables, the JIT and the answer cap, budget
 4 copy threads and your `-t`. The lists of values to try are spaced around what suited the 1920X + R9700, so another
 machine's best value can lie past an end. When a stage's winner is the first or last value of its list, the stage goes
 on past it, up to `--extend` (2) more values each way, and decides again:
-- the budget, the chunks, the JIT, the refill, the answer cap and the copy threads double or halve;
+- the budget, the chunks, the JIT, the refill, the answer cap or gain (whichever won) and the copy threads double or
+  halve;
 - the submit size steps by the list's own spacing, 4×;
 - the drafts go one at a time, up to 7: 8 drafts make a 9-token pass, which leaves the mat-vec kernels;
 - the spin has one value, so it tries one more each way, 4× apart;

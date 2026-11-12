@@ -63,22 +63,25 @@ RESERVED_ARGS = {
     "--log-verbosity", "--log-file", "--log-disable", "--no-log-timestamps", "--moe-cache-mib", "--moe-cache-mode", "--moe-cache-budget",
     "--moe-cache-refill", "--moe-cache-predictor", "--moe-cache-predictor-start", "--moe-cache-save", "--spec-draft-n-max",
     "--spec-draft-p-min", "--draft-p-min", "-md", "--model-draft", "--spec-draft-model", "--moe-cache-jit", "--moe-cache-predictor-answer-cap",
+    "--moe-cache-predictor-answer-gain",
 }
 RESERVED_ENV = [
     "LLAMA_ARG_MOE_CACHE_MIB", "LLAMA_ARG_MOE_CACHE_MODE", "LLAMA_ARG_MOE_CACHE_BUDGET", "LLAMA_ARG_MOE_CACHE_REFILL",
     "LLAMA_ARG_MOE_CACHE_PREDICTOR", "LLAMA_ARG_MOE_CACHE_PREDICTOR_START", "LLAMA_ARG_MOE_CACHE_SAVE", "LLAMA_ARG_SPEC_DRAFT_MODEL",
     "LLAMA_ARG_SPEC_DRAFT_N_MAX", "LLAMA_ARG_SPEC_DRAFT_P_MIN", "LLAMA_MOE_CACHE_COPY_THREADS", "LLAMA_ARG_MOE_CACHE_JIT",
     "LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_CAP", "LLAMA_MOE_PREDICTOR_ANSWER_CAP", "LLAMA_ARG_THREADS",
+    "LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_GAIN", "LLAMA_MOE_PREDICTOR_ANSWER_GAIN",
     "GOMP_SPINCOUNT", "OMP_WAIT_POLICY", "GGML_CPU_MMID_FLAT", "GGML_VK_FLOPS_PER_SUBMIT",
 ]
 # how a stage's list goes on past its ends, when its winner is the first or last value of it: the field, the step (a factor,
-# or +1), the lowest and the highest value it may reach, and the value that means "not set" (never extended from)
+# or +1), the lowest and the highest value it may reach, and the value that means "not set" (never extended from); a
+# stage with two fields (the answer's start: a cap or a gain) goes on in the one its winner uses
 EXTEND = {
     "omp-spin": ("spin", 4, 1000000, 1000000000, 0),
     "cpu-chunks": ("chunks", 2, 8, 4096, 0),
     "submits": ("submit_mflops", 4, 1, 10000, 0),
     "refill": ("refill", 2, 16, 4096, 0),
-    "answer-cap": ("answer_cap", 2, 10, 100000, 0),
+    "answer-cap": [("answer_cap", 2, 10, 100000, 0), ("answer_gain", 2, 0.5, 512, 0)],
     "drafts": ("n_max", "+1", 1, 7, None),  # 8 drafts make a 9-token pass, which leaves the mat-vec kernels
     "budget": ("budget", 2, 1, 1000, None),
     "mib": ("mib", None, None, None, None),  # down only: a larger cache may not fit
@@ -88,7 +91,8 @@ EXTEND = {
 
 # what each stage needs from the server's build: a string of its binary or libraries
 FEATURES = {"libgomp": b"libgomp", "cpu_chunks": b"GGML_CPU_MMID_FLAT", "submits": b"GGML_VK_FLOPS_PER_SUBMIT",
-            "jit": b"--moe-cache-jit", "answer_cap": b"--moe-cache-predictor-answer-cap"}
+            "jit": b"--moe-cache-jit", "answer_cap": b"--moe-cache-predictor-answer-cap",
+            "answer_gain": b"--moe-cache-predictor-answer-gain"}
 # allowed in your placement, but they change the answers: reported in the results
 ACCURACY_ARGS = {
     "-ctk", "--cache-type-k", "-ctv", "--cache-type-v", "--override-kv", "--repeat-penalty", "--presence-penalty",
@@ -598,6 +602,7 @@ class Config:
     copy_threads: int = DEFAULT_COPY_THREADS
     jit: int = 0                       # --moe-cache-jit
     answer_cap: int = 0                # --moe-cache-predictor-answer-cap, 0 = all of the swaps
+    answer_gain: float = 0.0           # --moe-cache-predictor-answer-gain, 0 = every swap; the search sets a cap or a gain, not both
     threads: int = 0                   # -t, 0 = as the placement says
     spin: int = 0                      # GOMP_SPINCOUNT, 0 = not set
     chunks: int = 0                    # GGML_CPU_MMID_FLAT, 0 = not set
@@ -606,7 +611,7 @@ class Config:
     def name(self):
         draft = f"-d{self.n_max}-g{self.p_min:g}" if self.n_max is not None else ""
         return (f"p{self.predictor}-r{self.refill}-b{self.budget:g}{draft}-m{self.mib.replace(',', '_')}-ct{self.copy_threads}"
-                f"-j{self.jit}-a{self.answer_cap}-t{self.threads}-s{self.spin / 1e6:g}M-f{self.chunks}-v{self.submit_mflops}M")
+                f"-j{self.jit}-a{self.answer_cap}{f'g{self.answer_gain:g}' if self.answer_gain else ''}-t{self.threads}-s{self.spin / 1e6:g}M-f{self.chunks}-v{self.submit_mflops}M")
 
     def env(self):
         """The environment of a configuration, next to the placement's."""
@@ -744,6 +749,8 @@ class Tuner:
             a += ["--moe-cache-jit", str(cfg.jit)]
         if cfg.answer_cap:
             a += ["--moe-cache-predictor-answer-cap", str(cfg.answer_cap)]
+        if cfg.answer_gain:
+            a += ["--moe-cache-predictor-answer-gain", f"{cfg.answer_gain:g}"]
         return a
 
     def check_fits(self, srv):
@@ -948,6 +955,11 @@ class Tuner:
         spec = EXTEND.get(stage)
         if not spec:
             return []
+        if isinstance(spec, list):
+            # the field the winner uses
+            spec = next((sp for sp in spec if getattr(winner, sp[0]) != sp[4]), None)
+            if spec is None:
+                return []
         field, step, lo, hi, off = spec
         if field == "mib":
             sizes = sorted({tuple(int(x) for x in c.mib.split(",")) for c in cands}, key=sum)
@@ -1005,7 +1017,11 @@ class Tuner:
         elif stage == "submits":
             c = [cur] + [replace(cur, submit_mflops=n) for n in o.submit_mflops]
         elif stage == "answer-cap":
-            c = [cur] + [replace(cur, answer_cap=n) for n in self.answer_caps()]
+            # the answer's start by count or by what each swap gains: the two compete, and which one wins depends on
+            # the machine (how much an upload costs against a miss) and on the work
+            c = [cur] + [replace(cur, answer_cap=n, answer_gain=0.0) for n in self.answer_caps()]
+            if self.features["answer_gain"]:
+                c += [replace(cur, answer_cap=0, answer_gain=g) for g in o.answer_gains]
         elif stage == "jit":
             c = [cur] + [replace(cur, jit=n) for n in o.jits]
         elif stage == "cpu-threads":
@@ -1512,6 +1528,8 @@ def parse_args(argv):
     ap.add_argument("--cpu-chunks", type=list_of(int), default=[64, 128, 256], help="GGML_CPU_MMID_FLAT values to try: the CPU's experts in chunks of this many rows (default: 64,128,256)")
     ap.add_argument("--submit-mflops", type=list_of(int), default=[25, 100], help="GGML_VK_FLOPS_PER_SUBMIT values to try, in millions (default: 25,100)")
     ap.add_argument("--answer-caps", type=list_of(int), help="--moe-cache-predictor-answer-cap values to try (default: by --answer-cap-shares; the search starts at 0, all)")
+    ap.add_argument("--answer-gains", type=list_of(float), default=[4.0, 8.0, 16.0], help="--moe-cache-predictor-answer-gain values to try in the answer-cap stage, without a cap: "
+                    "the answer's start by what each swap gains, against the caps (default: 4,8,16; none on a build without the option)")
     ap.add_argument("--answer-cap-shares", type=list_of(float), default=[0.075, 0.15, 0.3], help="answer caps to try as shares of the cache's slots, read from the warm-up's log (default: 0.075,0.15,0.3)")
     ap.add_argument("--jits", type=list_of(int), default=[4, 8, 16], help="--moe-cache-jit values to try (default: 4,8,16; the search starts at 0, off)")
     ap.add_argument("--cpu-threads", type=list_of(int), help="-t values to try (default: the physical cores and a quarter fewer, and the performance cores alone on a hybrid CPU)")
