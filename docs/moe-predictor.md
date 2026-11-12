@@ -218,8 +218,9 @@ topic (a story, questions after 2k–3k tokens of code and of documentation, an 
 - The uploads change little: 16% fewer swaps than the cap of 500 on Q4, 19% more than the cap of 125 on Q6, with 0.5
   and 3.1 more points of hits.
 
-The tuning script's `answer-cap` stage tries both, caps and gains, and keeps whichever is ahead on the machine. Given
-both at once, the answer's start stops at whichever limit comes first.
+The tuning script's `answer-cap` stage tries both, caps and gains, and keeps whichever is ahead on the machine, and its
+`predictor` stage compares the predictor with a gain against no predictor, not only at a full rebalance. Given both at
+once, the answer's start stops at whichever limit comes first.
 
 #### The predictor against the decayed scores
 

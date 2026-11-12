@@ -3,8 +3,10 @@
 
 Each configuration answers the same requests at temperature 0 on a fresh server, at least twice, the order reversed in
 the second pass. One setting changes per stage and the best one so far carries on. A setting wins only if its gain is
-larger than the noise measured between the passes, and a last stage compares the result with the starting point. Python
-3.8+, standard library only: copy this file to another machine. Stop it at any time, the next start skips complete runs.
+larger than the noise measured between the passes. The stages run in the order of what depends on what, and when one
+moves the result a lot, the earlier stages that depend on it are tried again. A last stage compares the result with the
+starting point. Python 3.8+, standard library only: copy this file to another machine. Stop it at any time, the next
+start skips complete runs.
 
     python3 moe-hot-spare-tune.py --server build/bin/llama-server -m model.gguf --mib 8000 --out tune \\
         --predictor pred.gguf --draft-model mtp.gguf --hours 4 \\
@@ -52,8 +54,32 @@ DEFAULT_BUDGET = 10.0     # --moe-cache-budget
 DEFAULT_REFILL = 128      # --moe-cache-refill, without a predictor; 0 with one
 DEFAULT_COPY_THREADS = 4  # LLAMA_MOE_CACHE_COPY_THREADS
 DEFAULT_N_MAX = 3         # --spec-draft-n-max
-ALL_STAGES = ["omp-spin", "cpu-chunks", "submits", "predictor", "refill", "answer-cap", "drafts", "gate", "budget", "mib", "jit", "threads", "cpu-threads"]
+# The order puts first what the others depend on and what moves the most: the cost of the CPU's experts, then the tokens a
+# pass verifies, then what the cache holds, then how it is kept.
+ALL_STAGES = ["omp-spin", "cpu-chunks", "drafts", "gate", "predictor", "refill", "answer-cap", "submits", "budget", "mib", "jit", "threads", "cpu-threads"]
 DEFAULT_STAGES = [s for s in ALL_STAGES if s != "gate"]  # gates lose to the graph rebuild of each new verify length
+# What depends on what. A stage's choice holds while the settings it was made with stay where they were: when a stage
+# moves the objective by --swing percent or more, the stages listed for it that were decided before it are tried again
+# after the list, with the values they tried before, and a wide move there queues its own. A stage later in the list
+# runs with the move in place anyway.
+DEPENDS = {
+    # the CPU computes the experts that miss the cache: what a miss costs sets what a draft, a swap and a slot are worth
+    "omp-spin":    ["cpu-chunks", "cpu-threads", "drafts", "gate", "predictor", "answer-cap", "budget"],
+    "cpu-chunks":  ["omp-spin", "cpu-threads", "drafts", "gate"],
+    "cpu-threads": ["omp-spin", "cpu-chunks", "drafts", "gate", "threads"],
+    # the tokens a pass verifies: the size of the CPU's and the GPU's work in a pass, and the experts a pass wants
+    "drafts":      ["omp-spin", "cpu-chunks", "submits", "predictor", "refill", "answer-cap", "budget", "jit"],
+    "gate":        ["omp-spin", "cpu-chunks", "submits", "predictor", "refill", "answer-cap", "budget", "jit"],
+    # what the cache holds, and so the misses that are left to the others
+    "predictor":   ["drafts", "gate", "refill", "answer-cap", "budget", "jit"],
+    "mib":         ["drafts", "gate", "predictor", "refill", "answer-cap", "budget", "jit"],
+    # how the cache is kept: the swaps of a token, and what one costs
+    "refill":      ["budget"],
+    "answer-cap":  ["budget"],
+    "budget":      ["refill", "answer-cap", "jit"],
+    "jit":         ["answer-cap", "budget"],
+    "threads":     ["answer-cap", "budget"],
+}
 # the stages that a speed of the whole turn judges, not the objective: they change prompts more than generation
 STAGE_METRIC = {"jit": "agent_turn"}
 
@@ -640,6 +666,7 @@ class Tuner:
         self.visited = {}
         self.decisions = []
         self.not_searched = []
+        self.not_revisited = []
         self.final = self.confirm = None
         self.history = {}
         self.base = Config(mib=o.mib, n_max=DEFAULT_N_MAX if self.draft_on else None, p_min=0.0 if self.draft_on else None)
@@ -950,6 +977,12 @@ class Tuner:
             return [500, 1000, 2000]
         return list(dict.fromkeys(max(10, int(round(f * slots / 10)) * 10) for f in self.o.answer_cap_shares))
 
+    def answer_starts(self, cur, both):
+        """The answer's starts to try in place of cur's: by count and by gain, or one kind only (by gain if the build can)."""
+        caps = [replace(cur, answer_cap=n, answer_gain=0.0) for n in self.answer_caps()] if self.features["answer_cap"] else []
+        gains = [replace(cur, answer_cap=0, answer_gain=g) for g in self.o.answer_gains] if self.features["answer_gain"] else []
+        return caps + gains if both else gains or caps
+
     def extensions(self, stage, cands, winner):
         """The next values past the end of a stage's list that its winner sits at, or none."""
         spec = EXTEND.get(stage)
@@ -1010,6 +1043,7 @@ class Tuner:
         if why:
             self.skipped.setdefault(stage, why)
             return [cur]
+        self.skipped.pop(stage, None)  # it could not act earlier in the search and can now
         if stage == "omp-spin":
             c = [cur] + [replace(cur, spin=s) for s in o.spin_counts]
         elif stage == "cpu-chunks":
@@ -1019,17 +1053,19 @@ class Tuner:
         elif stage == "answer-cap":
             # the answer's start by count or by what each swap gains: the two compete, and which one wins depends on
             # the machine (how much an upload costs against a miss) and on the work
-            c = [cur] + [replace(cur, answer_cap=n, answer_gain=0.0) for n in self.answer_caps()]
-            if self.features["answer_gain"]:
-                c += [replace(cur, answer_cap=0, answer_gain=g) for g in o.answer_gains]
+            c = [cur] + self.answer_starts(cur, True)
         elif stage == "jit":
             c = [cur] + [replace(cur, jit=n) for n in o.jits]
         elif stage == "cpu-threads":
             c = [cur] + [replace(cur, threads=n) for n in self.cpu_thread_counts(cur)]
         elif stage == "predictor" and o.predictor:
-            c = [cur, replace(cur, predictor=0, refill=DEFAULT_REFILL), replace(cur, predictor=1, refill=0)]
+            # the predictor is judged with its answer's start too. At a full rebalance of every answer it can lose where
+            # uploads are slow, by the swaps that cost more than they gain, and the answer-cap stage, which is there to
+            # settle that, would never run
+            on = replace(cur, predictor=1, refill=0)
+            c = [cur, replace(cur, predictor=0, refill=DEFAULT_REFILL, answer_cap=0, answer_gain=0.0), on] + self.answer_starts(on, False)
             if o.predictor_start:
-                c.append(replace(cur, predictor=2, refill=0))
+                c.append(replace(cur, predictor=2, refill=0, answer_cap=0, answer_gain=0.0))
         elif stage == "refill":
             c = [cur] + [replace(cur, refill=r) for r in o.refills]
         elif stage == "drafts" and self.draft_on:
@@ -1052,6 +1088,7 @@ class Tuner:
         o = self.o
         self.visited, self.decisions, self.not_searched, self.skipped = {}, [], [], {}
         self.final = self.confirm = None
+        self.not_revisited = []
         if execute:
             self.ensure(self.base, 0, "warm-up")
             if (self.base.name(), 0) not in self.runs:
@@ -1061,53 +1098,64 @@ class Tuner:
         confirm_ids = [f"c{i}" for i in numbered]
         tried = {}  # stage: the values its earlier rounds tried, as {field: value} changes
         for rnd in range(o.rounds):
-            for stage in o.stages:
-                cands = self.candidates(stage, cur)
-                if rnd and stage not in self.skipped:
-                    # a later round tries again every value the stage tried before, its extensions and its old starting
-                    # value too, now with the other stages' choices in place
-                    cands = list(dict.fromkeys(cands + [replace(cur, **d) for d in tried.get(stage, [])]))
-                if len(cands) < 2:
-                    continue
-                need = self.missing(cands, numbered)
-                if execute and need:
-                    # the runs that the last stage needs stay reserved
-                    if self.fits_budget(len([1 for c, p in need if c.name() not in self.failed_now]), 2 * o.passes):
-                        self.measure(cands, numbered, stage)
-                    else:
-                        log(f"--- {stage}: skipped, {len(need)} runs do not fit the time budget")
-                for c in cands:
-                    self.visited.setdefault(c.name(), c)
-                incumbent, added = cur, []
-                cur = self.decide(stage, cands, cur, numbered)
-                end = cur  # the winner of the stage's own list
-                for _ in range(o.extend):
-                    ext = [c for c in self.extensions(stage, cands, cur) if c not in cands]
-                    if not ext:
-                        break
-                    need = self.missing(ext, numbered)
+            todo, again = list(o.stages), 0
+            while todo:
+                queued = []  # the stages to try again after this list: a wide move changed what they were decided with
+                for i, stage in enumerate(todo):
+                    cands = self.candidates(stage, cur)
+                    if (rnd or again) and stage not in self.skipped:
+                        # a later round, or a stage tried again, takes every value the stage tried before, its extensions
+                        # and its old starting value too, now with the other stages' choices in place
+                        cands = list(dict.fromkeys(cands + [replace(cur, **d) for d in tried.get(stage, [])]))
+                    if len(cands) < 2:
+                        continue
+                    need = self.missing(cands, numbered)
                     if execute and need:
-                        if self.fits_budget(len(need), 2 * o.passes):
-                            log(f"--- {stage}: the winner is at the end of the list, trying {', '.join(change(cur.name(), c.name()) for c in ext)}")
-                            self.measure(ext, numbered, stage)
+                        # the runs that the last stage needs stay reserved
+                        if self.fits_budget(len([1 for c, p in need if c.name() not in self.failed_now]), 2 * o.passes):
+                            self.measure(cands, numbered, stage)
                         else:
-                            log(f"--- {stage}: its extension does not fit the time budget")
-                    if any((c.name(), p) not in self.runs and (c.name(), p) not in self.failed for c in ext for p in numbered):
-                        break  # not measured: the stage's decision stands
-                    for c in ext:
+                            log(f"--- {stage}: skipped, {len(need)} runs do not fit the time budget")
+                    for c in cands:
                         self.visited.setdefault(c.name(), c)
-                    cands, added = cands + ext, added + [c.name() for c in ext]
-                    self.decisions.pop()
-                    cur = self.decide(stage, cands, incumbent, numbered)
-                    self.decisions[-1]["extended"] = list(added)
-                    cur = self.hold_end(stage, end, cur, numbered)
-                if rnd and self.decisions and self.decisions[-1]["stage"] == stage:
-                    self.decisions[-1]["stage"] = f"{stage} ({rnd + 1})"
-                changed = [f.name for f in fields(Config) if any(getattr(c, f.name) != getattr(incumbent, f.name) for c in cands)]
-                for c in cands:
-                    d = {f: getattr(c, f) for f in changed}
-                    if d not in tried.setdefault(stage, []):
-                        tried[stage].append(d)
+                    incumbent, added = cur, []
+                    cur = self.decide(stage, cands, cur, numbered)
+                    end = cur  # the winner of the stage's own list
+                    for _ in range(o.extend):
+                        ext = [c for c in self.extensions(stage, cands, cur) if c not in cands]
+                        if not ext:
+                            break
+                        need = self.missing(ext, numbered)
+                        if execute and need:
+                            if self.fits_budget(len(need), 2 * o.passes):
+                                log(f"--- {stage}: the winner is at the end of the list, trying {', '.join(change(cur.name(), c.name()) for c in ext)}")
+                                self.measure(ext, numbered, stage)
+                            else:
+                                log(f"--- {stage}: its extension does not fit the time budget")
+                        if any((c.name(), p) not in self.runs and (c.name(), p) not in self.failed for c in ext for p in numbered):
+                            break  # not measured: the stage's decision stands
+                        for c in ext:
+                            self.visited.setdefault(c.name(), c)
+                        cands, added = cands + ext, added + [c.name() for c in ext]
+                        self.decisions.pop()
+                        cur = self.decide(stage, cands, incumbent, numbered)
+                        self.decisions[-1]["extended"] = list(added)
+                        cur = self.hold_end(stage, end, cur, numbered)
+                    if (rnd or again) and self.decisions and self.decisions[-1]["stage"] == stage:
+                        self.decisions[-1]["stage"] = stage + (f" ({rnd + 1})" if rnd else "") + (" (again)" if again == 1 else f" (again {again})" if again else "")
+                    changed = [f.name for f in fields(Config) if any(getattr(c, f.name) != getattr(incumbent, f.name) for c in cands)]
+                    for c in cands:
+                        d = {f: getattr(c, f) for f in changed}
+                        if d not in tried.setdefault(stage, []):
+                            tried[stage].append(d)
+                    more, swing = self.revisits(stage, incumbent, cur, todo[i + 1:], numbered)
+                    if more:
+                        self.decisions[-1].update(swing=round(swing, 1), revisit=more)
+                        queued += [s for s in more if s not in queued]
+                again += 1
+                todo = [s for s in o.stages if s in queued] if again <= o.revisits else []
+                if queued and not todo:
+                    self.not_revisited = [s for s in o.stages if s in queued]
         self.final = cur
         if cur != self.base:
             need = self.missing([self.base, cur], confirm_ids)
@@ -1117,6 +1165,17 @@ class Tuner:
                 else:
                     log("--- confirm: skipped, its runs do not fit the time budget")
             self.confirm = self.decide_confirm(cur, confirm_ids)
+
+    def revisits(self, stage, old, new, later, pids):
+        """The stages to try again after this one moved from old to new, and the move in percent of the objective: the
+        stages that depend on it when the move is wide, and the ones that could not act before and can now."""
+        if new == old:
+            return [], 0.0
+        a, b = self.mean(old, pids), self.mean(new, pids)
+        swing = 100 * (b / a - 1) if a and b else 0.0
+        out = list(DEPENDS.get(stage, [])) if abs(swing) >= self.o.swing else []
+        out += [s for s in self.skipped if self.applies(s, new) is None]
+        return [s for s in dict.fromkeys(out) if s in self.o.stages and s != stage and s not in later], swing
 
     def values(self, cfg, pids, metric=None):
         rows = [metrics(self.runs[(cfg.name(), p)], self.ref_lengths()) for p in pids if (cfg.name(), p) in self.runs]
@@ -1338,6 +1397,8 @@ class Tuner:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: best was {change(d['incumbent'], best)} at {d['gain']:+.2f} tok/s{by}, needed {d.get('threshold', 0):.2f}")
                 else:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: the fastest{by}")
+                if d.get("revisit"):
+                    L.append(f"              it moved {o.objective} by {d['swing']:+.1f}%: {', '.join(d['revisit'])} {'is' if len(d['revisit']) == 1 else 'are'} tried again after the list")
                 if d.get("extended"):
                     L.append(f"              its list went on past the end: {', '.join(change(d['incumbent'], n).split(' -> ')[-1] for n in d['extended'])}")
                 if d.get("held"):
@@ -1367,6 +1428,9 @@ class Tuner:
         if free:
             L.append("")
             L.append("free GPU memory at exit: " + ", ".join(f"{k} {v} MiB" for k, v in free.items()) + " (a larger --mib may fit, keep the headroom of docs/moe-hot-spare.md)")
+        if self.not_revisited:
+            L.append("")
+            L.append(f"not tried again after the last wide move: {', '.join(self.not_revisited)} (--revisits {o.revisits}; --rounds 2 goes through every stage again)")
         if self.not_searched:
             L.append("")
             L.append(f"not searched yet: {', '.join(self.not_searched)} (start again with the same --out and more --hours to continue)")
@@ -1394,7 +1458,7 @@ class Tuner:
             placement=[base_name(a) for a in self.extra], env=self.user_env(), accuracy_warnings=self.warnings, corpus=self.corpus, scale=o.scale, objective=o.objective,
             passes=o.passes, noise_sd={k: self.noise(k) for k in ("all", "short", "long")},
             requests=[{k: r[k] for k in ("label", "kind", "max_tokens", "session")} for r in self.requests], stage_metrics=STAGE_METRIC,
-            starting_point=self.base.name(), decisions=self.decisions, confirm=self.confirm, not_searched=self.not_searched,
+            starting_point=self.base.name(), decisions=self.decisions, confirm=self.confirm, not_searched=self.not_searched, not_revisited=self.not_revisited,
             recommended=dict(name=cfg.name(), config=asdict(cfg), reason=why, args=self.recommended_line(cfg, False)),
             configs=[r for r in (self.config_row(c, numbered) for c in self.visited.values()) if r],
             failed=[dict(name=k[0], **{"pass": k[1]}, reason=v) for k, v in self.failed.items()], runs=runs)
@@ -1433,6 +1497,8 @@ class Tuner:
         log(f"at most {total} runs, {fmt_time(total * est)} at {est / 60:.1f} minutes per run; time budget {self.o.hours:g} h. The stages that do not fit are skipped, last ones first.")
         log("the configurations of a stage depend on what the stages before it choose: this assumes that they keep the starting point.")
         log(f"a stage whose winner is at an end of its list goes on past it, up to {self.o.extend} more values each way (--extend), 2 runs each.")
+        log(f"a stage that moves {self.o.objective} by {self.o.swing:g}% or more (--swing) has the earlier stages that depend on it tried again after the list, "
+            f"up to {self.o.revisits} times (--revisits): those runs are not counted here.")
 
 
 def fmt_num(v, width, prec):
@@ -1512,6 +1578,8 @@ def parse_args(argv):
     ap.add_argument("--run-minutes", type=float, default=5, help="minutes per run to plan with until a run has been timed (default: %(default)s)")
     ap.add_argument("--passes", type=int, default=2, help="passes per configuration, at least 2 (default: %(default)s)")
     ap.add_argument("--rounds", type=int, default=1, help="times through the stages: a second one revisits the early choices with the later ones in place (default: %(default)s)")
+    ap.add_argument("--swing", type=float, default=5.0, help="a stage that moves the objective by this many percent or more has the earlier stages that depend on it tried again after the list (default: %(default)s)")
+    ap.add_argument("--revisits", type=int, default=2, help="how many times the stages can be tried again in a round after wide moves, 0 = never (default: %(default)s)")
     ap.add_argument("--stages", type=list_of(str), default=DEFAULT_STAGES, help=f"the stages and their order (default: {','.join(DEFAULT_STAGES)}; also gate)")
     ap.add_argument("--objective", choices=["balance", "all", "short", "long", "agent", "agent_turn"], default="balance",
                     help="the speed to optimize: the balance of the three kinds of request (each counts the same), all requests by their tokens, "

@@ -193,26 +193,45 @@ results don't mix.
 
 A run takes about 5 minutes and each configuration runs at least twice, so all the combinations of the default values
 would take months. The search instead changes one setting per stage and carries the best one forward. A configuration
-that a stage carries over isn't run again, so with a predictor and a draft model the plan is about 50 runs, 5–6 hours,
-for one round. The starting point sets none of the CPU and Vulkan variables, no `--moe-cache-jit` and no answer cap, so
+that a stage carries over isn't run again, so with a predictor and a draft model the plan is about 55 runs, 5–6 hours,
+for one round, before anything is tried again (below). The starting point sets none of the CPU and Vulkan variables, no `--moe-cache-jit` and no answer cap, so
 the confirm stage measures everything the search found.
 
 | Stage | Tries | Why it's there |
 | --- | --- | --- |
 | `omp-spin` | `--spin-counts 30000000` against not set (`GOMP_SPINCOUNT`) | GCC's OpenMP spins ~1 ms before its threads sleep, about the gap between two layers' CPU work. Only with a build that links libgomp. |
 | `cpu-chunks` | `--cpu-chunks 64,128,256` against not set (`GGML_CPU_MMID_FLAT`) | How the CPU's experts are cut between its threads; depends on the memory system. |
-| `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan build that has the switch; since 2026-11-10 upstream's own rule does this and the stage is skipped. |
-| `predictor` | none, `--moe-cache-predictor`, also `--moe-cache-predictor-start` | The largest effect of the cache's settings. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
+| `drafts` | `--draft-n 1,2` and the start, 3 | Sets how much each pass verifies: the CPU's and the GPU's work in a pass, and the experts a pass wants. Most of the later stages depend on it. Where the CPU computes many of the experts, one draft can win (1920X + RX480x2: 18.30 tok/s with 1 against 15.70 with 3). |
+| `gate` | `--draft-gates 3:0.6,5:0.8,8:0.9` (`--spec-draft-n-max`:`--spec-draft-p-min`) | Not in the defaults: gates lose to the graph rebuild that each new verify length costs. `--stages` adds it. |
+| `predictor` | none, `--moe-cache-predictor` at a full rebalance and with each of `--answer-gains` (the caps, on a build without the gain), also `--moe-cache-predictor-start` | The largest effect of the cache's settings. It's judged with its answer's start: at a full rebalance of every answer it can lose where uploads are slow, by the swaps that cost more than they gain, and the `answer-cap` stage, which settles that, only runs with a predictor. It changes what the refill is worth, so each runs at its own default refill: 128 without a predictor, 0 with one. |
 | `refill` | `--refills 0,64,128` | Tested at the predictor setting just chosen. |
 | `answer-cap` | `--answer-cap-shares 0.075,0.15,0.3` of the cache's slots (`--moe-cache-predictor-answer-cap`) and `--answer-gains 4,8,16` (`--moe-cache-predictor-answer-gain`), against a full rebalance | Only with the predictor and no start predictor. A full rebalance at an answer's start buys hits with uploads. The stage limits it by a count of swaps or by what each swap gains ([docs/moe-predictor.md](../../docs/moe-predictor.md#the-answers-start-by-gain)), one or the other: the two compete, and which wins depends on the machine and the work. The slots come from the warm-up's log, so the caps scale with the cache (500, 1000 and 2000 swaps of 6731 slots on the 1920X + R9700); `--answer-caps` gives swap counts instead. A build without the gain option tries the caps only. Names read `a500` for a cap and `a0g8` for a gain of 8. |
-| `drafts` | `--draft-n 1,2` and the start, 3 | Sets how much each pass verifies, which the budget and the hit rate then count. |
-| `gate` | `--draft-gates 3:0.6,5:0.8,8:0.9` (`--spec-draft-n-max`:`--spec-draft-p-min`) | Not in the defaults: gates lose to the graph rebuild that each new verify length costs. `--stages` adds it. |
+| `submits` | `--submit-mflops 25,100` against not set (`GGML_VK_FLOPS_PER_SUBMIT`, in millions) | How much Vulkan work goes into a submit; depends on how fast the CPU records against how fast the GPU runs. Only with a Vulkan build that has the switch; since 2026-11-10 upstream's own rule does this and the stage is skipped. |
 | `budget` | `--budgets 5,20` and the start, 10 | After the drafts, because the budget counts every token of a verify batch. |
 | `mib` | `--mibs`, by default 85% of `--mib` | A smaller cache can win if uploads are slow or the card is short of memory. |
 | `jit` | `--jits 4,8,16` against 0, off (`--moe-cache-jit`) | Judged by the agent's whole turns, prompts included, since it speeds up prompts and costs a little generation. Needs prompts of 33 tokens and more that keep the cache (`--moe-cache-batch`). |
 | `threads` | `--copy-threads 2,8` and the start, 4 (`LLAMA_MOE_CACHE_COPY_THREADS`) | A small effect. |
 | `cpu-threads` | `--cpu-threads`, by default the physical cores and a quarter fewer, and on a hybrid CPU the performance cores alone, against the placement's `-t` | Replaces `-t` in the placement. A second thread on a core shares its arithmetic, and a slow core holds the others up at each barrier. The cores come from `/proc/cpuinfo` and sysfs on Linux (Intel's `cpu_core` and `cpu_atom` for hybrid CPUs), `sysctl` on macOS, and elsewhere the logical CPUs and half of them. |
 | confirm | the result against the starting point | See below. |
+
+**The order, and what is tried again.** One setting at a time finds the best combination only while each stage's
+choice still holds after the later ones are made. So the stages run in the order of what depends on what: first the
+cost of the CPU's experts, then the tokens a pass verifies, then what the cache holds, and last how the cache is kept.
+Most choices then never need a second look. When a stage still moves the objective by `--swing` (5) percent or more,
+the earlier stages that depend on it are tried again once the list is through, each with every value it tried before:
+
+| A wide move in | tries again, if decided before it | because it changes |
+| --- | --- | --- |
+| `omp-spin`, `cpu-chunks`, `cpu-threads` | each other, `drafts`, and for the spin also `predictor`, `answer-cap`, `budget` | what an expert that misses the cache costs, and so what a draft, a swap and a slot are worth |
+| `drafts`, `gate` | `omp-spin`, `cpu-chunks`, `submits`, `predictor`, `refill`, `answer-cap`, `budget`, `jit` | the size of the CPU's and the GPU's work in a pass, and the experts a pass wants |
+| `predictor`, `mib` | `drafts`, `refill`, `answer-cap`, `budget`, `jit`, and for the size also `predictor` | what the cache holds, and so the misses left to the others |
+| `refill`, `answer-cap`, `budget`, `jit`, `threads` | `budget`, `answer-cap`, and for the budget also `refill` and `jit` | the swaps of a token, and what one costs |
+
+A stage later in the list runs with the move in place anyway. A wide move in a stage that is tried again queues its
+own, up to `--revisits` (2) times, and the summary names what was left; `--revisits 0` turns it off. A stage that
+couldn't act earlier and can after a move (the answer's start, once a predictor is on) is tried the same way.
+`--rounds 2` goes through every stage again regardless, and `--stages` sets another order. On the 1920X + RX480x2 the
+spin moved the balance by 19% and one draft in place of three by 17%; no other stage moved it by more than 2.2%.
 
 **The starting point and the lists.** The search starts from llama.cpp's defaults, your `--mib` and your placement:
 nothing set for the CPU and Vulkan variables, the JIT and the answer cap, budget 10, the refill at its default, 3 drafts,
