@@ -380,8 +380,8 @@ Most of this matches the settings found by hand, step by step. The search did be
   Q6, long answers 3.4% and 1.9% faster, and Q6's answers after a large prompt 6.0% faster; the agent's whole turns
   don't move. Long answers with changes of topic and no agent would take a larger cap: on eleven such requests, 1000
   made Q6's set 4.0% shorter and Q4's 1.1%, and no cap at all gained nothing. The setup now limits the answer's start
-  by what each swap gains instead, which the script doesn't search
-  ([The expert predictor](#the-expert-predictor)).
+  by what each swap gains instead ([The expert predictor](#the-expert-predictor)). That was found by hand; the
+  script's `answer-cap` stage has tried both since, caps and gains.
 - **`--moe-cache-jit 8`, not off:** with the shared slots it costs generation little (Q4: 42.71 against 43.07 tok/s
   off), and the prompts gain a lot. Q4's agent prompts went from 334 to 410 tok/s and its fills from 282 to 453.
 
@@ -821,8 +821,6 @@ job, `jobs:` is empty and GitHub rejects the file. Nothing of the fork's; it end
 - **The tuning script's second round in full:** in both searches it ran out of time before the answer cap, drafts and
   budget came up again. The answer cap has been compared by hand since ([Tuning a machine](#tuning-a-machine)); the
   drafts and the budget haven't.
-- **The answer's gain in the tuning script:** `--moe-cache-predictor-answer-gain` was set by hand (8, against 16 and
-  32). The script still searches the cap only.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
