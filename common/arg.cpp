@@ -2781,7 +2781,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-cache-mode"}, "{lru,hot-spare}",
         "MoE cache mode (default: lru)\n"
-        "- lru: the selected experts are uploaded to the cache before they run on the GPU\n"
+        "- lru: the selected experts are uploaded to the cache before they run on the GPU, or the CPU computes a share of the misses (--moe-cache-cpu-share)\n"
         "- hot-spare: the resident experts run on the cache device while the CPU runs the others",
         [](common_params & params, const std::string & value) {
             if (value == "lru") {
