@@ -1,7 +1,7 @@
 # Vulkan on RDNA4 (`vk-rdna4`)
 
-> **Work in progress, stable.** The changes below pass the Vulkan backend's matrix tests on an RDNA4 GPU and are
-> already faster than upstream llama.cpp on it. Tuning goes on, so the defaults may still change.
+> **Stable; the tuning continues.** The changes below pass the Vulkan backend's matrix tests on an RDNA4 GPU and are
+> faster than upstream llama.cpp on it. The defaults may still change.
 
 Tuning of the Vulkan backend's quantized matrix kernels for AMD RDNA4 GPUs (gfx12: Radeon RX 9060/9070, Radeon AI PRO
 R9700). Other GPUs are unaffected: every default this branch changes is behind a check for RDNA4. The switches for
@@ -9,24 +9,24 @@ measuring (see [Environment variables](#environment-variables)) do nothing unles
 
 ## What the branch does on RDNA4
 
-The prompt-side matmuls in question are the int8 cooperative-matrix (KHR_coopmat, "coopmat1") ones, which upstream
+The prompt-side matmuls here are the int8 cooperative-matrix (KHR_coopmat, "coopmat1") ones, which upstream
 creates on RDNA3 and RDNA4: the activations are quantized to Q8_1 and multiplied against the quantized weights on the
 int8 matrix cores. RDNA4 has no coopmat2, so the tile selection described here is the coopmat1 one. The numbers behind
 each choice are under [Measured](#measured).
 
 **Generation: Q4_K and Q5_K without MMVQ.** Matrix-vector products of Q4_K and Q5_K weights use the regular matvec
 shaders (float dot products) instead of the int8 ones (MMVQ), as Q8_0 already does on RDNA4. Upstream uses MMVQ for
-these two types there, and it was slower. The upstream switches `GGML_VK_DISABLE_MMVQ` and `GGML_VK_FORCE_MMVQ` still
+these two types there, and it is slower. The upstream switches `GGML_VK_DISABLE_MMVQ` and `GGML_VK_FORCE_MMVQ` still
 override the choice.
 
 **Prompts: Q4_K and Q5_K int8 matmuls.** The dense (MUL_MAT) int8 matmuls for Q4_K and Q5_K are created on RDNA4 too.
-Upstream leaves them out there, so those types fell back to the f16 matmul (their MUL_MAT_ID versions already existed).
+Upstream leaves them out there, so those types fall back to the f16 matmul (their MUL_MAT_ID versions exist upstream).
 Dense Q4_1, Q5_1 and NVFP4 stay on the f16 path, as upstream has them. `GGML_VK_RDNA4_NO_INT_K=1` goes back to
 upstream's choice.
 
 **MUL_MAT_ID's tile by the rows an expert gets.** Without coopmat2, upstream picks MUL_MAT_ID's tile like a dense
 matmul's, from the ubatch's tokens, although each expert only gets its share of the rows. Models with many small
-experts then got the large tile in small batches. On RDNA4 the tile follows the mean rows per expert (tokens × experts
+experts then get the large tile in small batches. On RDNA4 the tile follows the mean rows per expert (tokens × experts
 used ÷ experts): the small tile under 32 rows, the medium one up to 64, and above that by the tokens as before. With 512
 experts and 10 used, a 512-token ubatch gives about 10 rows an expert. `GGML_VK_MMID_TILE_BY_TOKENS=1` picks by the
 tokens again.
@@ -71,7 +71,7 @@ A shape the shared memory doesn't hold is turned off as usual, and the next smal
 
 ## Measured
 
-All on an AMD Radeon AI PRO R9700 (32 GB, RADV, Mesa 25.2.8). Model runs are Qwen3-Coder-30B-A3B-Instruct entirely on
+All on the 1920X + R9700 (AMD Radeon AI PRO R9700, 32 GB, RADV, Mesa 25.2.8). Model runs are Qwen3-Coder-30B-A3B-Instruct entirely on
 the GPU (`llama-bench -fa 1 -p 2048 -ub 2048 -n 128 -r 3`). Kernel runs are `test-backend-ops perf`; its perf cases on
 this branch include Qwen3.8-Flash-Next's expert matmuls (512 experts, 10 used, at 512, 2048 and 8192 tokens; q4_K and
 q6_K gate/up 640 × 2560, q5_1 and q8_0 down 2560 × 640) and dense matmuls of 48 tokens.
@@ -82,12 +82,14 @@ q6_K gate/up 640 × 2560, q5_1 and q8_0 down 2560 × 640) and dense matmuls of 4
 
 | configuration | MUL_MAT | MUL_MAT_ID |
 |---|---|---|
-| without the Q4_K/Q5_K int8 matmuls (now `GGML_VK_RDNA4_NO_INT_K=1`) | 2275/2275 | 1109/1109 |
-| with them (now the default) | 2275/2275 | 1109/1109 |
+| without the Q4_K/Q5_K int8 matmuls (`GGML_VK_RDNA4_NO_INT_K=1`) | 2275/2275 | 1109/1109 |
+| with them (the default) | 2275/2275 | 1109/1109 |
 | `GGML_VK_DISABLE_COOPMAT_INT=1` | 2275/2275 | 1109/1109 |
 | `GGML_VK_FORCE_MMID_TILE` 0, 1 and 2 | | 1109/1109 each |
 | tile by rows | | 1109/1109 |
-| tile shapes as above (current defaults) | 2437/2437 | 1109/1109 |
+| the default tile shapes | 2437/2437 | 1109/1109 |
+
+The last row ran a later version of the test, which has more MUL_MAT cases.
 
 ### Generation and prompts
 
@@ -98,11 +100,11 @@ Speed in tok/s:
 | no MMVQ for Q4_K/Q5_K | UD-Q4_K_XL, generation (tg128) | 175 | **184–186** (+5 to +6%) |
 | Q4_K/Q5_K int8 matmuls | UD-Q4_K_XL, prompt (pp2048) | 3318 ± 10 | **3379 ± 2** (+1.8%) |
 | | UD-Q4_K_XL, generation | 186.1 | 185.5 (the same) |
-| | UD-Q6_K_XL, prompt | 3164 ± 67 | 3087 ± 2 (−2.4%, an open question) |
+| | UD-Q6_K_XL, prompt | 3164 ± 67 | 3087 ± 2 (−2.4%) |
 | | UD-Q6_K_XL, generation | 140.6 | 140.9 (the same) |
 
 In the int8 matmul rows, "upstream" is this branch without the Q4_K/Q5_K int8 matmuls (both columns without MMVQ for
-Q4_K/Q5_K).
+Q4_K/Q5_K). The loss on UD-Q6_K_XL prompts isn't explained yet.
 
 For scale, the int8 path upstream already uses for the other types is worth 3318 against 3217 tok/s on Q4_K_XL prompts
 (`GGML_VK_DISABLE_COOPMAT_INT=1` turns it off).
@@ -124,9 +126,9 @@ At 2048 and 8192 tokens, and for Qwen3-30B's shapes, the two were the same withi
 With Qwen3-Coder-30B (128 experts, 8 used) and the tiles forced one at a time, the automatic choice was the best or
 within noise at `-ub 512` and `-ub 2048`, for both quants. For example, Q4_K_XL at `-ub 2048`: auto 3368, small 3104,
 medium 3364, large 3273 tok/s. At 512 tokens that model has 32 rows an expert, so the tile by rows takes the medium
-tile there. These runs predate the tile shapes below.
+tile there. These runs used upstream's tile shapes.
 
-For scale, with the tile shapes before the ones below, ROCm ran Flash-Next's expert matmuls 1.3–2.1× faster than
+For scale, with upstream's tile shapes, ROCm ran Flash-Next's expert matmuls 1.3–2.1× faster than
 Vulkan, the widest at 512–2048 tokens, and dense matmuls 1.45–1.8× faster (q6_K the same).
 
 ### Tile shapes
@@ -134,12 +136,12 @@ Vulkan, the widest at 512–2048 tokens, and dense matmuls 1.45–1.8× faster (
 A sweep of 25 shapes, each tile size forced in turn, found the medium tile faster at 128 × 64 than at 64 × 64. Dense
 matmuls were 20–25% faster with it forced at 512 tokens. Expert matmuls were 6–20% faster at 512–2048 tokens, but 8–12%
 slower at 8192, where they had no large tile to fall to. MUL_MAT_ID's large tile at 64 × 128 is there for that case:
-with it, the expert matmuls of 8192 tokens were 5–16% faster than with the old medium tile alone. A large tile at
+with it, the expert matmuls of 8192 tokens were 5–16% faster than with upstream's medium tile alone. A large tile at
 128 × 256 made dense q8_0 17% faster at 512 tokens but q4_K 35% slower, so the large dense tile stays at 128 × 128.
 
-The new shapes against the old ones, with the tiles picked as they would be (TFLOPS, two passes each):
+The branch's shapes against upstream's, with the tiles picked as they would be (TFLOPS, two passes each):
 
-| case | old | new | |
+| case | upstream's shapes | the branch's | |
 |---|---|---|---|
 | dense q4_K 4096 × 14336, 48 tokens | 14.8 | 24.0 | +62% |
 | dense q8_0, 48 tokens | 14.4 | 23.6 | +64% |
@@ -164,3 +166,6 @@ cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DVulkan_GLSLC_EXE
 ```
 
 At startup the Vulkan device line shows what's in use, for example `int dot: 1 | matrix cores: KHR_coopmat`.
+
+With the rest of the fork, these kernels are part of the second rung of
+[the ladder](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder), the fork with no option set.
