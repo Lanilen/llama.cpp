@@ -108,6 +108,14 @@ refresh does the rest. On the 1920X + R9700 (Flash-Next Q4 and Q6) 1000 sped age
 usual answers up to 2.6%, because the uploads of a full rebalance cost more than the point of hits it buys. The flag
 overrides `LLAMA_MOE_PREDICTOR_ANSWER_CAP`.
 
+**Or by what each swap gains: `--moe-cache-predictor-answer-gain G`.** The answer's start only makes the swaps that
+bring at least G more of the predicted selections, so it makes many where the topic changed and few in the next turn of
+the same work. With 8 and no cap, against caps of 500 (Q4) and 125 (Q6) on the 1920X + R9700: the tuning requests'
+balance +2.1% on Q4 and +0.5% on Q6, and the first answers after a change of topic 3–8% and 7–11% faster a step
+([docs/moe-predictor.md](moe-predictor.md#the-answers-start-by-gain)). The flag overrides
+`LLAMA_MOE_PREDICTOR_ANSWER_GAIN`; `LLAMA_MOE_PREDICTOR_ANSWER_LOG=1` logs each answer's start, the swaps the prediction
+asks for by gain.
+
 ### The two branches at the same time
 
 On its own, the scheduler would run the cache branch together with the layer's attention, and the CPU's input copy would
@@ -355,6 +363,8 @@ The refill moves up to the whole cache in one step, and the generation waits for
 | `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
 | `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
 | `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them); `--moe-cache-predictor-answer-cap` overrides it |
+| `LLAMA_MOE_PREDICTOR_ANSWER_GAIN=G` | the answer's start only makes the swaps that bring at least G more predicted selections (default 0: every swap over the margin); `--moe-cache-predictor-answer-gain` overrides it |
+| `LLAMA_MOE_PREDICTOR_ANSWER_LOG=1` | a log line for each answer's start: the swaps the prediction asks for, by gain |
 | `LLAMA_MOE_CACHE_REFILL_BG=1` | the full rebalances (the refill of `--moe-cache-refill`, and the first rebalance after a prompt without `--moe-cache-hot`) run in the background over the next ubatches, staging what fits without waiting, instead of stalling the generation until all their uploads are done; the staging memory is then at least 2 x 512 MiB |
 | `LLAMA_MOE_CACHE_STAGING_MIB=N` | the staging memory of the uploads (default: two halves of 8 tokens of the budget, at least 64 MiB each) |
 | `LLAMA_MOE_CACHE_JIT_SLOTS=N` | `--moe-cache-jit`: the most experts a layer uploads, and the slots each group takes from the cache (default 64) |
