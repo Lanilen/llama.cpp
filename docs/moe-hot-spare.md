@@ -111,6 +111,11 @@ the selections so far. With one:
   with the 1920X + R9700, 1000 sped up agent turns by 8–12% for up to 2.6% of the usual answers, and 500 was better
   still: agent turns 46.8 tok/s against 44.2 at 1000, the usual answers the same. The tuning script picks 500 for Q4_K_XL
   and 125 for Q6_K_XL there ([Tuning](#tuning));
+- **`--moe-cache-predictor-answer-gain G`** limits the answer's start by what each swap gains instead: only the swaps
+  that bring at least G more of the predicted selections. It makes many where the topic changed and few in the next
+  turn of the same work. With 8 and no cap, against those caps: the tuning requests' balance +2.1% on Q4_K_XL and +0.5%
+  on Q6_K_XL, and the first answers after a change of topic 3–8% and 7–11% faster a step
+  ([docs/moe-predictor.md](moe-predictor.md#the-answers-start-by-gain));
 - **`--moe-cache-predictor-start FILE`**, a second file, predicts from a turn's text before its prompt runs, so its
   experts upload while a short prompt computes.
 
@@ -678,6 +683,8 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts a text start uploads while the prompt computes (default 1600) |
 | `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes from the main predictor (default 1000) |
 | `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | without a text start, the most swaps the answer's start makes from the main predictor (default 0: all of them); `--moe-cache-predictor-answer-cap` overrides it |
+| `LLAMA_MOE_PREDICTOR_ANSWER_GAIN=G` | the answer's start only makes the swaps that bring at least G more predicted selections (default 0: every swap over the margin); `--moe-cache-predictor-answer-gain` overrides it |
+| `LLAMA_MOE_PREDICTOR_ANSWER_LOG=1` | a log line for each answer's start: the swaps the prediction asks for, by gain |
 
 **The scheduler, the CPU and Vulkan**
 

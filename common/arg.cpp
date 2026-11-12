@@ -2880,6 +2880,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_CAP"));
     add_opt(common_arg(
+        {"--moe-cache-predictor-answer-gain"}, "G",
+        "with --moe-cache-predictor: the rebalance at an answer's start only makes the swaps that bring at least G more of "
+        "the predicted selections than the expert they replace, so it makes many where the topic changed and few in the "
+        "next turn of the same work; 0 = every swap over --moe-cache-margin (default: LLAMA_MOE_PREDICTOR_ANSWER_GAIN, else 0)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_predictor_answer_gain = std::max(0.0f, std::stof(value));
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PREDICTOR_ANSWER_GAIN"));
+    add_opt(common_arg(
         {"--moe-cache-refill"}, "N",
         "hot spare mode: after a prompt, rebalance the resident experts once from the selections of the first N generated tokens, 0 = never (default: 128, or 0 with --moe-cache-predictor)",
         [](common_params & params, int value) {

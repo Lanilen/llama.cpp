@@ -11,6 +11,9 @@ loads what the answer is about to need instead of what the last answer used.
   as a ggml graph on the CPU (a few ms per prediction) or on another device.
 - **The answer's start can be capped** (`--moe-cache-predictor-answer-cap N`): at most the N best of the predictor's
   swaps, the budget doing the rest. On the R9700 that sped agent turns up by 8–12%.
+- **Or limited by what each swap gains** (`--moe-cache-predictor-answer-gain G`): only the swaps that bring at least G
+  more of the predicted selections. That makes many swaps where the topic changed and few in the next turn of the
+  same work, which one count can't do.
 - **A second, optional file** (`--moe-cache-predictor-start FILE`) predicts from a turn's text before its prompt is
   processed, so the experts upload while the prompt computes. It cuts the uploads by a quarter to over 40%, but was
   slower overall on the R9700, where the answer cap does better (see [Results](#results)).
@@ -49,8 +52,9 @@ The trained Flash-Next files (the main predictor, the start predictor and their 
 With `--moe-cache-predictor FILE` the hot spare cache:
 
 - **At each answer's start** (the first ubatch that outputs all its tokens), predicts from the prompt's last token. The
-  predicted experts replace the others in a rebalance in the background: in full by default, or at most the N best
-  swaps with `--moe-cache-predictor-answer-cap N`, leaving the rest to the budgeted refresh. After a release
+  predicted experts replace the others in a rebalance in the background: in full by default, at most the N best
+  swaps with `--moe-cache-predictor-answer-cap N`, or only the swaps that gain at least G selections with
+  `--moe-cache-predictor-answer-gain G`, leaving the rest to the budgeted refresh. After a release
   (`--moe-cache-resize`) the restore uploads the predicted set instead of the old one.
 - **Every 16 generated tokens** (the file sets the interval), predicts again. The budgeted refresh
   (`--moe-cache-budget`) then ranks by the prediction instead of the decayed scores: the expected selections over the
@@ -99,6 +103,7 @@ All of them need `--moe-cache-mode hot-spare`.
 | `--moe-cache-predictor-device DEV` | the device it runs on (default: CPU) |
 | `--moe-cache-predictor-start FNAME` | a start file (role `start`), with `--moe-cache-predictor` |
 | `--moe-cache-predictor-answer-cap N` | without a start file, the most swaps the answer's start makes, 0 = all of them (default: `LLAMA_MOE_PREDICTOR_ANSWER_CAP`, else 0) |
+| `--moe-cache-predictor-answer-gain G` | the answer's start only makes the swaps that bring at least G more predicted selections than the expert they replace, 0 = every swap over `--moe-cache-margin` (default: `LLAMA_MOE_PREDICTOR_ANSWER_GAIN`, else 0). With a cap too, both limits apply |
 | `--moe-cache-refill N` | the refill after a prompt; default 0 with a predictor (128 without) |
 
 Each option also reads its `LLAMA_ARG_` variable (`LLAMA_ARG_MOE_CACHE_PREDICTOR`, and so on).
@@ -107,6 +112,8 @@ Each option also reads its `LLAMA_ARG_` variable (`LLAMA_ARG_MOE_CACHE_PREDICTOR
 |---|---|
 | `LLAMA_MOE_PREDICTOR_THREADS=N` | the CPU threads of the predictor (default 4) |
 | `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | the answer cap when the option isn't given (default 0: all) |
+| `LLAMA_MOE_PREDICTOR_ANSWER_GAIN=G` | the answer's least gain when the option isn't given (default 0: every swap) |
+| `LLAMA_MOE_PREDICTOR_ANSWER_LOG=1` | a log line for each answer's start: the swaps the prediction asks for, and how many of them gain at least 1, 2, 4, ... 64 selections |
 | `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts the text start uploads during a prompt (default 1600) |
 | `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes (default 1000) |
 
@@ -171,6 +178,48 @@ The card's clock was below COMPUTE's in these runs, the same for every arm, so t
   runs' per-request numbers, but the run would still take 3–5 s longer. About 4 GiB of uploads (1375 experts on Q4)
   take about 0.3 s on the R9700's PCIe 3.0 x16 link. That's more than a short prompt takes, so the answer starts later.
   It might still pay on a slower link; that isn't measured.
+
+#### The answer's start by gain
+
+A cap takes the same number of swaps at every answer's start. With `LLAMA_MOE_PREDICTOR_ANSWER_LOG=1` the cache prints
+what the prediction asks for at each one, and it differs a lot. A swap's gain is how many more selections over the next
+128 tokens the new expert is predicted to serve than the one it replaces (the file's horizons averaged). On Q4, with 500 to 3600 swaps over the
+margin at every start, the swaps that gain at least 8:
+
+| answer's start | swaps that gain 8 or more |
+|---|---|
+| a story as the first request | 996 |
+| a question about code right after the story | 1045 |
+| an essay after code | 392 |
+| follow-up turns of a chat | 22–105 |
+| most of an agent's turns | 9–82 |
+| two agent turns whose tool output changed the subject | 1063 and 802 |
+| after a prompt that released the cache (the restore loaded the prediction) | 0–1 |
+
+`--moe-cache-predictor-answer-gain G` makes the answer's start take only the swaps that gain at least G, best first.
+Against the caps the tuning script picked (500 on Q4, 125 on Q6), with no cap, on the 1920X + R9700 with the settings
+of 2026-11-12, four passes. The first three columns are the tuning script's requests (ms a verify step by kind, which
+doesn't depend on how well each text drafts), then its balance in tok/s, then eleven requests with more changes of
+topic (a story, questions after 2k–3k tokens of code and of documentation, an essay, a function, follow-ups):
+
+| | after a large prompt | long answers | agent's answers | balance | eleven requests, whole set |
+|---|---|---|---|---|---|
+| Q4, gain 8 | −2.6% | +0.2% | −0.9% | 45.08 → 46.03 tok/s (+2.1%) | 95.8 → 94.1 s (−1.8%) |
+| Q4, gain 16 | −2.2% | +0.1% | −2.6% | 45.59 (+1.1%) | 95.4 s (−0.4%) |
+| Q6, gain 8 | −3.9% | −4.3% | +2.3% | 35.50 → 35.69 tok/s (+0.5%) | 123.4 → 121.4 s (−1.6%) |
+| Q6, gain 16 | −3.8% | −3.6% | +0.9% | 35.26 (−0.7%) | 122.3 s (−0.9%) |
+
+- **Gain 8 is kept for both.** On Q4 every pass of it was ahead of every pass of the cap. On Q6 the balance is inside
+  the spread between passes, the first answers after a change of topic (the story, the code question after it) are
+  7–11% faster a step, against 3–8% on Q4, and the agent's answers lose 1% in tok/s.
+- **A larger cap doesn't do this.** On Q6, a cap of 1000 gave long answers the same 4.6% and cost the agent's answers
+  10.8% a step; no cap at all gained nothing ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
+- **Gain 32** made too few swaps: 0.9% (Q4) and −1.0% (Q6) on the balance in two passes.
+- The uploads change little: 16% fewer swaps than the cap of 500 on Q4, 19% more than the cap of 125 on Q6, with 0.5
+  and 3.1 more points of hits.
+
+The tuning script doesn't search the gain yet. Its `answer-cap` stage still runs; given both, the answer's start
+stops at whichever limit comes first.
 
 #### The predictor against the decayed scores
 
@@ -545,8 +594,10 @@ llama-server -m model.gguf <placement> -np 1 \
     --moe-cache-predictor pred.gguf
 ```
 
-Add `--moe-cache-predictor-answer-cap N` to cap the answer's start (1000 in the runs above; the tuning script finds the
-best value for a machine). The cache's own statistics (`-v`, at exit) count the predictions and their time.
+Add `--moe-cache-predictor-answer-gain 8` to limit the answer's start to the swaps that gain enough, or
+`--moe-cache-predictor-answer-cap N` to cap it by count (the tuning script finds the best cap for a machine). The
+cache's own statistics (`-v`, at exit) count the predictions and their time, and the swaps the answers' starts asked
+for and made.
 
 ### What the experiments found
 
