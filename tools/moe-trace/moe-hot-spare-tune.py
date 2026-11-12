@@ -57,7 +57,7 @@ DEFAULT_N_MAX = 3         # --spec-draft-n-max
 # The order puts first what the others depend on and what moves the most: the cost of the CPU's experts, then the tokens a
 # pass verifies, then what the cache holds, then how it is kept.
 ALL_STAGES = ["omp-spin", "cpu-chunks", "drafts", "gate", "predictor", "refill", "answer-cap", "submits", "budget", "mib", "jit", "threads", "cpu-threads"]
-DEFAULT_STAGES = [s for s in ALL_STAGES if s != "gate"]  # gates lose to the graph rebuild of each new verify length
+DEFAULT_STAGES = [s for s in ALL_STAGES if s != "gate"]  # the gates tried lose to a fixed draft length
 # What depends on what. A stage's choice holds while the settings it was made with stay where they were: when a stage
 # moves the objective by --swing percent or more, the stages listed for it that were decided before it are tried again
 # after the list, with the values they tried before, and a wide move there queues its own. A stage later in the list
@@ -967,7 +967,7 @@ class Tuner:
         return None
 
     def answer_caps(self):
-        """--answer-caps, or --answer-cap-shares of the cache's slots in the warm-up (500, 1000 and 2000 swaps of 6731 slots on
+        """--answer-caps, or --answer-cap-shares of the cache's slots in the warm-up (500, 1010 and 2020 swaps of 6731 slots on
         the 1920X + R9700 with Flash-Next Q4 at 20900 MiB), rounded to tens."""
         if self.o.answer_caps:
             return self.o.answer_caps

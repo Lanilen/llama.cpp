@@ -2907,8 +2907,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-cache-batch"}, "N",
         string_format("with --moe-cache-resize: batches of up to N tokens keep\n"
         "the cache and run on the hot spare, if their compute buffers\n"
-        "fit next to it in the free GPU memory (else the largest of\n"
-        "N/2, N/4, ... down to 32 that fits); larger batches release\n"
+        "fit next to it in the free GPU memory (else the largest\n"
+        "smaller size that fits, down to 32); larger batches release\n"
         "it; 0 = up to --ubatch-size (default: %d)", params.moe_cache_batch),
         [](common_params & params, int value) {
             if (value < 0) {
