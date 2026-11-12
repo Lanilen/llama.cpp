@@ -421,6 +421,7 @@ Hugging Face, trained with `tools/moe-predictor`). The cache, draft and CPU sett
 ```bash
 GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_VK_SPIN_WAIT=2000 \
   LLAMA_GRAPH_CACHE=8 LLAMA_MOE_RESIZE_SPLIT=3072 LLAMA_MOE_HOST_SUM=64 LLAMA_MOE_RESIZE_DRAFT=512 \
+  GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=transfer_queue \
 LLAMA_MOE_CACHE_JIT_SHARE=1 LLAMA_MOE_CACHE_JIT_SLOTS=128 LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT=8 LLAMA_OFFLOAD_FAST=1 \
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     -dev Vulkan0 -ngl 99 -ncmoe 49 -ot per_layer_token_embd.weight=CPU -t 12 -np 1 -b 16384 -ub 16384 \
@@ -443,7 +444,7 @@ whole agent turns at 4.99 tok/s, 71.5% of the experts in the cache.
 Both sets of numbers were measured with the tuning script's answer caps (`--moe-cache-predictor-answer-cap 500` on Q4,
 `125` on Q6), before some of the settings above. On 2026-11-12, with all of them and the script's requests as its
 corpus stood that day: 45.08 tok/s by the balance on Q4 and 35.50 on Q6 with the caps, 46.03 and 35.69 with
-`--moe-cache-predictor-answer-gain 8` in their place.
+`--moe-cache-predictor-answer-gain 8` in their place, and 48.62 and 37.27 with the two queue variables as well.
 
 - **`--moe-cache-hot`** starts the cache from a set saved with `--moe-cache-save` on the same kind of work.
 - **The predictor runs on the GPU** (`--moe-cache-predictor-device`), not on the CPU: a verify step 1.0% faster on Q4
@@ -453,6 +454,13 @@ corpus stood that day: 45.08 tok/s by the balance on Q4 and 35.50 on Q6 with the
   `-cmoed` with 23500 MiB: usual answers 31.5 → 32.6 tok/s and agent turns 27.9 → 28.6, at 83.6% hits instead of 86.5%.
 - **`LLAMA_MOE_HOST_SUM=64` and `LLAMA_MOE_RESIZE_DRAFT=512`** are for prompts of up to 3072 tokens, the ones that keep
   the cache ([Prompts with the cache](#prompts-with-the-cache)): 12–14% sooner on Q4, 8–22% on Q6.
+- **`GGML_VK_ALLOW_GRAPHICS_QUEUE=1` with `RADV_PERFTEST=transfer_queue`** are upstream's and the driver's, not the
+  fork's. The backend then computes on RADV's graphics queue family, where its many small submits are faster, and
+  transfers on a family the driver offers for that. Against the same setup without them, four passes: 45.70 → 48.62
+  tok/s by the balance on Q4 (+6.4%) and 35.93 → 37.27 on Q6 (+3.7%), every pass ahead, with prompts 1.9% and 1.4%
+  faster. The switch without the transfer family loses: the transfers then land on the compute family, at half the
+  speed ([the guide](docs/moe-hot-spare.md#the-compute-queue-on-radv)). The transfer family is one of the driver's
+  features that aren't on by default yet (Mesa 25.2).
 - **The RX 480s in the same machine stay out of this setup.** Whatever of Flash-Next was moved to them cost more than
   it gave ([Tried and not kept](#tried-and-not-kept)).
 - **`-b`/`-ub 16384`:** a 59k-token fill at 334 against 243 tok/s at 8192 (PCIe x8), with the same generation after it.
@@ -507,8 +515,9 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
 A model that fits whole on one RX 480 gains from upstream's `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`. Qwen3.5-9B UD-Q4_K_XL,
 alone on the machine, generated at 25.9 tok/s against 24.8 (+4%, nine passes), with the same prompt speed and the same
 answers. RADV offers two queue families that compute: the backend computes on the compute-only one and transfers on the
-graphics one, and the switch swaps them. With a hot spare cache on the R9700 the swap costs more than it gives
-([Tried and not kept](#tried-and-not-kept)); it isn't measured with the cache on the RX 480s.
+graphics one, and the switch swaps them. On the RX 480 the uploads are as fast on either (5.6–5.7 GB/s), so the swap
+should cost a cache nothing there, unlike on the R9700 ([1920X + R9700](#1920x--r9700)); the setup above isn't measured
+with it.
 
 ## The ladder
 
@@ -632,13 +641,11 @@ Measured on the 1920X + R9700. These either didn't help or cost more than they g
   instead of one an expert slot, 10x less over the bus): as one op it costs 8–19 µs a layer and saved nothing (verify
   batches within 1%); the copy it removed was already hidden behind other work. Kept for prompt batches, where the
   copy is 80 MiB a layer (`LLAMA_MOE_HOST_SUM=64`).
-- **Upstream's `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` on the R9700.** The backend then computes on RADV's graphics family
-  and transfers on its compute family, the other way round from its default. Generation got faster: 45.16 → 46.28
-  tok/s by the tuning requests' balance on Q4 and 35.18 → 36.22 on Q6, both passes ahead. But the cache's uploads on
-  the compute family were three times slower. A restore took 3.3 s instead of 2.3, prompts took 18–21% longer, and an
-  agent's whole turns were 15–18% slower. The graphics family has one queue, so both on it would leave no queue for
-  the uploads in the background. It pays where nothing is uploaded after the load
-  ([1920X + RX480x2](#1920x--rx480x2)).
+- **Upstream's `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` by itself on the R9700.** The backend then computes on RADV's
+  graphics family and transfers on its compute family, the other way round from its default. Generation got faster
+  (+2.5% on Q4 and +3.0% on Q6 by the tuning requests' balance), but the cache's uploads on the compute family ran at
+  half the speed: a restore took 3.3 s instead of 2.3, prompts took 18–21% longer, and an agent's whole turns were
+  15–18% slower. With the driver's transfer family it's kept ([1920X + R9700](#1920x--r9700)).
 - **The MTP draft's experts on an RX 480 beside the R9700,** with the 2550 MiB they free given to the cache (23450
   MiB, 17 more slots a layer on Q4 and 12 on Q6). It is the one use of a second card that leaves the R9700's own chain
   alone: only the draft crosses to the other card. Four arms (the residual handed from GPU to GPU or through the
