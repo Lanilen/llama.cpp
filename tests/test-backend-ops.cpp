@@ -13497,11 +13497,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // a ubatch of 33-64 tokens, which the medium tiles serve (Flash-Next's medium prompts; its draft's prompt batches)
-    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 48, 14336, {1,  1}, {1, 1}));
-    }
-
     // small mat-vecs at Qwen3.8-Flash-Next's widths (k = n_embd 2560, or 10240 for its 4 hyper-connection streams): how the
     // time grows with the rows, to see what one mat-vec over concatenated weights would save against several
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
@@ -13519,6 +13514,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
+    }
+
+    // a ubatch of 33-64 tokens, which the medium tiles serve (Flash-Next's medium prompts; its draft's prompt batches)
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 48, 14336, {1,  1}, {1, 1}));
     }
 
     // qwen3-30b-a3b
@@ -13553,17 +13553,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // the same experts in a prompt's ubatch on the GPU: all 512, 10 used a token, so about 40 rows an expert at 2048
-    // tokens (Qwen3-30B's 128 x 8 have 128)
-    for (int bs : {512, 2048, 8192}) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
-        }
-        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
-        }
-    }
-
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
@@ -13571,6 +13560,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 2880, bs, 2880));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 2880, bs, 2880, 1));
             }
+        }
+    }
+
+    // Qwen3.8-Flash-Next's experts in a prompt's ubatch on the GPU: all 512, 10 used a token, so about 40 rows an expert
+    // at 2048 tokens (Qwen3-30B's 128 x 8 have 128)
+    for (int bs : {512, 2048, 8192}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
         }
     }
 
