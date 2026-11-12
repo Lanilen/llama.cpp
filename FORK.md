@@ -223,6 +223,8 @@ layers at the newest token.
   the CPU each time.
 - **`--moe-cache-predictor-answer-cap N`:** the answer's start makes at most the N best of the predictor's swaps, and
   the budget does the rest.
+- **`--moe-cache-predictor-answer-gain G`:** the answer's start makes only the swaps that bring at least G more of the
+  predicted selections: many where the topic changed, few in the next turn of the same work.
 - **`--moe-cache-predictor-start`:** an optional second file predicts from a turn's text before its prompt runs, so the
   experts upload while the prompt computes.
 - **Training** (`tools/moe-predictor`): traces of the model's routing on public conversations and its own answers,
@@ -237,6 +239,11 @@ layers at the newest token.
 - **The answer cap at 1000:** agent turns 30.81 → 34.41 tok/s on Q4 (+11.7%) and 26.28 → 28.42 on Q6 (+8.1%), for
   −2.6% and −0.8% on the usual answers. The full rebalance buys a point of hits that its uploads cost more than. The
   tuning script's picks, smaller still, are in [Tuning a machine](#tuning-a-machine).
+- **The answer's start by gain,** 8 and no cap, against those picks (four passes): the tuning requests' balance 45.08
+  → 46.03 tok/s on Q4 (+2.1%) and 35.50 → 35.69 on Q6 (+0.5%, inside the spread between passes). A verify step is 2.6%
+  and 3.9% shorter after a large prompt, the same and 4.3% shorter in long answers, and 0.9% shorter and 2.3% longer in
+  the agent's answers. The first answers after a change of topic gain the most, 3–8% on Q4 and 7–11% on Q6
+  ([the guide](docs/moe-predictor.md#the-answers-start-by-gain)).
 - **The text start** cuts the uploads by a quarter to 40%, but it was slower overall on the R9700, so it isn't used
   there.
 
@@ -372,7 +379,9 @@ Most of this matches the settings found by hand, step by step. The search did be
   and −0.4%. The cap is a trade between kinds of work. At 1000 the agent's answers are 4.8% slower on Q4 and 8.5% on
   Q6, long answers 3.4% and 1.9% faster, and Q6's answers after a large prompt 6.0% faster; the agent's whole turns
   don't move. Long answers with changes of topic and no agent would take a larger cap: on eleven such requests, 1000
-  made Q6's set 4.0% shorter and Q4's 1.1%, and no cap at all gained nothing.
+  made Q6's set 4.0% shorter and Q4's 1.1%, and no cap at all gained nothing. The setup now limits the answer's start
+  by what each swap gains instead, which the script doesn't search
+  ([The expert predictor](#the-expert-predictor)).
 - **`--moe-cache-jit 8`, not off:** with the shared slots it costs generation little (Q4: 42.71 against 43.07 tok/s
   off), and the prompts gain a lot. Q4's agent prompts went from 334 to 410 tok/s and its fills from 282 to 453.
 
@@ -418,7 +427,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 65536 \
     --moe-cache-mode hot-spare --moe-cache-resize --moe-cache-mib 20900 --moe-cache-budget 10 --moe-cache-batch 0 \
     --moe-cache-hot flashnext.hot \
     --moe-cache-predictor flashnext-pred-v3.moepred --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-jit 8 \
-    --moe-cache-predictor-answer-cap 500 \
+    --moe-cache-predictor-answer-gain 8 \
     -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf -ngld 99 -devd Vulkan0 \
     --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 2048 --load-mode mmap+mlock
 ```
@@ -427,9 +436,14 @@ With the card on the COMPUTE profile (below), over a story, questions after 2k a
 and ten recorded agent turns, two passes: 42.71 tok/s by the balance (42.53 over every request's tokens), agent turns
 at 45.15 tok/s, whole agent turns at 6.99 tok/s, 79.9% of the experts in the cache.
 
-UD-Q6_K_XL takes the same placement, cache size, hot set, predictor and draft head, with its own picks:
-`--moe-cache-budget 20` and `--moe-cache-predictor-answer-cap 125`. 33.23 tok/s by the balance (32.43 over every
-request's tokens), agent turns at 36.75 tok/s, whole agent turns at 4.99 tok/s, 71.5% of the experts in the cache.
+UD-Q6_K_XL takes the same placement, cache size, hot set, predictor and draft head, with its own pick,
+`--moe-cache-budget 20`. 33.23 tok/s by the balance (32.43 over every request's tokens), agent turns at 36.75 tok/s,
+whole agent turns at 4.99 tok/s, 71.5% of the experts in the cache.
+
+Both sets of numbers were measured with the tuning script's answer caps (`--moe-cache-predictor-answer-cap 500` on Q4,
+`125` on Q6), before some of the settings above. On 2026-11-12, with all of them and the script's requests as its
+corpus stood that day: 45.08 tok/s by the balance on Q4 and 35.50 on Q6 with the caps, 46.03 and 35.69 with
+`--moe-cache-predictor-answer-gain 8` in their place.
 
 - **`--moe-cache-hot`** starts the cache from a set saved with `--moe-cache-save` on the same kind of work.
 - **The predictor runs on the GPU** (`--moe-cache-predictor-device`), not on the CPU: a verify step 1.0% faster on Q4
@@ -787,9 +801,8 @@ job, `jobs:` is empty and GitHub rejects the file. Nothing of the fork's; it end
 - **The tuning script's second round in full:** in both searches it ran out of time before the answer cap, drafts and
   budget came up again. The answer cap has been compared by hand since ([Tuning a machine](#tuning-a-machine)); the
   drafts and the budget haven't.
-- **An answer's start that swaps by expected gain, not by count:** the cap takes the same number of swaps at a change
-  of topic, where they pay over a long answer, and in an agent's next turn, where they cost its short answer more than
-  they give.
+- **The answer's gain in the tuning script:** `--moe-cache-predictor-answer-gain` was set by hand (8, against 16 and
+  32). The script still searches the cap only.
 - **More training data for the predictor,** with more agent conversations, where it's furthest from hindsight.
 
 ## How it was made
