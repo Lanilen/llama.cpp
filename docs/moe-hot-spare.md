@@ -29,7 +29,7 @@ this guide and the [predictor](moe-predictor.md)
 - [How it works](#how-it-works): [the hot spare](#the-hot-spare), [choosing the resident experts](#choosing-the-resident-experts),
   [the predictor](#a-learned-predictor---moe-cache-predictor), [the two branches at the same time](#the-two-branches-at-the-same-time),
   [work beside the MoE](#work-beside-the-moe), [faster copies to the CPU](#faster-copies-to-the-cpu),
-  [the CPU's experts](#the-cpus-experts), [Vulkan submits](#vulkan-submits),
+  [the CPU's experts](#the-cpus-experts), [Vulkan submits](#vulkan-submits), [the compute queue on RADV](#the-compute-queue-on-radv),
   [changes that apply without any option](#changes-that-apply-without-any-option)
 - [Prompts](#prompts---moe-cache-resize): [which batches keep the cache](#which-batches-keep-the-cache---moe-cache-batch),
   [medium prompts](#medium-prompts---moe-cache-jit), [splitting a prompt](#splitting-a-prompt-llama_moe_resize_split),
@@ -255,6 +255,46 @@ split's reads; a blocking wait returns through an interrupt and the scheduler. `
 semaphore for up to N µs before blocking. On the 1920X + R9700 with N = 2000, Flash-Next Q4 verify batches of 1 / 3 / 8
 tokens were 1.3 / 1.4 / 0.9% faster without the fused expert FFN and 1.7 / 1.1 / 2.6% faster with it, every pair of
 two in its favour: about 10 µs a layer, the wake-up of that one wait.
+
+### The compute queue on RADV
+
+Nothing of the fork's; two variables of upstream's backend and of Mesa's driver that belong together on an AMD card.
+
+RADV offers two queue families that compute: the graphics family, with one queue, and a compute family, with four.
+Upstream's backend computes on the compute family and transfers on a family that only transfers. RADV offers none of
+those by default, so the transfers fall back to the graphics family. `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` makes it compute
+on the graphics family, and the two swap. Compute submits are faster there, but copies on the compute family run at
+half speed. `RADV_PERFTEST=transfer_queue` makes the driver offer a transfer family (on the R9700 with Mesa 25.2, not
+on the RX 480s), the backend takes it, and the switch then moves the compute queue alone. Background uploads of 16–128
+MiB with `llama-upload-bench`:
+
+| transfers on | R9700 | RX 480 |
+| --- | --- | --- |
+| the graphics family (the default) | 13.3–14.1 GB/s | 5.6–5.7 GB/s |
+| the compute family (the switch alone) | 6.4–6.8 | 5.6–5.7 |
+| RADV's transfer family, with or without the switch | 13.1–14.0 | not offered |
+
+On the 1920X + R9700 with Flash-Next, the setup of
+[FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups) on the tuning script's requests. The switch
+alone had two passes against the setup of that morning; both variables had four against the setup of the afternoon:
+
+| | Q4_K_XL | Q6_K_XL |
+| --- | --- | --- |
+| the switch alone, balance | 45.16 → 46.28 tok/s (+2.5%) | 35.18 → 36.22 (+3.0%) |
+| the switch alone, all prompts | 133.2 → 157.7 s (+18%) | 157.3 → 190.9 s (+21%) |
+| the switch alone, a cache restore | 2.3 → 3.3 s | |
+| both, balance | 45.70 → 48.62 tok/s (+6.4%) | 35.93 → 37.27 (+3.7%) |
+| both, a verify step after a large prompt / in long answers / in the agent's | −6.0 / −6.8 / −4.8% | −4.6 / −4.7 / −2.9% |
+| both, all prompts | 133.1 → 130.6 s (−1.9%) | 157.3 → 155.0 s (−1.4%) |
+| both, the agent's whole turns | 7.21 → 7.42 tok/s (+2.8%) | 6.15 → 6.23 (+1.3%) |
+
+With both, every pass was ahead of every pass without. The first answer came out the same in every run, and the hit
+rates and swaps didn't move. The transfer family alone changed nothing beyond the spread between passes. Both gain more
+than the switch alone because the cache's swaps during generation no longer run on the slow family either.
+
+`RADV_PERFTEST` marks features the driver doesn't turn on by default yet. This one held through 19k-token prompts and
+cache restores here; that is one afternoon. A model whole on one RX 480 needs the switch only: Qwen3.5-9B UD-Q4_K_XL
+generated 4% faster with it (25.9 against 24.8 tok/s, nine passes), with the same prompt speed and the same answers.
 
 ### Graphs by batch length
 
@@ -701,6 +741,7 @@ options. The predictor's options (`--moe-cache-predictor`, `--moe-cache-predicto
 | `GGML_CPU_MMID_GLU=1` | with `GGML_CPU_MMID_FLAT`, up to 8 tokens: the CPU's MUL_MAT_ID of gate and up and their SWIGLU in one op ([The CPU's experts](#the-cpus-experts); on on the 1920X + R9700) |
 | `GOMP_SPINCOUNT=N` | GCC's OpenMP (not this fork's): how long the CPU's threads spin before they sleep; 30000000 (~32 ms) on the 1920X + R9700 ([The CPU's experts](#the-cpus-experts)) |
 | `GGML_VK_SPIN_WAIT=N` | Vulkan: when the host synchronizes an event, poll its semaphore for up to N µs before blocking ([Vulkan submits](#vulkan-submits)) |
+| `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` | upstream's: compute on the graphics queue family. On RADV with `RADV_PERFTEST=transfer_queue` (the driver's), or for a model that uploads nothing after its load ([The compute queue on RADV](#the-compute-queue-on-radv)) |
 | `LLAMA_GRAPH_CACHE=N` | a scheduler and graph of its own for each of up to N small batch lengths (`LLAMA_GRAPH_CACHE_TOKENS`, 16), so a verify batch of another length than the last one reuses its graph instead of rebuilding and reallocating it ([Graphs by batch length](#graphs-by-batch-length)) |
 | `GGML_VK_ASYNC_TRANSFER_MIN=N` | Vulkan, with the cache's background uploads: asynchronous writes smaller than N bytes go through the compute queue, so they don't wait behind the uploads on the transfer queue; larger ones stay there (default 1048576) |
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
