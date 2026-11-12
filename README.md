@@ -4,7 +4,21 @@
 
 > **The Polaris Anniversary Fork.** The AMD Radeon RX 480 came out in June 2016. Ten years on, this fork of llama.cpp
 > keeps a home lab useful for today's large mixture-of-experts models, with the Vulkan backend and the experts in system
-> memory. The lab has two RX 480s (8 GB each, no fp16) and a Radeon AI PRO R9700 (32 GB). The fork adds:
+> memory. The lab has two RX 480s (8 GB each, no fp16) and a Radeon AI PRO R9700 (32 GB).
+>
+> **Against upstream llama.cpp with its defaults,** Qwen3.8-Flash-Next with its experts in system memory and its MTP
+> draft head, a Threadripper 1920X beside the GPUs:
+>
+> | | prompts | answers |
+> |---|---|---|
+> | two RX 480s, UD-IQ4_XS | 28.9 → 95.0 tok/s (3.3×) | 9.2 → 19.7 tok/s (2.1×) |
+> | R9700, UD-Q4_K_XL | 53.3 → 414.7 tok/s (7.8×) | 18.7 → 44.7 tok/s (2.4×) |
+> | R9700, UD-Q6_K_XL | 39.2 → 350.6 tok/s (8.9×) | 16.2 → 34.6 tok/s (2.1×) |
+>
+> One request set on each machine, upstream at `3b4d6ab3f`. What each part of the fork adds on the way, rung by rung,
+> is in [FORK.md](FORK.md#the-ladder).
+>
+> The fork adds:
 > - Vulkan shaders for the sparse-attention ops that fall back to the CPU on GPUs without fp16;
 > - a GPU cache of the most used experts that runs beside the CPU, with the scheduler and Vulkan changes around it;
 > - prompts that keep the cache, with the experts they need uploaded just in time;
@@ -13,10 +27,7 @@
 > - kernel tuning for RDNA4;
 > - a script that finds the best of these settings for another machine.
 >
-> With Qwen3.8-Flash-Next on the two RX 480s, a 9.6k-token prompt reads at 86 tok/s instead of 36.5, and generation runs
-> at 14.5 tok/s instead of 11.7. On the R9700, the cache took generation from 16.8 to 25.9 tok/s with the same
-> settings, and with all of the fork's parts it runs at 42 tok/s on Q4_K_XL and 33 on Q6_K_XL. The results and how
-> they were measured are in [FORK.md](FORK.md).
+> The setups, the results and how they were measured are in [FORK.md](FORK.md).
 >
 > **It is tuned for one home lab.** Some changes work around the RX 480's Vulkan driver and could make other GPUs slower
 > where they collide with features that modern GPUs use. We try to avoid that: the changes that apply to every GPU were

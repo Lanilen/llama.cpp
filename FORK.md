@@ -574,7 +574,8 @@ with it.
 One request set on the 1920X + R9700, each rung adding one thing to the rung before it. Every rung has the same
 placement (the experts in system memory, the n-gram table on the CPU, 12 threads, `mmap+mlock`, 64k context) and the
 same MTP draft head on the GPU with 3 drafts. The R9700 is on the COMPUTE profile, except in the last row. Measured on
-2026-11-12: one pass for rungs 0–2 and the last row, two passes for the others.
+2026-11-12: one pass for rungs 0–2 and the last row, two passes for the others. Upstream is llama.cpp at `3b4d6ab3f`;
+rungs 2 to 8 and the last row are the fork at `89fa598de`, rung 9 at `7eabbc3a9`.
 
 The requests, one after another: a 512-token story, a question after 2.3k tokens of code, one after 18.6k tokens, one
 after another 2.2k, a 400-token function, a 400-token essay, and five prompts of 1k to 7.5k tokens that the server
@@ -668,7 +669,8 @@ What it shows:
 The same requests and columns with Flash-Next UD-IQ4_XS on the two RX 480s alone, measured on 2026-11-13. Every rung
 has [the setup's](#1920x--rx480x2) placement at 32k context, with the layers over both cards and the MTP draft head on
 the second, its experts on the CPU. The cards' memory clock is held, except in the last row. One pass for the first
-four rows and the last, two for the others. Where the rungs differ from the R9700's:
+four rows and the last, two for the others. Upstream is llama.cpp at `3b4d6ab3f`, the fork is at `2380466e5`. Where the
+rungs differ from the R9700's:
 
 | | rung | what differs |
 |---|---|---|
