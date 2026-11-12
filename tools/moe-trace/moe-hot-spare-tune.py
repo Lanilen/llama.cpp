@@ -1667,6 +1667,7 @@ def main(argv):
     def stop(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)  # also when started in the background of a script, which leaves SIGINT ignored
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, stop)
     code = 0
