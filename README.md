@@ -12,8 +12,8 @@
 > | | prompts | answers |
 > |---|---|---|
 > | two RX 480s, UD-IQ4_XS | 28.9 → 95.0 tok/s (3.3×) | 9.2 → 19.7 tok/s (2.1×) |
-> | R9700, UD-Q4_K_XL | 53.3 → 414.7 tok/s (7.8×) | 18.7 → 44.7 tok/s (2.4×) |
-> | R9700, UD-Q6_K_XL | 39.2 → 350.6 tok/s (8.9×) | 16.2 → 34.6 tok/s (2.1×) |
+> | R9700, UD-Q4_K_XL | 53.2 → 418.4 tok/s (7.9×) | 18.8 → 47.3 tok/s (2.5×) |
+> | R9700, UD-Q6_K_XL | 38.6 → 349.6 tok/s (9.0×) | 16.3 → 37.3 tok/s (2.3×) |
 >
 > One request set on each machine, upstream at `3b4d6ab3f`. What each part of the fork adds on the way, rung by rung,
 > is in [FORK.md](FORK.md#the-ladder).
@@ -46,7 +46,7 @@ useful beyond Polaris.
 | [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | a GPU cache of the most used experts that runs beside the CPU; scheduler and Vulkan changes for models with experts on the CPU; trace tools | any MoE model whose experts don't fit in VRAM, on Vulkan GPUs (tested on AMD and NVIDIA) | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
 | [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus a learned predictor of the next experts and its training pipeline, just-in-time uploads for medium prompts, the shared expert beside the MoE, the tuning script | the same; trained so far for Qwen3.8-Flash-Next | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`moe-tuning`](https://github.com/Lanilen/llama.cpp/tree/moe-tuning) | `moe-predictor` plus faster CPU experts, a fused mat-vec store, larger prompts that keep the cache and faster expert copies for those that don't, and the tuning script with its CPU and Vulkan stages | the same, with experts on the CPU; the script for any machine | [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts) |
-| [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4 (**work in progress, stable**) | AMD RDNA4 GPUs (RX 9060/9070, AI PRO R9700) | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
+| [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4 (stable; the tuning continues) | AMD RDNA4 GPUs (RX 9060/9070, AI PRO R9700) | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
 | `master` | upstream, unchanged | | |
 
 ## Install this fork
