@@ -13,7 +13,6 @@
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
-#include "../../src/llama-ext.h" // staging API: llama_set_embeddings_layer_inp / llama_get_embeddings_layer_inp
 
 #include <nlohmann/json.hpp>
 
