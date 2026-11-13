@@ -31,13 +31,3 @@ include = [
 # torch declares nn.Module.forward as a Callable attribute, so every forward() method reads as an override of a mutable attribute
 [overrides.rules]
 incompatible-mutable-override = "ignore"
-
-[[overrides]]
-include = [
-    "./examples/pydantic_models_to_grammar.py",
-]
-
-[overrides.rules]
-unsupported-operator = "ignore"
-not-subscriptable = "ignore"
-invalid-type-form = "ignore"
