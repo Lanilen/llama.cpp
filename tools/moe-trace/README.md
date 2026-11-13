@@ -243,7 +243,7 @@ variables, no `--moe-cache-jit`, no predictor, the refill at its default, budget
 **How many runs.** With a predictor and a draft model, and a build and machine that every stage can act on, `--dry-run`
 counts 53 runs for one round on a 12-core CPU. That count is a floor: it assumes every stage keeps the starting point,
 so it has no `answer-cap` stage, no value past the end of a list and no stage tried again. The lab's three searches
-made 57 to 91 runs ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
+made 77 to 99 runs ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
 
 **How long** depends on the machine. The plan counts `--run-minutes` (5) for a run until one has been timed, and the
 median of the real runs after that. On the 1920X + R9700 a run does take about 5 minutes, so the 53 runs are 4h25m
@@ -254,9 +254,9 @@ at the first runs' times and at what the summary lists as not searched.
 **The order, and what is tried again.** One setting at a time finds the best combination only while each stage's
 choice still holds after the later ones are made. So the stages run in the order of what depends on what: first the
 cost of the CPU's experts, then the tokens a pass verifies, then what the cache holds, and last how the cache is kept.
-Most choices then never need a second look. When a stage still moves the objective by `--swing` (5) percent or more,
-the stages that depend on it and were decided before it are tried again once the list is through, each with every
-value it tried before:
+Most choices then never need a second look. When a stage still moves the speed it is judged by (the objective; for
+`jit`, the agent's whole turns) by `--swing` (5) percent or more, the stages that depend on it and were decided before
+it are tried again once the list is through, each with every value it tried before:
 
 | A wide move in | tries again | because it changes |
 | --- | --- | --- |
@@ -268,7 +268,8 @@ value it tried before:
 | `mib` | the same as `predictor`, and `predictor` | the same |
 | `refill`, `answer-cap` | `budget` | how the cache is kept: the swaps of a token, and what one costs |
 | `budget` | `refill`, `answer-cap`, `jit` | the same |
-| `jit`, `threads` | `answer-cap`, `budget` | the same |
+| `jit` | `predictor`, `refill`, `answer-cap`, `budget` | what an answer finds in the cache when it starts: the experts a prompt uploads take slots of the resident set |
+| `threads` | `answer-cap`, `budget` | how the cache is kept |
 
 - A stage later in the list runs with the move in place anyway, so it isn't queued. A move in `submits` queues nothing.
 - A wide move in a stage that is tried again queues its own, up to `--revisits` (2) times, and the summary names what
@@ -277,7 +278,11 @@ value it tried before:
   on.
 - `--rounds 2` goes through every stage again regardless, and `--stages` sets another order.
 
-On the 1920X + RX480x2, for example, two stages move the balance that far, the spin and the drafts.
+On the 1920X + RX480x2, for example, the spin and the drafts move the balance that far, and the jit moves the agent's
+whole turns by 44%. The predictor's second try is what settled it there: judged before the jit was on, it was 0.5%
+ahead by the balance, and with the jit on 5.0%
+([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)). Where the jit pays, its
+stages tried again add about 20 runs.
 
 **Lists that go on past their ends.** The lists of values are spaced around what suits one machine (the
 1920X + R9700), so another machine's best value can lie past an end. When a stage's winner is the first or last value
