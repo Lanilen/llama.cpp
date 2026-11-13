@@ -59,9 +59,9 @@ DEFAULT_N_MAX = 3         # --spec-draft-n-max
 ALL_STAGES = ["omp-spin", "cpu-chunks", "drafts", "gate", "predictor", "refill", "answer-cap", "submits", "budget", "mib", "jit", "threads", "cpu-threads"]
 DEFAULT_STAGES = [s for s in ALL_STAGES if s != "gate"]  # the gates tried lose to a fixed draft length
 # What depends on what. A stage's choice holds while the settings it was made with stay where they were: when a stage
-# moves the objective by --swing percent or more, the stages listed for it that were decided before it are tried again
-# after the list, with the values they tried before, and a wide move there queues its own. A stage later in the list
-# runs with the move in place anyway.
+# moves the speed it is judged by (the objective, or its own of STAGE_METRIC) by --swing percent or more, the stages
+# listed for it that were decided before it are tried again after the list, with the values they tried before, and a
+# wide move there queues its own. A stage later in the list runs with the move in place anyway.
 DEPENDS = {
     # the CPU computes the experts that miss the cache: what a miss costs sets what a draft, a swap and a slot are worth
     "omp-spin":    ["cpu-chunks", "cpu-threads", "drafts", "gate", "predictor", "answer-cap", "budget"],
@@ -77,7 +77,8 @@ DEPENDS = {
     "refill":      ["budget"],
     "answer-cap":  ["budget"],
     "budget":      ["refill", "answer-cap", "jit"],
-    "jit":         ["answer-cap", "budget"],
+    # the experts a prompt uploads take slots of the resident set: what an answer finds in the cache when it starts
+    "jit":         ["predictor", "refill", "answer-cap", "budget"],
     "threads":     ["answer-cap", "budget"],
 }
 # the stages that a speed of the whole turn judges, not the objective: they change prompts more than generation
@@ -1169,11 +1170,13 @@ class Tuner:
             self.confirm = self.decide_confirm(cur, confirm_ids)
 
     def revisits(self, stage, old, new, later, pids):
-        """The stages to try again after this one moved from old to new, and the move in percent of the objective: the
-        stages that depend on it when the move is wide, and the ones that could not act before and can now."""
+        """The stages to try again after this one moved from old to new, and the move in percent of the speed that
+        judges the stage: the stages that depend on it when the move is wide, and the ones that could not act before and
+        can now."""
         if new == old:
             return [], 0.0
-        a, b = self.mean(old, pids), self.mean(new, pids)
+        metric = STAGE_METRIC.get(stage, self.o.objective)
+        a, b = self.mean(old, pids, metric), self.mean(new, pids, metric)
         swing = 100 * (b / a - 1) if a and b else 0.0
         out = list(DEPENDS.get(stage, [])) if abs(swing) >= self.o.swing else []
         out += [s for s in self.skipped if self.applies(s, new) is None]
@@ -1400,7 +1403,7 @@ class Tuner:
                 else:
                     L.append(f"  {d['stage']:11s} kept {d['incumbent']}: the fastest{by}")
                 if d.get("revisit"):
-                    L.append(f"              it moved {o.objective} by {d['swing']:+.1f}%: {', '.join(d['revisit'])} {'is' if len(d['revisit']) == 1 else 'are'} tried again after the list")
+                    L.append(f"              it moved {d.get('metric', o.objective)} by {d['swing']:+.1f}%: {', '.join(d['revisit'])} {'is' if len(d['revisit']) == 1 else 'are'} tried again after the list")
                 if d.get("extended"):
                     L.append(f"              its list went on past the end: {', '.join(change(d['incumbent'], n).split(' -> ')[-1] for n in d['extended'])}")
                 if d.get("held"):
@@ -1499,7 +1502,8 @@ class Tuner:
         log(f"at most {total} runs, {fmt_time(total * est)} at {est / 60:.1f} minutes per run; time budget {self.o.hours:g} h. The stages that do not fit are skipped, last ones first.")
         log("the configurations of a stage depend on what the stages before it choose: this assumes that they keep the starting point.")
         log(f"a stage whose winner is at an end of its list goes on past it, up to {self.o.extend} more values each way (--extend), 2 runs each.")
-        log(f"a stage that moves {self.o.objective} by {self.o.swing:g}% or more (--swing) has the earlier stages that depend on it tried again after the list, "
+        own = "".join(f"; {s}: {m}" for s, m in STAGE_METRIC.items() if s in self.o.stages)
+        log(f"a stage that moves the speed it is judged by ({self.o.objective}{own}) by {self.o.swing:g}% or more (--swing) has the earlier stages that depend on it tried again after the list, "
             f"up to {self.o.revisits} times (--revisits): those runs are not counted here.")
 
 
@@ -1580,7 +1584,7 @@ def parse_args(argv):
     ap.add_argument("--run-minutes", type=float, default=5, help="minutes per run to plan with until a run has been timed (default: %(default)s)")
     ap.add_argument("--passes", type=int, default=2, help="passes per configuration, at least 2 (default: %(default)s)")
     ap.add_argument("--rounds", type=int, default=1, help="times through the stages: a second one revisits the early choices with the later ones in place (default: %(default)s)")
-    ap.add_argument("--swing", type=float, default=5.0, help="a stage that moves the objective by this many percent or more has the earlier stages that depend on it tried again after the list (default: %(default)s)")
+    ap.add_argument("--swing", type=float, default=5.0, help="a stage that moves the speed it is judged by by this many percent or more has the earlier stages that depend on it tried again after the list (default: %(default)s)")
     ap.add_argument("--revisits", type=int, default=2, help="how many times the stages can be tried again in a round after wide moves, 0 = never (default: %(default)s)")
     ap.add_argument("--stages", type=list_of(str), default=DEFAULT_STAGES, help=f"the stages and their order (default: {','.join(DEFAULT_STAGES)}; also gate)")
     ap.add_argument("--objective", choices=["balance", "all", "short", "long", "agent", "agent_turn"], default="balance",
