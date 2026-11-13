@@ -417,14 +417,16 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf -c 32768 \
 ```
 
 With the cards' memory clock held (below), on the ladder's requests: prompts at 95 tok/s and answers at 19.7 tok/s, with
-64.4% of the selected experts in the cache. By the tuning script's balance over its own requests at half scale: 18.83
+64.4% of the selected experts in the cache. By the tuning script's balance over its own requests at half scale: 19.09
 tok/s.
 
 What differs from the 1920X + R9700's setup, and why:
 - **One draft, not three.** The cache holds 8 GiB of the experts here, not 20, so the CPU computes a third of the
   selected ones, and each draft adds experts to a pass. With 3 drafts the same setup generates 15% slower (16.7 against
   19.7 tok/s).
-- **`--moe-cache-jit 16`, not 8:** the tuning script's pick by an agent's whole turns.
+- **`--moe-cache-jit 16`, not 8:** the first search's pick here, and what the ladder ran with. The search as it is
+  now picks 8 by an agent's whole turns; by its balance and by the ladder's totals the two are within 1%
+  ([Tuning a machine](#tuning-a-machine)).
 - **`GGML_VK_FLOPS_PER_SUBMIT=25000000`:** smaller submits suit these cards, also the script's pick.
 - **`GGML_VK_ALLOW_GRAPHICS_QUEUE=1` without the driver option:** RADV offers no transfer family on these cards, and
   their uploads are as fast on either queue family (5.6–5.7 GB/s), so the switch costs the cache nothing.
@@ -508,23 +510,28 @@ has the hardware and the timings but no prompts and no answers. The method, the 
 | `submits` | `GGML_VK_FLOPS_PER_SUBMIT` | how much Vulkan work goes into one submit | 100M | 100M | 25M |
 | `budget` | `--moe-cache-budget` | MiB uploaded per token to follow the text | 10 | 20 | 10 |
 | `mib` | `--moe-cache-mib` | the cache's size, against 85% of it | 20900 | 20900 | 5150,3050 |
-| `jit` | `--moe-cache-jit` | which prompts' experts upload just in time | 8 | 8 | 16 |
+| `jit` | `--moe-cache-jit` | which prompts' experts upload just in time | 8 | 8 | 8 |
 | `threads` | `LLAMA_MOE_CACHE_COPY_THREADS` | the threads that copy experts to staging memory | 4 | 4 | 4 |
 | `cpu-threads` | `-t` | the CPU's threads | 12 | 12 | 12 |
 
 By the balance, the searches' results against nothing set: 42.34 against 36.80 tok/s on the R9700 with Q4 (91 runs),
-33.23 against 28.89 with Q6 (77 runs), and 17.90 against 12.67 on the RX 480s (57 runs). The largest moves were the
-predictor and the spin on the R9700 (about 4% each), and on the RX 480s the spin (19%) and one draft in place of three
-(17%).
+33.23 against 28.89 with Q6 (77 runs), and 18.95 against 12.92 on the RX 480s (99 runs). The largest moves were the
+predictor and the spin on the R9700 (about 4% each), and on the RX 480s the spin (17%) and one draft in place of three
+(20%).
 
-Three rows of the table are not those searches' own picks:
-- **The answer's gain** was set by hand on both machines. The searches ran when the script only tried caps; on the
-  R9700 they picked 500 swaps on Q4 and 125 on Q6, and a gain of 8 measured 2.1% and 0.5% better by the balance. The
-  script tries both now.
-- **The predictor on the RX 480s** was left out by its search, which judged it with a full rebalance at each answer's
-  start; that costs the agent's answers 4.9% there. With a gain of 8 the predictor is 4.4% ahead by the balance, and
-  the script now judges it with the gains.
-- **The cache size on the RX 480s** was raised by 600 MiB by hand, for 1.8%.
+The RX 480s' column is the script's own pick as it is now. The R9700's searches ran with an earlier version of it:
+- **The answer's gain on the R9700** was set by hand. Its searches ran when the script only tried caps; they picked
+  500 swaps on Q4 and 125 on Q6, and a gain of 8 measured 2.1% and 0.5% better by the balance. The script tries both
+  now.
+- **The predictor on the RX 480s** is why some stages are tried again. The first search there judged it with a full
+  rebalance at each answer's start, which costs the agent's answers 4.9%, and left it out; the script now judges it
+  with the gains. Judged before the jit is on, the predictor with a gain of 8 is only 0.5% ahead by the balance. With
+  the jit on it is 5.0% ahead (18.96 against 18.05 tok/s): the experts a prompt uploads take slots of the resident
+  set, and the predictor brings the answer's experts back. So when the jit moves the agent's whole turns, which judge
+  it, by 5% or more, the predictor's stage runs again.
+- **The jit on the RX 480s** is 8 by an agent's whole turns (6.82 against 6.48 tok/s with 16) and 16 by the balance
+  (19.09 against 18.96 tok/s). The ladder ran with 16. Its last rung with 8 reads all the prompts at 94.6 against 95.0
+  tok/s and answers at 19.63 against 19.66; only the 949-token prompt differs, at 94.5 against 99.8 tok/s.
 
 A `gate` stage for gated longer drafts exists but is left out by default
 ([Tried and not kept](#tried-and-not-kept)). The settings the script doesn't search (the split, the kept-prompt
@@ -781,8 +788,8 @@ These either didn't help or cost more than they gained. Measured on the 1920X + 
 - **Whether upstream's small-n split_k should also cover GCN** (the RX 480s): the fork's own version did.
 - **A draft length chosen by what the model is doing:** agent turns want longer drafts than the other requests, and a
   graph per batch length makes switching free.
-- **The tuning script's second round in full:** in the R9700's searches it ran out of time before the drafts and the
-  budget came up again.
+- **The R9700's searches with the tuning script as it is now:** they ran with an earlier order of the stages and
+  before stages were tried again; only the RX 480s' search has run with both.
 - **A predictor trained on UD-IQ4_XS's own routing,** and more agent conversations in the training data, where the
   predictor is furthest from hindsight.
 
