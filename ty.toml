@@ -30,7 +30,7 @@ include = [
 
 # torch declares nn.Module.forward as a Callable attribute, so every forward() method reads as an override of a mutable attribute
 [overrides.rules]
-invalid-mutable-override = "ignore"
+incompatible-mutable-override = "ignore"
 
 [[overrides]]
 include = [
