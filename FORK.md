@@ -445,9 +445,10 @@ With the performance level on manual and the memory clock at its top level, prom
 verify step doesn't change. It needs root and resets at reboot, for each card:
 
 ```bash
-echo manual | sudo tee /sys/bus/pci/devices/0000:0a:00.0/power_dpm_force_performance_level
-echo "0 1 2 3 4 5 6 7" | sudo tee /sys/bus/pci/devices/0000:0a:00.0/pp_dpm_sclk
-echo 1 | sudo tee /sys/bus/pci/devices/0000:0a:00.0/pp_dpm_mclk
+C=/sys/bus/pci/devices/0000:0b:00.0   # the card's address, from lspci -D
+echo manual | sudo tee $C/power_dpm_force_performance_level
+echo "0 1 2 3 4 5 6 7" | sudo tee $C/pp_dpm_sclk
+echo 1 | sudo tee $C/pp_dpm_mclk
 ```
 
 Keep the cards awake while a model is loaded, as with the R9700: when an RX 480 runtime-suspends, the driver moves its
