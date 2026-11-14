@@ -60,7 +60,7 @@ llama.cpp with its defaults to the fork's setup, on one request set per machine:
 | branch | what it has | guide |
 |---|---|---|
 | `polaris` | everything, the one to use | this file |
-| [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | Vulkan shaders for the sparse-attention ops on GPUs without fp16 | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
+| [`vk-sparse-attn`](https://github.com/Lanilen/llama.cpp/tree/vk-sparse-attn) | the lightning indexer's Vulkan shader for GPUs without fp16 | [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md) |
 | [`moe-hot-spare`](https://github.com/Lanilen/llama.cpp/tree/moe-hot-spare) | the hot spare cache, its release and return around large prompts, the scheduler and Vulkan changes for models with experts on the CPU, the trace tools | [docs/moe-hot-spare.md](docs/moe-hot-spare.md) |
 | [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus the expert predictor and its training pipeline, just-in-time uploads for prompts that keep the cache, the work beside the MoE, and the tuning script with its cache and draft stages | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`moe-tuning`](https://github.com/Lanilen/llama.cpp/tree/moe-tuning) | `moe-predictor` plus the CPU's expert op, larger prompts that keep the cache, faster expert copies for those that don't, the graph per batch length, and the tuning script's CPU and Vulkan stages | [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts), [tools/moe-trace](tools/moe-trace/README.md#tuning-a-machine) |
@@ -82,18 +82,20 @@ separate something.
 *Branch `vk-sparse-attn`, guide [docs/vk-sparse-attn.md](docs/vk-sparse-attn.md).*
 
 Models with a lightning-indexer sparse attention (Qwen3.8-Flash-Next / `qwen4exp`, DeepSeek V3.2/V4-style indexers) use
-two ops that upstream Vulkan doesn't fully cover. On GPUs without fp16, both fall back to the CPU in every
-full-attention layer.
+two ops, `GGML_OP_LIGHTNING_INDEXER` and `GGML_OP_TOP_K_MASK`. Upstream's Vulkan backend runs the mask on every GPU,
+but its indexer shader needs fp16: without it the indexer falls back to the CPU in every full-attention layer.
 - `GGML_OP_LIGHTNING_INDEXER` gets a shader variant with fp32 shared memory.
-- `GGML_OP_TOP_K_MASK` gets a Vulkan shader.
+- `GGML_OP_TOP_K_MASK` had a shader of the fork's until upstream added its own (2026-11-13); upstream's is used now,
+  and on an RX 480 the two take the same time.
 
-With the two, nothing else of Flash-Next falls back: with the model's dense layers on one RX 480 and its whole MTP
-draft on the other, the scheduler's node list for generation batches and for a 1410-token prompt has only the experts
-(kept in RAM by `-ncmoe`) and the token lookups on the CPU.
+With the two on the GPU, nothing else of Flash-Next falls back: with the model's dense layers on one RX 480 and its
+whole MTP draft on the other, the scheduler's node list for generation batches and for a 1410-token prompt has only the
+experts (kept in RAM by `-ncmoe`) and the token lookups on the CPU.
 
 **Measured on its own,** one RX 480 with `llama-bench` (Flash-Next UD-IQ4_XS, experts partly on the CPU, no draft):
 generation 8% faster at an empty context and 19% faster at 16k tokens of context, because upstream runs the indexer on
-the CPU over every cached key.
+the CPU over every cached key. That was against an upstream with both ops on the CPU; the indexer alone, which is
+what the branch adds today, was 5% at an empty context.
 
 ### The hot spare cache
 
@@ -250,7 +252,8 @@ apply to any such model, with or without the cache:
 - **A graph per batch length** (`LLAMA_GRAPH_CACHE=N`, opt-in): a verify batch of another length than the last one
   rebuilds and reallocates the graph, 14–21 ms on the 1920X. With the cache, each small length (up to
   `LLAMA_GRAPH_CACHE_TOKENS` tokens, 16) keeps a scheduler and graph of its own, about 50 MiB of device memory each,
-  and the main scheduler takes everything else.
+  and the main scheduler takes everything else. Upstream has since made its one scheduler serve every length; the
+  graph per length is still worth 1–2% of a verify step on top of that.
 
 **On the ladder:**
 - **The fork with no option set (rung 2)** makes a verify step 10.7% shorter than upstream's on the 1920X + RX480x2,
@@ -685,9 +688,10 @@ What it shows, in the order IQ4_XS on the RX 480s, then Q4 and Q6 on the R9700:
 
 ## The fork and upstream
 
-The fork follows upstream by merges, never rebases; every branch is at upstream `3b4d6ab3f` (2026-11-10). The rule for
-a conflict: where upstream has its own version of something the fork built and it performs about as well in general,
-upstream's version stays and ours goes; ours stays only where it measures better on the real workload.
+The fork follows upstream by merges, never rebases; every branch is at upstream `ded522f83` (2026-11-13), past
+upstream's `v1.0.0`. The rule for a conflict: where upstream has its own version of something the fork built and it
+performs about as well in general, upstream's version stays and ours goes; ours stays only where it measures better on
+the real workload.
 
 **What upstream has of its own, and what the fork keeps beside it:**
 - **A MoE cache with part of its misses on the CPU** (`--moe-cache-mib`, `--moe-cache-cpu-share F`, ClassLRU
@@ -706,6 +710,34 @@ upstream's version stays and ours goes; ours stays only where it measures better
 - **The MTP target rows on the device:** the draft reads the target's rows in place from a device buffer. Taken, with
   the two row transfers a pass queued on the compute queue, where they don't wait behind the cache's uploads.
   `LLAMA_MTP_DEV_ROWS=0` keeps the host rows, which the R9700 setup uses for its fit.
+- **One scheduler and one set of graph results for every batch** (2026-11-10 and 11): a batch of another length no
+  longer allocates them anew. The fork's graph per batch length (`LLAMA_GRAPH_CACHE`) stays beside it: without it a
+  verify step is still 1–2% longer on the R9700 and about 1% longer on the RX 480s.
+- **A stricter prefetch rule:** only inputs that an earlier split computed are read ahead. The fork's queued
+  asynchronous reads stay on for the rest (`GGML_SCHED_ASYNC_READS`, the default); switching them off costs about 1%
+  of a step on the R9700 and 0.4% on the RX 480s.
+- **Batched tensor copies in the Vulkan backend.** Taken as they are; the cache's restore after a large prompt and
+  the draft head's lap take the same time as before (on Q4 2.26 s before and 2.28 s after, 0.87 ms both).
+- **A check that the cache's device can run the expert matmul,** beside the hot spare's own probe of its bank size.
+- **The MoE cache's graph code in `llama-moe-cache`** (`build_lookup`, `build_experts`). The hot spare's branch of the
+  graph calls them and keeps its own parts: the CPU share of every miss, the side branch, the jit slots, the host sum.
+- **A Vulkan kernel for TOP_K_MASK** on every GPU. The fork's own went
+  ([Sparse attention](#sparse-attention-on-gpus-without-fp16)).
+- **`GGML_VK_KEEPALIVE`,** a small write every N seconds that keeps an idle GPU from suspending. Not used by the
+  setups, which keep the RX 480s awake with a udev rule; the two have not been compared.
+
+**The merge of 2026-11-14** (131 upstream commits, in six stages so that a break had few suspects) was accepted on
+the tuned setups, the build before against the build after, back to back, two passes each:
+
+| | verify step before | after | prompts before | after |
+|---|---|---|---|---|
+| 1920X + R9700, UD-Q4_K_XL | 60.68 ms | 60.00 ms | 413 tok/s | 435 tok/s |
+| 1920X + R9700, UD-Q6_K_XL | 76.73 ms | 75.24 ms | 351 tok/s | 362 tok/s |
+| 1920X + RX480x2, UD-IQ4_XS | 94.02 ms | 94.57 ms | 95 tok/s | 101 tok/s |
+
+Logits against the build before are within the run-to-run spread of either build, and `test-backend-ops` passes on
+the R9700 and on an RX 480 (22425 cases each). [The ladder](#the-ladder) is as measured on 2026-11-13, at upstream
+`3b4d6ab3f`.
 
 **Upstream's cache against the hot spare at the same memory.** The ladder's rung 1 gives upstream's cache what its own
 build can allocate. In the fork's build, which splits the cache's banks, it can take the hot spare's 20900 MiB on the
@@ -725,11 +757,11 @@ is the predictor's residency and the jit slots.
 cache from a few runs and a replay of the routing; the fork's `tools/moe-trace/moe-hot-spare-tune.py` searches the hot
 spare's settings in stages with real runs.
 
-**Upstream's checks on a push.** Upstream's Python type check (`ty`) runs on every push that touches a `.py` file,
-and the fork's scripts pass it. `ty.toml` lists `tools/moe-predictor` in `extra-paths`, so the predictor tools'
-`import common` resolves to their own module and not to the repository's `common/` directory, and ignores
-`invalid-mutable-override` there, which torch's `nn.Module.forward` triggers. The "CI (cann)" workflow fails on every
-push of this fork as it does on upstream's own master: its `jobs:` is empty and GitHub rejects the file.
+**Upstream's checks on a push.** Upstream's Python type check (`ty`) runs on every push that touches a `.py` file, and
+the fork's scripts pass it. `ty.toml` lists `tools/moe-predictor` in `extra-paths`, so the predictor tools' `import
+common` resolves to their own module and not to the repository's `common/` directory, and ignores `incompatible-mutable-
+override` there, which torch's `nn.Module.forward` triggers. The "CI (cann)" workflow fails on every push of this fork
+as it does on upstream's own master: its `jobs:` is empty and GitHub rejects the file.
 
 ## Tried and not kept
 
@@ -786,6 +818,8 @@ These either didn't help or cost more than they gained. Measured on the 1920X + 
 ## Still to measure
 
 - **Whether upstream's small-n split_k should also cover GCN** (the RX 480s): the fork's own version did.
+- **The indexer's shader against today's upstream** on an RX 480: the guide's tables predate upstream's mask kernel.
+- **Upstream's `GGML_VK_KEEPALIVE` against the udev rule** that keeps the RX 480s awake.
 - **A draft length chosen by what the model is doing:** agent turns want longer drafts than the other requests, and a
   graph per batch length makes switching free.
 - **The R9700's searches with the tuning script as it is now:** they ran with an earlier order of the stages and
