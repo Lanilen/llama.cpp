@@ -695,6 +695,15 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
+        // the layer's input, as the mean over the hc streams: the rows of llama_get_embeddings_layer_inp (llama-moe-trace's
+        // hidden rows) and the MoE predictor's hidden state, as qwen4exp and deepseek41 give them
+        if (((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) ||
+            ((size_t) il < cparams.moe_hidden_inp.size() && cparams.moe_hidden_inp[il])) {
+            res->t_layer_inp[il] = build_hc_mean(inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * residual = inpL;
         hc_pre attn_hc = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il);
         cur = attn_hc.cur;
