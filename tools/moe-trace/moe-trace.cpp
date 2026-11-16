@@ -238,15 +238,34 @@ int main(int argc, char ** argv) {
             msg.content = params.system_prompt;
             all.push_back(msg);
         }
+        bool has_reasoning = false;
         for (const auto & m : msgs) {
             common_chat_msg msg;
             msg.role    = m.at("role").get<std::string>();
             msg.content = m.at("content").get<std::string>();
+            // a model that thinks: its thinking is part of what it generated (gen_sessions.py keeps it)
+            if (m.contains("reasoning_content") && m.at("reasoning_content").is_string()) {
+                msg.reasoning_content = m.at("reasoning_content").get<std::string>();
+                has_reasoning = has_reasoning || !msg.reasoning_content.empty();
+            }
             all.push_back(msg);
+        }
+        // the template's options as the server that wrote the conversation had them: --chat-template-kwargs, then the
+        // conversation's own "chat_template_kwargs" (what gen_sessions.py sent with every request, e.g. reasoning_effort);
+        // earlier answers keep their thinking where the template can (llama-server's default)
+        std::map<std::string, std::string> kwargs = params.default_template_kwargs;
+        if (conv.is_object() && conv.contains("chat_template_kwargs") && conv.at("chat_template_kwargs").is_object()) {
+            for (const auto & kv : conv.at("chat_template_kwargs").items()) {
+                kwargs[kv.key()] = kv.value().dump();
+            }
+        }
+        if (has_reasoning && kwargs.find("preserve_reasoning") == kwargs.end()) {
+            kwargs["preserve_reasoning"] = "true";
         }
         auto render = [&](size_t n, bool add_generation_prompt) {
             common_chat_templates_inputs inputs;
             inputs.use_jinja = params.use_jinja;
+            inputs.chat_template_kwargs = kwargs;
             inputs.messages.assign(all.begin(), all.begin() + n);
             inputs.add_generation_prompt = add_generation_prompt;
             return common_tokenize(ctx, common_chat_templates_apply(chat_templates.get(), inputs).prompt.str(), true, true);

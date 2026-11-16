@@ -98,8 +98,8 @@ generation thread waits for it, and the model's threads are idle then. `--moe-ca
 a start file with it, on a device instead ([On the CPU or on a GPU](#on-the-cpu-or-on-a-gpu)).
 
 **What a model needs.** The hidden rows come from the layer inputs the model's graph exposes (`t_layer_inp`, set by
-most model graphs in llama.cpp; the fork adds it to `qwen4exp`). A model whose graph doesn't set it can't use a
-predictor with hidden inputs.
+most model graphs in llama.cpp; the fork adds it to `qwen4exp` and to `glm5-next`, as the mean over the residual
+streams). A model whose graph doesn't set it can't use a predictor with hidden inputs.
 
 **Checking a file.** `llama-moe-predictor-check FILE VECTORS [DEVICE]` runs the file in llama.cpp on test vectors
 written by its exporter and compares with the PyTorch model. A good file agrees to about 1e-7 and picks the same top
@@ -453,6 +453,11 @@ Two kinds of conversation are worth tracing:
   ```
   Each saved session is a conversation for `--trace-conversation`. The predictor gains most on these: they are
   what it sees live.
+  - A model that thinks writes its thinking too: `gen_sessions.py` keeps it with each answer (`reasoning_content`),
+    sends it back with the next turn, and `llama-moe-trace` renders it, so the thinking is part of the traced answer.
+  - `--chat-template-kwargs '{"reasoning_effort": "low"}'` (any JSON object) goes with every request and into the
+    session's file, and `llama-moe-trace` renders the session with it. Generate the sessions the ways the model will
+    be used: with a model served both ways, some thinking and some not.
 - **Datasets read teacher-forced.** Real conversations from public datasets: the model reads the dataset's answers as
   if it had written them. They are cheaper (no generation: about 110 tokens/s traced with hidden rows on the
   1920X + R9700) and much more varied. `build_corpus.py` samples them through the Hugging Face datasets-server API (no

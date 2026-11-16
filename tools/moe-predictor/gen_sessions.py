@@ -19,9 +19,12 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--url", default="127.0.0.1:8080")
 ap.add_argument("--prefix", default="sess-")
 ap.add_argument("--max-tokens", type=int, default=700)
+ap.add_argument("--chat-template-kwargs", default="", help="a JSON object sent with every request and kept in the session's "
+                "file, where llama-moe-trace reads it back, e.g. '{\"reasoning_effort\": \"low\"}' for a model that thinks")
 ap.add_argument("--minutes", type=float, default=0, help="stop starting new sessions after this long (0: no limit)")
 args = ap.parse_args()
 plans = json.load(open(args.plans))
+kwargs = json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else None
 os.makedirs(args.out, exist_ok=True)
 deadline = time.time() + args.minutes * 60 if args.minutes > 0 else float("inf")
 url = args.url if args.url.startswith("http") else f"http://{args.url}"
@@ -37,10 +40,14 @@ for i, turns in enumerate(plans):
         for turn in turns:
             msgs.append({"role": "user", "content": turn})
             req = urllib.request.Request(f"{url}/v1/chat/completions",
-                                         data=json.dumps({"messages": msgs, "max_tokens": args.max_tokens}).encode(),
+                                         data=json.dumps({"messages": msgs, "max_tokens": args.max_tokens,
+                                                          **({"chat_template_kwargs": kwargs} if kwargs else {})}).encode(),
                                          headers={"Content-Type": "application/json"})
             r = json.loads(urllib.request.urlopen(req, timeout=3600).read())
-            msgs.append({"role": "assistant", "content": r["choices"][0]["message"].get("content") or ""})
+            m = r["choices"][0]["message"]
+            # the thinking is part of the answer: kept, sent back with the next turn and traced with it
+            msgs.append({"role": "assistant", "content": m.get("content") or "",
+                         **({"reasoning_content": m["reasoning_content"]} if m.get("reasoning_content") else {})})
             timings.append(r.get("timings", {}))
     except Exception as e:   # one bad session doesn't stop the run; a dead server does
         print(f"  {args.prefix}{i:03d} FAILED: {e}", flush=True)
@@ -49,7 +56,8 @@ for i, turns in enumerate(plans):
             sys.exit("3 sessions failed in a row, stopping")
         continue
     fails = 0
-    json.dump({"messages": msgs, "timings": timings}, open(os.path.join(args.out, f"{args.prefix}{i:03d}.json"), "w"))
+    json.dump({"messages": msgs, "timings": timings, **({"chat_template_kwargs": kwargs} if kwargs else {})},
+              open(os.path.join(args.out, f"{args.prefix}{i:03d}.json"), "w"))
     n = sum(t.get("predicted_n", 0) for t in timings)
     s = sum(t.get("predicted_ms", 0) for t in timings) / 1000
     print(f"  {args.prefix}{i:03d}: {n} tokens generated at {n / max(s, 1e-9):.1f} tok/s, wall {time.time() - t0:.0f} s", flush=True)
