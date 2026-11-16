@@ -30,11 +30,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int n = hdr[0], NL = hdr[1], NE = hdr[2], NF = hdr[3], NEMB = hdr[4], NHL = hdr[5], TURN = hdr[6], NHZ = hdr[7];
-    auto p = llama_moe_predictor::load(argv[1], argc > 3 ? argv[3] : "", NL, NE, NEMB);
+    auto p = llama_moe_predictor::load(argv[1], argc > 3 ? argv[3] : "", 0, NE, NEMB);   // no model here: any layers
     if (!p) {
         return 1;
     }
-    if ((int) p->maps().size() != NF || (int) p->horizons().size() != NHZ || (int) p->hidden_layers().size() != NHL ||
+    if ((int) p->layers().size() != NL || (int) p->maps().size() != NF || (int) p->horizons().size() != NHZ || (int) p->hidden_layers().size() != NHL ||
             p->reads_turn_embd() != (TURN != 0)) {
         fprintf(stderr, "the vectors don't match the predictor file\n");
         return 1;

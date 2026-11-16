@@ -34,11 +34,15 @@ public:
     static const char * map_name(map_kind k);
 
     // nullptr if the file can't be used for a model of n_layer layers of n_expert experts and n_embd embeddings
-    // (logged); device: name of the backend device to run on, empty = CPU
+    // (logged); n_layer 0: a model of any number of layers (a tool without one); device: name of the backend device
+    // to run on, empty = CPU
     static std::unique_ptr<llama_moe_predictor> load(const std::string & path, const std::string & device,
                                                      int32_t n_layer, int32_t n_expert, int32_t n_embd);
     ~llama_moe_predictor();
 
+    // the model's layer each of its layers stands for: every layer of the model in order, or the file's own list (a
+    // model whose every layer isn't a MoE layer); the count maps and the predictions are in this order
+    const std::vector<int32_t>  & layers() const;
     const std::vector<int32_t>  & hidden_layers() const; // the layers whose input it reads, at the newest token
     const std::vector<map_kind> & maps() const;          // the count maps it reads, in this order
     const std::vector<int32_t>  & horizons() const;      // tokens, one prediction each
@@ -46,11 +50,11 @@ public:
     bool reads_turn_embd() const;                        // it reads the turn's mean token embedding
     bool is_start() const;                               // role "start": it predicts before the turn's prompt runs
 
-    // maps: one pointer per entry of maps() to n_layer*n_expert counts (layer-major), nullptr for MAP_PRIOR
+    // maps: one pointer per entry of maps() to layers().size()*n_expert counts (layer-major), nullptr for MAP_PRIOR
     // hidden: one pointer per entry of hidden_layers() to the n_embd inputs of that layer at the newest token
     // t: tokens of the answer generated so far (0: right after the prompt)
     // turn_embd: with reads_turn_embd(), the n_embd mean of the token embeddings over the turn's tokens
-    // out: per horizon, n_layer*n_expert probabilities (each layer's sum to 1); false if the graph failed
+    // out: per horizon, layers().size()*n_expert probabilities (each layer's sum to 1); false if the graph failed
     bool predict(const std::vector<const float *> & maps, const std::vector<const float *> & hidden, int64_t t,
                  std::vector<std::vector<float>> & out, const float * turn_embd = nullptr);
 

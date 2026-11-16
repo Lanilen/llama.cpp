@@ -664,6 +664,8 @@ embedding size. Trace your own use: the predictor learns the routing of the text
   - `n_layer`, `n_expert`, `n_expert_used`, `n_embd`: the MoE model it predicts for. A file whose `n_layer`,
     `n_expert` or `n_embd` differs from the model's doesn't load.
   - `role`: `main` or `start`.
+  - `layers` (optional): the model's layer of each of its `n_layer` layers, for a model whose every layer isn't a
+    MoE layer (GLM-5.3-Flash: layers 3 to 44 of 45). Without it `n_layer` must be the model's layer count.
   - `hidden_layers`: the layers whose input it reads.
   - `hidden_slots`: what it reads of them, `last` (the newest row) or `turn_embd_mean` (the start predictor), with
     `turn_embd_scale`.
