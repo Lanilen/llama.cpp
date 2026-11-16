@@ -2535,7 +2535,12 @@ struct llama_moe_cache::impl {
     bool predict_with(llama_moe_predictor & pr, int64_t t, const std::vector<std::vector<float>> & hid, const float * turn_embd) {
         const int64_t t_start_us = ggml_time_us();
         const auto & maps = pr.maps();
-        const size_t n_layer = layers.size();
+        const auto & pl   = pr.layers(); // the model's layer of each of the predictor's
+        const size_t n_layer = pl.size();
+        if (pl.empty() || (size_t) pl.back() >= layers.size()) {
+            LLAMA_LOG_WARN("%s: the MoE predictor's layers aren't the model's\n", __func__);
+            return false;
+        }
         size_t n_expert = 0;
         for (const layer & l : layers) {
             n_expert = std::max(n_expert, l.rec.count.size());
@@ -2547,9 +2552,10 @@ struct llama_moe_cache::impl {
                 continue;
             }
             pred_in[f].assign(n_layer*n_expert, 0.0f);
-            for (size_t il = 0; il < n_layer; ++il) {
-                if (layers[il].ig >= 0) {
-                    std::copy(layers[il].pmap[maps[f]].begin(), layers[il].pmap[maps[f]].end(), pred_in[f].begin() + il*n_expert);
+            for (size_t ip = 0; ip < n_layer; ++ip) {
+                const layer & l = layers[pl[ip]];
+                if (l.ig >= 0) {
+                    std::copy(l.pmap[maps[f]].begin(), l.pmap[maps[f]].end(), pred_in[f].begin() + ip*n_expert);
                 }
             }
             mp[f] = pred_in[f].data();
@@ -2562,15 +2568,15 @@ struct llama_moe_cache::impl {
             return false;
         }
         const float scale = (float) n_expert_used*pr.horizons()[0]/pred_out.size();
-        for (size_t il = 0; il < n_layer; ++il) {
-            layer & l = layers[il];
+        for (size_t ip = 0; ip < n_layer; ++ip) {
+            layer & l = layers[pl[ip]];
             if (l.ig < 0) {
                 continue;
             }
             for (size_t e = 0; e < l.pred.size(); ++e) {
                 float sum = 0.0f;
                 for (const auto & o : pred_out) {
-                    sum += o[il*n_expert + e];
+                    sum += o[ip*n_expert + e];
                 }
                 l.pred[e] = scale*sum;
             }
