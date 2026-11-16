@@ -11,10 +11,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <numeric>
 
 // the predictor file, version 1 (see the exporter, moe-pred/export_predictor.py):
 //   moe_predictor.{version, n_layer, n_expert, n_expert_used, n_embd, every}: u32; .norm_eps, .map_eps: f32
 //   moe_predictor.{hidden_layers, buckets, horizons}: i32 arrays; .hidden_slots, .maps: string arrays
+//   .layers: i32 array, optional: the model's layer of each of the n_layer layers, ascending, for a model whose every
+//   layer isn't a MoE layer (GLM-5.3: layers 3-44 of 45); without it n_layer is the model's and they are all its layers
 //   .hidden_slots: "last" (the newest token's input of each hidden layer) and/or "turn_embd_mean" (the mean of the
 //   model's token embeddings over the turn's tokens, times .turn_embd_scale, f32, default 1), in the input's order
 //   .role: "main" (default) or "start" (it predicts before the turn's prompt is processed)
@@ -35,7 +39,8 @@ const char * llama_moe_predictor::map_name(map_kind k) {
 }
 
 struct llama_moe_predictor::impl {
-    int32_t n_layer  = 0;
+    int32_t n_layer  = 0; // the predictor's own layers
+    std::vector<int32_t> layers; // the model's layer of each
     int32_t n_expert = 0;
     int32_t n_embd   = 0;
     int32_t every    = 16;
@@ -74,6 +79,7 @@ struct llama_moe_predictor::impl {
 llama_moe_predictor::llama_moe_predictor() : pimpl(new impl()) {}
 llama_moe_predictor::~llama_moe_predictor() = default;
 
+const std::vector<int32_t> & llama_moe_predictor::layers() const { return pimpl->layers; }
 const std::vector<int32_t> & llama_moe_predictor::hidden_layers() const { return pimpl->hidden_layers; }
 const std::vector<llama_moe_predictor::map_kind> & llama_moe_predictor::maps() const { return pimpl->maps; }
 const std::vector<int32_t> & llama_moe_predictor::horizons() const { return pimpl->horizons; }
@@ -138,16 +144,28 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
     if (!u32("n_layer", f_layer) || !u32("n_expert", f_expert) || !u32("n_embd", f_embd)) {
         return fail("missing n_layer, n_expert or n_embd");
     }
-    if ((int32_t) f_layer != n_layer || (int32_t) f_expert != n_expert || (int32_t) f_embd != n_embd) {
-        return fail("made for " + std::to_string(f_layer) + " layers of " + std::to_string(f_expert) + " experts and " +
-                    std::to_string(f_embd) + " embeddings, the model has " + std::to_string(n_layer) + ", " +
-                    std::to_string(n_expert) + " and " + std::to_string(n_embd));
+    // the model's layer of each of the file's: its own list, or every layer of the model in order
+    std::vector<int32_t> f_layers;
+    bool fits = f_layer > 0 && (int32_t) f_expert == n_expert && (int32_t) f_embd == n_embd;
+    if (i32s("layers", f_layers)) {
+        fits = fits && f_layers.size() == f_layer && f_layers.front() >= 0 && (n_layer <= 0 || f_layers.back() < n_layer) &&
+               std::adjacent_find(f_layers.begin(), f_layers.end(), std::greater_equal<int32_t>()) == f_layers.end();
+    } else {
+        fits = fits && (n_layer <= 0 || (int32_t) f_layer == n_layer);
+        f_layers.resize(f_layer);
+        std::iota(f_layers.begin(), f_layers.end(), 0);
+    }
+    if (!fits) {
+        return fail("made for " + std::to_string(f_layer) + " layers" +
+                    (key("layers") >= 0 && !f_layers.empty() ? " (the model's " + std::to_string(f_layers.front()) + " to " + std::to_string(f_layers.back()) + ")" : "") +
+                    " of " + std::to_string(f_expert) + " experts and " + std::to_string(f_embd) + " embeddings, the model has " +
+                    std::to_string(n_layer) + ", " + std::to_string(n_expert) + " and " + std::to_string(n_embd));
     }
     u32("every", every);
 
     std::unique_ptr<llama_moe_predictor> p(new llama_moe_predictor());
     impl & m = *p->pimpl;
-    m.n_layer = n_layer; m.n_expert = n_expert; m.n_embd = n_embd; m.every = std::max<int32_t>(1, (int32_t) every);
+    m.n_layer = (int32_t) f_layer; m.layers = f_layers; m.n_expert = n_expert; m.n_embd = n_embd; m.every = std::max<int32_t>(1, (int32_t) every);
     if (const int64_t k = key("norm_eps"); k >= 0) { m.norm_eps = gguf_get_val_f32(g, k); }
     if (const int64_t k = key("map_eps");  k >= 0) { m.map_eps  = gguf_get_val_f32(g, k); }
     if (const int64_t k = key("turn_embd_scale"); k >= 0) { m.turn_scale = gguf_get_val_f32(g, k); }
@@ -178,7 +196,7 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
         return fail("the slot \"last\" and the hidden layers go together");
     }
     for (int32_t il : m.hidden_layers) {
-        if (il < 0 || il >= n_layer) {
+        if (il < 0 || (n_layer > 0 && il >= n_layer)) {
             return fail("hidden layer " + std::to_string(il) + " out of range");
         }
     }
@@ -197,7 +215,7 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
     const int64_t D  = (int64_t) m.hidden_layers.size()*n_embd + (m.use_turn ? n_embd : 0);
     const int64_t NB = m.buckets.size();
     const int64_t NF = m.maps.size();
-    const int64_t NE = n_expert, NL = n_layer;
+    const int64_t NE = n_expert, NL = m.n_layer;
     ggml_tensor * t_mlp0 = ggml_get_tensor(ctx_meta, "mlp.0.weight");
     ggml_tensor * t_mlp2 = ggml_get_tensor(ctx_meta, "mlp.2.weight");
     if (!t_mlp0 || !t_mlp2) {
@@ -330,8 +348,8 @@ std::unique_ptr<llama_moe_predictor> llama_moe_predictor::load(const std::string
     for (map_kind k : m.maps) {
         names += std::string(names.empty() ? "" : " ") + map_name(k);
     }
-    LLAMA_LOG_INFO("%s: %s: %s predictor, %zu horizons every %d tokens from the inputs of %zu layers%s and %zu count maps (%s), on %s\n",
-        __func__, fn, m.start ? "start" : "main", m.horizons.size(), m.every, m.hidden_layers.size(),
+    LLAMA_LOG_INFO("%s: %s: %s predictor for layers %d to %d, %zu horizons every %d tokens from the inputs of %zu layers%s and %zu count maps (%s), on %s\n",
+        __func__, fn, m.start ? "start" : "main", m.layers.front(), m.layers.back(), m.horizons.size(), m.every, m.hidden_layers.size(),
         m.use_turn ? ", the turn's mean token embedding" : "", m.maps.size(), names.c_str(), ggml_backend_dev_name(dev));
     return p;
 }

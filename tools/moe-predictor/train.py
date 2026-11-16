@@ -303,7 +303,7 @@ if __name__ == "__main__":
         torch.save({"state": model.state_dict(), "prior": prior.view(NL, NE).cpu(), "buckets": BUCKETS, "horizons": HS,
                     "slots": ["last"] if args.hid_last_only else ["last", "prompt_mean", "answer_mean"],
                     "rank": args.rank, "hid_layers": HID_LAYERS, "n_embd": N_EMBD, "n_expert_used": K, "maps": MAPS, "no_hidden": args.no_hidden,
-                    **({"sources": SRCS} if SRCS else {})}, args.save)
+                    "moe_layers": MODEL.get("moe_layers"), **({"sources": SRCS} if SRCS else {})}, args.save)
 
     if args.sim:
         # swap-limited replays of a third of the held-out answers (their first 512 tokens): the live rule with the

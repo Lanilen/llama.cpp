@@ -43,7 +43,7 @@ EMB = None
 
 def shape_of(meta):
     hid = meta.get("hidden") or {}
-    return {"n_layer": len(meta["moe_layers"]), "n_expert": int(meta["layers"][0]["n_expert"]),
+    return {"n_layer": len(meta["moe_layers"]), "moe_layers": [int(x) for x in meta["moe_layers"]], "n_expert": int(meta["layers"][0]["n_expert"]),
             "n_expert_used": int(meta["n_expert_used"]), "n_embd": int(hid.get("n_embd", 0)),
             "hidden_layers": [int(x) for x in hid.get("layers", [])], "model": meta.get("model_name", "")}
 
