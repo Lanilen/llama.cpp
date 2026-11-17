@@ -8,6 +8,7 @@ that the documents no longer name, or that the code has, is an error too, so the
 
 Also lists, without failing, the variables the fork's own sources read that no document names.
 """
+import fnmatch
 import glob
 import os
 import re
@@ -71,7 +72,7 @@ def main(argv):
         why = "has no reason" if not allow[name] else "is in the code" if in_code(name) else "is in no document"
         print(f"FAIL  check-docs.allow: {name} {why}: drop the entry")
 
-    own = "\n".join(code[rel] for pat in OWN for rel in code if glob.fnmatch.fnmatch(rel, pat))
+    own = "\n".join(code[rel] for pat in OWN for rel in code if fnmatch.fnmatch(rel, pat))
     undocumented = sorted({m[1] for m in re.finditer(r'getenv\("((?:LLAMA|GGML)_[A-Z0-9_]+)"\)', own)} | set(re.findall(r'"((?:LLAMA|GGML)_[A-Z0-9_]+)"', code.get("tools/moe-trace/moe-hot-spare-tune.py", ""))))
     undocumented = [n for n in undocumented if n not in named and not n.startswith("LLAMA_ARG_")]
     print(f"{len(named)} names in {len(docs)} documents, {len(allow)} kept on purpose; {len(missing)} not in the code, {len(stale)} stale entries")
