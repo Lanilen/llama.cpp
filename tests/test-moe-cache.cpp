@@ -53,10 +53,14 @@ static const float    FIX_STDEV    = 0.1f;
 // logits, and the margin of the reference's top token, in the same unit, above which another top token fails.
 // The reference is the same to the bit from run to run; what a cache changes is which kernel computes an expert
 // (the device's for a resident one, the CPU's for the others). Measured on a 14600KF + RTX 4070 Ti and on lavapipe:
-// up to 0.0007 with k-quant and i-quant experts (qwen4exp), up to 0.03 where the fixture's rows only take the legacy
+// up to 0.0007 with k-quant and i-quant experts (qwen4exp), up to 0.024 where the fixture's rows only take the legacy
 // quants (glm5-next: n_embd 128), from the device's fp16 matmul.
+// What this bound catches is a computation that went wrong (a graph of another batch, a branch left out). It does
+// not catch a wrong expert in a slot: with a quarter of the uploaded experts replaced by their neighbours the logits
+// of these random models move by 0.003 to 0.005 (qwen4exp) and 0.04 to 0.09 (glm5-next). The read-back checks do
+// (LLAMA_MOE_CACHE_VERIFY, LLAMA_MOE_CACHE_JIT_CHECK, LLAMA_OFFLOAD_FAST_CHECK: byte for byte against the host's).
 static float tol_logit(const llm_arch arch) {
-    return arch == LLM_ARCH_GLM5_NEXT ? 0.1f : 0.005f;
+    return arch == LLM_ARCH_GLM5_NEXT ? 0.1f : 0.002f;
 }
 static float tol_margin(const llm_arch arch) {
     return 4.0f*tol_logit(arch);
@@ -1300,7 +1304,8 @@ int main(int argc, char ** argv) {
             return ref_save(r, write_ref) ? 0 : 1;
         }
 
-        const std::string tmp_dir = std::filesystem::temp_directory_path().string();
+        // the files a scenario writes: next to the references when ctest runs it
+        const std::string tmp_dir = ref_dir.empty() ? std::filesystem::temp_directory_path().string() : ref_dir;
         std::string dev_names;
         for (ggml_backend_dev_t dev : devs) {
             dev_names += std::string(dev_names.empty() ? "" : " + ") + ggml_backend_dev_description(dev);
