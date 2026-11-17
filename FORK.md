@@ -304,7 +304,7 @@ In `tools/moe-trace` ([README](tools/moe-trace/README.md)) and `tools/moe-predic
 - `moe-hot-spare-tune.py`: the search for a machine's settings ([Tuning a machine](#tuning-a-machine));
 - `moe-check.sh`: the checks after an upstream merge or a change to the caches, from one command: the caches on tiny
   models built in memory (`ctest -L moe`), the ops, the tools' own tests and the documents against the code, in about
-  ten minutes on one machine with a GPU, and a canary for the real setups ([Testing the MoE caches](docs/moe-testing.md));
+  seven minutes on one machine with a GPU, and a canary for the real setups ([Testing the MoE caches](docs/moe-testing.md));
 - `tools/moe-predictor`: the predictor's training pipeline.
 
 ## Build
