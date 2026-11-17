@@ -230,6 +230,26 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 llama_build(test-llama-archs.cpp)
+
+# the MoE caches on tiny models: a process per scenario (the switches are read once a process), see test-moe-cache.cpp
+if (NOT WIN32)
+    llama_build(test-moe-cache.cpp)
+    set(MOE_CACHE_REF_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-moe-cache")
+    file(MAKE_DIRECTORY "${MOE_CACHE_REF_DIR}")
+    set(MOE_CACHE_SCENARIOS lru lru-cpu-share hot-spare hot-file resize resize-warm small-buffers two-devices mtp
+        jit jit-slots-2 predictor predictor-start predictor-gain predictor-cap predictor-device
+        graph-cache host-sum jit-share resize-split offload-fast cpu-flat cpu-fused cpu-plain kit kit-mtp)
+    foreach(arch IN ITEMS qwen4exp glm5-next)
+        llama_test(test-moe-cache NAME test-moe-cache-${arch}-ref LABEL moe
+            ARGS --arch ${arch} --make-ref --ref-dir "${MOE_CACHE_REF_DIR}")
+        set_tests_properties(test-moe-cache-${arch}-ref PROPERTIES FIXTURES_SETUP moe-cache-ref-${arch} SKIP_RETURN_CODE 77)
+        foreach(scn IN LISTS MOE_CACHE_SCENARIOS)
+            llama_test(test-moe-cache NAME test-moe-cache-${arch}-${scn} LABEL moe
+                ARGS --arch ${arch} --scenario ${scn} --ref-dir "${MOE_CACHE_REF_DIR}")
+            set_tests_properties(test-moe-cache-${arch}-${scn} PROPERTIES FIXTURES_REQUIRED moe-cache-ref-${arch} SKIP_RETURN_CODE 77)
+        endforeach()
+    endforeach()
+endif()
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")

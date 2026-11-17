@@ -17,11 +17,21 @@
 //                     (LLAMA_DRIFT_PROFILE_ALT=1: the sizes taken in turn, batch by batch, so every batch has another length than
 //                     the last: the graph is rebuilt each time, as with drafts of varying length; LLAMA_WINDOW_TIMING=1 splits it)
 //                     every token output; each phase is a label of the Vulkan perf logger (ggml_backend_vk_perf_mark)
+// LLAMA_DRIFT_CANARY  FILE: the canary of a setup, one load and no free generation: the tokens of -f (again from the start
+//                     when they run out) as a prompt (LLAMA_DRIFT_CANARY_PREFIX tokens, 1024), then LLAMA_DRIFT_CANARY_POS (256)
+//                     positions one token at a time, whose logits are compared with FILE (written if it does not exist: the
+//                     64 top tokens of each position), verify batches of LLAMA_DRIFT_CANARY_VERIFY tokens (3,8;
+//                     LLAMA_DRIFT_CANARY_BATCHES of each, 64), prompt batches of LLAMA_DRIFT_CANARY_KEPT tokens (512,2048; two of
+//                     each) that should keep the cache, one of LLAMA_DRIFT_CANARY_RELEASE tokens (4096, 0 = none) that should
+//                     not, the first token after it (the restore) and LLAMA_DRIFT_CANARY_AFTER (64) more. Prints a line
+//                     "canary: NAME VALUE ..." per measurement, with the cache's counters; the script that runs it holds
+//                     the numbers they are compared with
 
 #include "arg.h"
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "../../src/llama-moe-cache.h"
 
 #include <algorithm>
 #include <clocale>
@@ -112,6 +122,232 @@ static double pct(std::vector<double> v, double q) {
     return v[std::min(v.size() - 1, (size_t) (q * v.size()))];
 }
 
+static std::vector<int> int_list(const char * env, const char * def) {
+    std::vector<int> out;
+    for (const char * p = env ? env : def; *p;) {
+        out.push_back(atoi(p));
+        while (*p && *p != ',') {
+            ++p;
+        }
+        if (*p == ',') {
+            ++p;
+        }
+    }
+    return out;
+}
+
+// LLAMA_DRIFT_CANARY, see the top of the file
+static int canary(llama_context * ctx, common_batch & batch, const std::vector<llama_token> & text, const int n_vocab, const char * ref_path) {
+    auto geti = [](const char * name, int def) { const char * v = getenv(name); return v ? atoi(v) : def; };
+    const int n_prefix  = geti("LLAMA_DRIFT_CANARY_PREFIX", 1024);
+    const int n_pos     = geti("LLAMA_DRIFT_CANARY_POS", 256);
+    const int n_batches = geti("LLAMA_DRIFT_CANARY_BATCHES", 64);
+    const int n_release = geti("LLAMA_DRIFT_CANARY_RELEASE", 4096);
+    const int n_after   = geti("LLAMA_DRIFT_CANARY_AFTER", 64);
+    const std::vector<int> verify = int_list(getenv("LLAMA_DRIFT_CANARY_VERIFY"), "3,8");
+    const std::vector<int> kept   = int_list(getenv("LLAMA_DRIFT_CANARY_KEPT"), "512,2048");
+    const int n_top = std::min(64, n_vocab);
+    const int n_max_batch = (int) llama_n_batch(ctx);
+
+    int64_t need = (int64_t) n_prefix + n_pos + n_release + 1 + n_after;
+    for (int S : verify) {
+        need += (int64_t) S*n_batches;
+    }
+    for (int S : kept) {
+        need += 2*S;
+    }
+    bool sizes_ok = n_prefix >= 1 && n_pos >= 1 && n_release <= n_max_batch && need <= (int64_t) llama_n_ctx(ctx);
+    for (int S : verify) {
+        sizes_ok = sizes_ok && S >= 1 && S <= n_max_batch;
+    }
+    for (int S : kept) {
+        sizes_ok = sizes_ok && S >= 1 && S <= n_max_batch;
+    }
+    if (!sizes_ok) {
+        LOG_ERR("%s: the canary needs %lld positions in a context of %u and batches of up to %d tokens\n", __func__, (long long) need, llama_n_ctx(ctx), n_max_batch);
+        return 1;
+    }
+
+    uint64_t hash = 1469598103934665603ull;
+    for (int64_t i = 0; i < need; ++i) {
+        hash = (hash ^ (uint64_t) text[i % text.size()])*1099511628211ull;
+    }
+    printf("canary: tokens %lld hash %016llx\n", (long long) need, (unsigned long long) hash);
+
+    int pos = 0;
+    // n tokens from pos in batches of up to the batch size; ms, < 0 if it failed
+    auto decode = [&](int n, bool all) {
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < n; i += n_max_batch) {
+            batch.clear();
+            for (int k = i; k < std::min(n, i + n_max_batch); ++k) {
+                batch.add(text[(pos + k) % text.size()], pos + k, 0, all || k + 1 == n);
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0 || llama_get_logits_ith(ctx, -1) == nullptr) {
+                return -1.0;
+            }
+        }
+        pos += n;
+        return (ggml_time_us() - t0)/1e3;
+    };
+    auto counters = [&]() {
+        llama_moe_cache_counters c;
+        llama_moe_cache_get_counters(ctx, c);
+        return c;
+    };
+    auto hit_rate = [](const llama_moe_cache_counters & a, const llama_moe_cache_counters & b) {
+        const double hits = (double) (b.spare_small.hits - a.spare_small.hits);
+        const double all  = hits + (double) (b.spare_small.misses - a.spare_small.misses);
+        return all > 0 ? 100.0*hits/all : 0.0;
+    };
+    auto fail = [&]() {
+        LOG_ERR("%s: decode failed at position %d\n", __func__, pos);
+        return 1;
+    };
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    double t = decode(n_prefix, false);
+    if (t < 0) {
+        return fail();
+    }
+    printf("canary: prefix_ms %.1f tokens %d\n", t, n_prefix);
+
+    // the positions, one token at a time: the top tokens of each row against the reference's
+    std::vector<int32_t> ids((size_t) n_pos*n_top);
+    std::vector<float>   vals((size_t) n_pos*n_top);
+    std::vector<int32_t> ref_ids;
+    std::vector<float>   ref_vals;
+    bool have_ref = false;
+    if (FILE * f = fopen(ref_path, "rb")) {
+        uint64_t h = 0;
+        int32_t hdr[3] = { 0, 0, 0 };
+        have_ref = fread(&h, sizeof(h), 1, f) == 1 && fread(hdr, sizeof(hdr), 1, f) == 1;
+        if (have_ref && (h != hash || hdr[0] != n_pos || hdr[1] != n_top || hdr[2] != n_vocab)) {
+            fclose(f);
+            LOG_ERR("%s: %s was recorded with other tokens, sizes or another vocabulary\n", __func__, ref_path);
+            return 1;
+        }
+        ref_ids.resize(ids.size());
+        ref_vals.resize(vals.size());
+        have_ref = have_ref && fread(ref_ids.data(), sizeof(int32_t), ref_ids.size(), f) == ref_ids.size() &&
+                               fread(ref_vals.data(), sizeof(float), ref_vals.size(), f) == ref_vals.size();
+        fclose(f);
+        if (!have_ref) {
+            LOG_ERR("%s: can't read %s\n", __func__, ref_path);
+            return 1;
+        }
+    }
+    const llama_moe_cache_counters c0 = counters();
+    std::vector<double> t_steps;
+    std::vector<int> order(n_vocab);
+    int flips = 0;
+    double max_diff = 0.0;
+    for (int i = 0; i < n_pos; ++i) {
+        t = decode(1, true);
+        if (t < 0) {
+            return fail();
+        }
+        t_steps.push_back(t);
+        const float * l = llama_get_logits_ith(ctx, -1);
+        for (int k = 0; k < n_vocab; ++k) {
+            order[k] = k;
+        }
+        std::partial_sort(order.begin(), order.begin() + n_top, order.end(), [&](int a, int b) { return l[a] != l[b] ? l[a] > l[b] : a < b; });
+        for (int k = 0; k < n_top; ++k) {
+            ids[(size_t) i*n_top + k]  = order[k];
+            vals[(size_t) i*n_top + k] = l[order[k]];
+        }
+        if (have_ref) {
+            flips += ref_ids[(size_t) i*n_top] != order[0] ? 1 : 0;
+            for (int k = 0; k < n_top; ++k) {
+                max_diff = std::max(max_diff, (double) std::fabs(l[ref_ids[(size_t) i*n_top + k]] - ref_vals[(size_t) i*n_top + k]));
+            }
+        }
+    }
+    const llama_moe_cache_counters c1 = counters();
+    if (have_ref) {
+        printf("canary: logits positions %d flips %d max_diff %.6f\n", n_pos, flips, max_diff);
+    } else {
+        FILE * f = fopen(ref_path, "wb");
+        const int32_t hdr[3] = { n_pos, n_top, n_vocab };
+        const bool ok = f && fwrite(&hash, sizeof(hash), 1, f) == 1 && fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+            fwrite(ids.data(), sizeof(int32_t), ids.size(), f) == ids.size() && fwrite(vals.data(), sizeof(float), vals.size(), f) == vals.size();
+        if (!f || fclose(f) != 0 || !ok) {
+            LOG_ERR("%s: can't write %s\n", __func__, ref_path);
+            return 1;
+        }
+        printf("canary: logits positions %d recorded\n", n_pos);
+    }
+    printf("canary: step1_ms %.2f p10 %.2f p90 %.2f\n", pct(t_steps, .5), pct(t_steps, .1), pct(t_steps, .9));
+    printf("canary: hit_rate %.2f\n", hit_rate(c0, c1));
+
+    for (int S : verify) {
+        t_steps.clear();
+        for (int k = 0; k < n_batches; ++k) {
+            t = decode(S, true);
+            if (t < 0) {
+                return fail();
+            }
+            t_steps.push_back(t);
+        }
+        printf("canary: step%d_ms %.2f p10 %.2f p90 %.2f\n", S, pct(t_steps, .5), pct(t_steps, .1), pct(t_steps, .9));
+    }
+    printf("canary: fit %lld\n", (long long) counters().hot_batch);
+
+    for (int S : kept) {
+        const llama_moe_cache_counters ca = counters();
+        const double t_a = decode(S, false);
+        const double t_b = t_a < 0 ? -1.0 : decode(S, false);
+        if (t_b < 0) {
+            return fail();
+        }
+        printf("canary: kept%d_ms %.1f first %.1f restores %zu\n", S, std::min(t_a, t_b), t_a, counters().n_restores - ca.n_restores);
+    }
+
+    if (n_release > 0) {
+        const llama_moe_cache_counters ca = counters();
+        t = decode(n_release, false);
+        if (t < 0) {
+            return fail();
+        }
+        const bool released = counters().released;
+        const double t_restore = decode(1, true);
+        if (t_restore < 0) {
+            return fail();
+        }
+        const llama_moe_cache_counters cb = counters();
+        printf("canary: release%d_ms %.1f released %d\n", n_release, t, released ? 1 : 0);
+        printf("canary: restore_ms %.1f restores %zu mib %.1f\n", t_restore, cb.n_restores - ca.n_restores, (cb.restore_bytes - ca.restore_bytes)/1048576.0);
+    }
+    if (n_after > 0) {
+        const llama_moe_cache_counters ca = counters();
+        t_steps.clear();
+        for (int i = 0; i < n_after; ++i) {
+            t = decode(1, true);
+            if (t < 0) {
+                return fail();
+            }
+            t_steps.push_back(t);
+        }
+        printf("canary: after_step1_ms %.2f p10 %.2f p90 %.2f\n", pct(t_steps, .5), pct(t_steps, .1), pct(t_steps, .9));
+        printf("canary: after_hit_rate %.2f\n", hit_rate(ca, counters()));
+    }
+
+    llama_moe_cache_verify(ctx);
+    const llama_moe_cache_counters c = counters();
+    int n_resident = 0, n_slots = 0;
+    for (const auto & g : c.groups) {
+        n_resident += g.n_resident;
+        n_slots    += g.n_slots + g.n_share;
+    }
+    printf("canary: residents %d slots %d\n", n_resident, n_slots);
+    printf("canary: jit_uploaded %zu bad %zu\n", c.jit.uploaded, c.jit.bad_data + c.jit.bad_maps);
+    printf("canary: verify_checked %zu bad %zu\n", c.verify_checked, c.verify_bad + c.offload_bad);
+    printf("canary: predictions %zu\n", c.n_pred);
+    fflush(stdout);
+    return 0;
+}
+
 struct drift_run {
     llama_context * ctx;
     common_batch & batch;
@@ -176,6 +412,13 @@ int main(int argc, char ** argv) {
     const int n_max_batch = (int) llama_n_batch(ctx);
     common_batch batch(ctx);
     drift_run run{ctx, batch, prompt, n_vocab};
+
+    if (const char * env = getenv("LLAMA_DRIFT_CANARY")) {
+        const int rc = canary(ctx, batch, prompt, n_vocab, env);
+        llama_init.reset();
+        llama_backend_free();
+        return rc;
+    }
 
     if (const char * env = getenv("LLAMA_DRIFT_PROMPT")) {
         const int S = atoi(env);

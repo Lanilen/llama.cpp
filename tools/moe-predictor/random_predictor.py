@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """A predictor file with random weights for any model shape, to test the llama.cpp side (not to predict anything):
-random_predictor.py OUT.gguf N_LAYER N_EXPERT N_EMBD HIDDEN_LAYERS(comma-separated, or "start" for a start predictor)"""
+random_predictor.py OUT.gguf N_LAYER N_EXPERT N_EMBD HIDDEN_LAYERS(comma-separated, or "start" for a start predictor) [LAYERS]
+LAYERS: the model's layer of each of the file's N_LAYER, comma-separated (moe_predictor.layers), for a model whose every
+layer isn't a MoE layer; without it the file is for a model of N_LAYER layers"""
 import os, sys
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gguf-py"))   # this checkout's gguf-py
@@ -9,6 +11,8 @@ import gguf
 out, NL, NE, NEMB = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 START = sys.argv[5] == "start"
 HL = [] if START else [int(x) for x in sys.argv[5].split(",")]
+LAYERS = [int(x) for x in sys.argv[6].split(",")] if len(sys.argv) > 6 else None
+assert LAYERS is None or len(LAYERS) == NL, "LAYERS must name N_LAYER layers"
 maps = ["live64", "ctx512", "context", "prev_answer", "prior"] if START else \
        ["live64", "ctx512", "context", "turn", "prev_answer", "answer", "answer32", "answer8", "prior"]
 B, HS, F, R = ([0] if START else [0, 16, 32, 64, 128]), [128, 512], 64, 16
@@ -24,6 +28,8 @@ if START:
     w.add_string(a + "role", "start"); w.add_array(a + "hidden_slots", ["turn_embd_mean"]); w.add_float32(a + "turn_embd_scale", 100.0)
 else:
     w.add_array(a + "hidden_layers", HL); w.add_array(a + "hidden_slots", ["last"])
+if LAYERS is not None:
+    w.add_array(a + "layers", LAYERS)
 w.add_array(a + "maps", maps)
 w.add_array(a + "buckets", B); w.add_array(a + "horizons", HS)
 w.add_float32(a + "norm_eps", 1e-5); w.add_float32(a + "map_eps", 1e-4)
