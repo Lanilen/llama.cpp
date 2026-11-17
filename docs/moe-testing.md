@@ -4,8 +4,8 @@ What to run after an upstream merge or a change to the caches, and what a failur
 without a real model, on one machine with a GPU, except the lab canary at the end.
 
 ```bash
-tools/moe-trace/moe-check.sh --quick --build build-vk    # after an engine change, about 6 minutes
-tools/moe-trace/moe-check.sh --build build-vk            # after a merge, about 10 minutes
+tools/moe-trace/moe-check.sh --quick --build build-vk    # after an engine change, 6 minutes
+tools/moe-trace/moe-check.sh --build build-vk            # after a merge, 7 minutes: every op runs beside the rest
 ```
 
 The times are a 14600KF + RTX 4070 Ti with Vulkan. The script builds first, prints one `PASS`, `FAIL` or `SKIP` line
