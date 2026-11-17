@@ -47,8 +47,11 @@ def main(argv):
                 code[rel] = f.read()
         except OSError:
             pass
-    blob = "\n".join(code.values())
-    in_code = lambda name: re.search(r"(?<![A-Za-z0-9_-])" + re.escape(name) + r"(?![A-Za-z0-9_-])", blob) is not None
+    in_code_names = set()
+    for text in code.values():
+        in_code_names.update(m[1] for m in RE_VAR.finditer(text))
+        in_code_names.update(m[1] for m in RE_OPT.finditer(text))
+    in_code = lambda name: name in in_code_names
 
     allow = {}
     allow_path = os.path.join(os.path.dirname(__file__), "check-docs.allow")
