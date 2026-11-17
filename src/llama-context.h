@@ -285,6 +285,8 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
+
 private:
     llm_graph_result * get_gf_res_prev();
 
