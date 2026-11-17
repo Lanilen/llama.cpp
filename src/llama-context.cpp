@@ -5479,3 +5479,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+bool llama_moe_cache_get_counters(const struct llama_context * ctx, llama_moe_cache_counters & counters) {
+    const llama_moe_cache * cache = ctx->get_moe_cache();
+    if (cache == nullptr) {
+        return false;
+    }
+    counters = cache->counters();
+    return true;
+}

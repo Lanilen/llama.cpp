@@ -2297,3 +2297,53 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     }
     return res;
 }
+
+llama_moe_cache_counters llama_moe_cache::counters() const {
+    const impl & p = *pimpl;
+    llama_moe_cache_counters res;
+    res.mode          = p.mode;
+    res.n_expert_used = p.n_expert_used;
+    for (const auto & g : p.groups) {
+        llama_moe_cache_counters::group cg;
+        cg.device     = g.id;
+        cg.type       = g.ref.back()->type;
+        cg.layers     = g.layers;
+        cg.n_expert   = (int32_t) g.ref[0]->ne[2];
+        cg.n_slots    = g.n_slots;
+        cg.n_resident = g.n_resident;
+        for (size_t sl = 0; sl < g.key_of_slot.size(); ++sl) {
+            if (g.key_of_slot[sl] >= 0) {
+                cg.residents.push_back(g.key_of_slot[sl]);
+                if (g.slot_pending[sl]) {
+                    cg.uploading.push_back(g.key_of_slot[sl]);
+                }
+            }
+        }
+        res.groups.push_back(std::move(cg));
+    }
+    const auto spare = [](const impl::spare_stats & st) {
+        llama_moe_cache_counters::batches b;
+        b.tokens = st.tokens;
+        b.hits   = st.hits;
+        b.misses = st.misses;
+        b.swaps  = st.swaps;
+        b.bytes  = st.bytes;
+        return b;
+    };
+    const auto lru = [](const impl::stats & st) {
+        llama_moe_cache_counters::lookups l;
+        l.hits   = st.hits;
+        l.misses = st.misses;
+        l.cpu    = st.cpu;
+        l.bytes  = st.bytes;
+        return l;
+    };
+    res.spare_small   = spare(p.spare_small);
+    res.spare_large   = spare(p.spare_large);
+    res.lru_small     = lru(p.stats_small);
+    res.lru_large     = lru(p.stats_large);
+    res.released      = p.released;
+    res.n_restores    = p.n_restores;
+    res.restore_bytes = p.restore_bytes;
+    return res;
+}

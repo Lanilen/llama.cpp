@@ -57,6 +57,45 @@ struct llama_moe_cache_hot_spare_maps {
     ggml_tensor * hit  = nullptr; // I32 [1, n_expert] on the cache device: e if it is resident, else -1
 };
 
+// what the cache holds and did since it was made, for tests and tools (llama_moe_cache_get_counters)
+struct llama_moe_cache_counters {
+    struct group {
+        int32_t   device     = 0; // index of its cache device, in the order of the model's devices
+        ggml_type type       = GGML_TYPE_COUNT; // of its last expert tensor, as the log names the group
+        std::vector<int32_t> layers;
+        int32_t   n_expert   = 0; // of each layer
+        int32_t   n_slots    = 0; // 0: its budget is too small, its layers are not cached
+        int32_t   n_resident = 0; // hot spare mode: slots in use
+        std::vector<int32_t> residents; // hot spare mode: layer*n_expert + expert of each slot in use, in slot order
+        std::vector<int32_t> uploading; // the ones of them whose upload is not done: they do not serve yet
+    };
+    // hot spare mode: the selections of the cached layers, by the ubatch they were in
+    struct batches {
+        size_t tokens = 0;
+        size_t hits   = 0;
+        size_t misses = 0;
+        size_t swaps  = 0;
+        size_t bytes  = 0; // uploaded
+    };
+    struct lookups {
+        size_t hits   = 0;
+        size_t misses = 0;
+        size_t cpu    = 0; // misses computed on the CPU
+        size_t bytes  = 0; // uploaded
+    };
+
+    llama_moe_cache_mode mode = LLAMA_MOE_CACHE_MODE_LRU;
+    int32_t n_expert_used = 0;
+    std::vector<group> groups;
+    batches spare_small;      // ubatches of up to 32 tokens, the ones that run on the hot spare without resize
+    batches spare_large;
+    lookups lru_small;        // lru mode: ubatches of up to 8 tokens
+    lookups lru_large;
+    bool    released      = false; // with resize: the device memory is released now
+    size_t  n_restores    = 0;     // with resize: times the cache came back after a release
+    size_t  restore_bytes = 0;     // uploaded again by them
+};
+
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // lru mode: each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 // hot spare mode: one device keeps a set of resident experts, they run there while the CPU runs the other selected experts
@@ -128,9 +167,15 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // read between two decodes
+    llama_moe_cache_counters counters() const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
+
+// the counters of the context's MoE cache, false if it has none
+LLAMA_API bool llama_moe_cache_get_counters(const struct llama_context * ctx, llama_moe_cache_counters & counters);
