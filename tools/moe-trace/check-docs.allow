@@ -1,0 +1,3 @@
+# names the fork's documents keep on purpose though the code does not have them: NAME, then why (check-docs.py)
+OMP_PLACES OpenMP's own variable: FORK.md's "Tried and not kept" names it for the thread pinning that lost
+GGML_SCHED_ASYNC_CPU the switch of the shelved design in docs/moe-hot-spare-async-cpu.md, which says it does not exist
