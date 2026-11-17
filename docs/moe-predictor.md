@@ -20,8 +20,8 @@ loads what the answer is about to need instead of what the last answer used.
   pipeline is the main part of this document ([Training](#training)), because a predictor is only as good as its data
   and every model needs its own.
 
-**The file for Flash-Next.** One model has a predictor: Qwen3.8-Flash-Next (`qwen4exp`: 48 MoE layers, 512 experts,
-10 used per token).
+**The file for Flash-Next.** The first predictor, and the one this document's results are from, is for
+Qwen3.8-Flash-Next (`qwen4exp`: 48 MoE layers, 512 experts, 10 used per token).
 - **Its data:** 1,181 traces of UD-Q4_K_XL's routing, 945 recorded on the 1920X + R9700 and 236 on the
   14600KF + RTX 4070 Ti.
 - **Offline,** its top 164 experts per layer serve 86.7% of the next 128 tokens' selections from an answer's start,
@@ -34,7 +34,18 @@ loads what the answer is about to need instead of what the last answer used.
   Hugging Face:
   [Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).
 
-The pipeline reads the model's shape from the traces and isn't tied to Flash-Next, but no other model has been trained.
+**The file for GLM-5.3-Flash.** A second model, of another architecture (`glm5-next`: 3 dense and 42 MoE layers, 288
+experts, 8 used per token), has a first predictor. The scripts made it as they are: they read the model's shape from
+the traces, and the file lists the model's MoE layers (`moe_predictor.layers`), as its first three have no experts.
+- **Its data:** 190 traces of UD-Q3_K_XL's routing (2.9M tokens, 4,882 answers), recorded in 20 hours on the
+  1920X + R9700x2 and trained there in 4 minutes. Of the 114 sessions the model wrote itself, 39 have it thinking.
+- **Offline,** its top 53 experts per layer (the cache holds 18% of a layer there) serve 53.0% of the next 128 tokens'
+  selections from an answer's start, against 44.2% for the decayed scores and 65.4% in hindsight.
+- **In use,** on the 1920X + R9700x2 with the experts of 35 layers in RAM under a 19900 MiB cache: a verify step
+  198.0 → 177.1 ms (−10.6%, every one of 7 requests ahead, two passes), hits 44.1% → 51.6%. A start predictor trained
+  with it added nothing (179.3 ms) and isn't published.
+- **The file** (`glm53-pred-v1.moepred`) and its test vectors are on Hugging Face:
+  [Lanilen/GLM-5.3-Flash-Expert-Predictor](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor).
 
 ## Contents
 
