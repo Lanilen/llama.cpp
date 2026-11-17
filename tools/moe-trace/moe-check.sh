@@ -44,7 +44,7 @@ run() {    # run NAME TEXT COMMAND...: exit code 0 passes, 77 skips
   return $rc
 }
 skip() { note SKIP "$1" 0 "$2"; }
-have() { [ -x "$BIN/$1" ]; }
+have() { [ -x "$BIN/$1" ] && { [ -z "${2:-}" ] || [ -f "$2" ]; }; }   # have BINARY [its source on this branch: a build directory can hold another branch's]
 
 cd "$ROOT" || exit 2
 echo "moe-check: $(git describe --always --dirty 2>/dev/null) on $(git rev-parse --abbrev-ref HEAD 2>/dev/null), ${QUICK:+quick, }build $BUILD, device $DEV"
@@ -90,10 +90,10 @@ if [ "${DEV#Vulkan}" != "$DEV" ]; then
 else
   skip ops-no-fp16 "$DEV is not a Vulkan device"
 fi
-if have llama-mmid-glu-check; then
+if have llama-mmid-glu-check tools/moe-trace/mmid-glu-check.cpp; then
   run cpu-fusions "llama-mmid-glu-check: the CPU's fused experts against the unfused ops" env GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_CPU_MMID_FLAT=128 "$BIN/llama-mmid-glu-check"
 else skip cpu-fusions "no llama-mmid-glu-check on this branch"; fi
-if have llama-moe-predictor-check; then
+if have llama-moe-predictor-check tools/moe-trace/moe-predictor-check.cpp; then
   P=${MOE_CHECK_PREDICTORS:-}
   if [ -z "$P" ]; then
     for v in 1 2 3; do for k in pred start; do f=$HOME/moe-pred/results/flashnext-$k-v$v.gguf; [ -f "$f" ] && [ -f "$HOME/moe-pred/results/$k-v$v.vec" ] && P="$P $f:$HOME/moe-pred/results/$k-v$v.vec"; done; done
@@ -122,12 +122,14 @@ else skip tuner-mock "no tuner tests on this branch"; fi
 
 # the tools that load a file, on the tiny model
 TINY=$OUT/tiny-qwen4exp.gguf; PRED=$OUT/tiny-pred.gguf
-if "$BIN/test-moe-cache" --arch qwen4exp --save-model "$TINY" > "$OUT/tiny-model.log" 2>&1; then
+if ! grep -q -- "--save-model" tests/test-moe-cache.cpp; then
+  skip tuner-server "no tiny model file on this branch"; skip canary-mode "no canary mode on this branch"
+elif "$BIN/test-moe-cache" --arch qwen4exp --save-model "$TINY" > "$OUT/tiny-model.log" 2>&1; then
   PLACE="-c 2048 -ngl 99 -ncmoe 6 -t 4 -b 256 -ub 256 --moe-cache-resize"
   if [ -f tools/moe-trace/tests/test-tune.py ] && have llama-server && python3 tools/moe-predictor/random_predictor.py "$PRED" 6 32 256 2,5 > /dev/null 2>&1; then
     run tuner-server "the tuner's predictor and jit stages on the real server" python3 tools/moe-trace/tests/test-tune.py --real "$BIN/llama-server" "$TINY" "$PRED" -- $PLACE --moe-cache-batch 256 -dev "$DEV"
   else skip tuner-server "needs the tuner tests, llama-server and numpy"; fi
-  if have llama-moe-logit-drift && grep -q LLAMA_DRIFT_CANARY tools/moe-trace/moe-logit-drift.cpp; then
+  if have llama-moe-logit-drift tools/moe-trace/moe-logit-drift.cpp && grep -q LLAMA_DRIFT_CANARY tools/moe-trace/moe-logit-drift.cpp; then
     canary_twice() {
       rm -f "$OUT/canary.ref"; local i
       for i in 1 2; do
