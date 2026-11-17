@@ -125,6 +125,7 @@ static gguf_context_ptr fixture_gguf(const llm_arch arch, const bool mtp) {
     ms.add_kv(LLM_KV_EXPERT_COUNT,               FIX_N_EXPERT);
     ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          FIX_N_USED);
     ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, FIX_N_FF_EXP);
+    ms.add_kv(LLM_KV_CONTEXT_LENGTH,             uint32_t(2048)); // the server holds a context to it
     if (mtp) {
         ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
     }
