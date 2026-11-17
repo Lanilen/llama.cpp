@@ -175,8 +175,9 @@ slots (`LLAMA_MOE_CACHE_JIT_SLOTS`) can serve large batches.
 
 ### The expert predictor
 
-*Branch `moe-predictor`, guide [docs/moe-predictor.md](docs/moe-predictor.md); the trained Flash-Next files on
-[Hugging Face](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).*
+*Branch `moe-predictor`, guide [docs/moe-predictor.md](docs/moe-predictor.md), with
+[the predictors that exist](docs/moe-predictor.md#available-predictors) and the results of each; the trained Flash-Next
+files on [Hugging Face](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).*
 
 The cache's scores look back. The predictor is a small learned model (a ~35 MB file of its own) that ranks each layer's
 experts by how often the router will pick them over the next tokens. It reads the same counts plus the input of two
@@ -202,6 +203,14 @@ decayed scores. It carries over to the other quants of the model: both setups be
 the 1920X + RX480x2, from 74.5% to 80.5% (Q4) and from 67.7% to 75.1% (Q6) on the 1920X + R9700. It pays where the topic
 changes: a verify step in the answers after a prompt is 11%, 24% and 24% shorter. In the long answers it moves by −1.5%,
 −5.1% and −5.9%.
+
+**A file for GLM-5.3-Flash,** the second model with one, was trained on 190 traces of UD-Q3_K_XL's routing, recorded in
+20 hours on the 1920X + R9700x2 (the same machine with two R9700s) and trained there in 4 minutes. Its cache holds 53 of
+a layer's 288 experts, where Flash-Next's holds 164 of 512: the top 53 serve 53.0% of the next 128 tokens' selections
+from an answer's start, against 44.2% for the decayed scores and 65.4% in hindsight. Live on that machine a verify step
+is 10.6% shorter (198.0 → 177.1 ms over seven requests, every one ahead) and the cache serves 51.6% of the selections in
+place of 44.1%. It isn't published yet and that layout isn't one of the setups below ([its
+results](docs/moe-predictor.md#glm-53-flash)).
 
 ### The CPU's experts
 
