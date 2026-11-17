@@ -578,6 +578,11 @@ static void check_hot_spare_counters(check_list & check, const fixture & fx, con
         c.spare_large.hits, c.spare_large.misses, n_large);
 }
 
+// MiB of cache that hold a quarter of the experts: the fixture's experts are half the size with n_embd 128
+static double cache_mib(const fixture & fx) {
+    return fx.arch == LLM_ARCH_GLM5_NEXT ? 6 : 12;
+}
+
 static llama_context_params hot_spare_params(const fixture & fx, const double cache_mib) {
     llama_context_params cparams = fx.ctx_params();
     cparams.moe_cache_mode       = LLAMA_MOE_CACHE_MODE_HOT_SPARE;
@@ -590,7 +595,7 @@ static llama_context_params hot_spare_params(const fixture & fx, const double ca
 static void scn_lru(scenario_ctx & s, const float cpu_share) {
     llama_context_params cparams = s.fx.ctx_params();
     cparams.moe_cache_mode      = LLAMA_MOE_CACHE_MODE_LRU;
-    cparams.moe_cache_size      = mib(12);
+    cparams.moe_cache_size      = mib(cache_mib(s.fx));
     cparams.moe_cache_cpu_share = cpu_share;
     llama_context_ptr lctx = make_ctx(s.fx, cparams);
     const run_result got = run_steps(s.fx.model.get(), lctx.get());
@@ -606,7 +611,7 @@ static void scn_lru(scenario_ctx & s, const float cpu_share) {
 }
 
 static void scn_hot_spare(scenario_ctx & s) {
-    llama_context_ptr lctx = make_ctx(s.fx, hot_spare_params(s.fx, 12));
+    llama_context_ptr lctx = make_ctx(s.fx, hot_spare_params(s.fx, cache_mib(s.fx)));
     const run_result got = run_steps(s.fx.model.get(), lctx.get());
     check_logits(s.check, s.fx.arch, s.ref, got);
     const llama_moe_cache_counters c = get_counters(lctx.get());
@@ -621,7 +626,7 @@ static std::set<int32_t> make_hot_file(scenario_ctx & s, const std::string & pat
     std::set<int32_t> serving;
     llama_moe_cache_counters c;
     {
-        llama_context_params cparams = hot_spare_params(s.fx, 12);
+        llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
         cparams.moe_cache_save = path.c_str();
         llama_context_ptr lctx = make_ctx(s.fx, cparams);
         run_steps(s.fx.model.get(), lctx.get());
@@ -661,7 +666,7 @@ static void scn_hot_file(scenario_ctx & s) {
     const std::string path = hot_file_path(s);
     const std::set<int32_t> start = make_hot_file(s, path);
 
-    llama_context_params cparams = hot_spare_params(s.fx, 12);
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
     cparams.moe_cache_hot       = path.c_str();
     cparams.moe_cache_half_life = 0.0f;
     cparams.moe_cache_refill    = 0;
@@ -678,7 +683,7 @@ static void scn_hot_file(scenario_ctx & s) {
 
 // --moe-cache-resize with --moe-cache-batch 64: the batch of 200 tokens runs with the cache released
 static void scn_resize(scenario_ctx & s) {
-    llama_context_params cparams = hot_spare_params(s.fx, 12);
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
     cparams.moe_cache_resize = true;
     cparams.moe_cache_batch  = 64;
     llama_context_ptr lctx = make_ctx(s.fx, cparams);
@@ -697,7 +702,7 @@ static void scn_resize_warm(scenario_ctx & s) {
     const std::string path = hot_file_path(s);
     const std::set<int32_t> start = make_hot_file(s, path);
 
-    llama_context_params cparams = hot_spare_params(s.fx, 12);
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
     cparams.moe_cache_hot       = path.c_str();
     cparams.moe_cache_half_life = 0.0f;
     cparams.moe_cache_refill    = 0;
@@ -740,8 +745,8 @@ static void scn_small_buffers(scenario_ctx & s) {
 
 // a cache on each device for the layers it has
 static void scn_two_devices(scenario_ctx & s) {
-    llama_context_params cparams = hot_spare_params(s.fx, 16);
-    const size_t sizes[2] = { mib(8), mib(8) };
+    llama_context_params cparams = hot_spare_params(s.fx, 4.0/3.0*cache_mib(s.fx));
+    const size_t sizes[2] = { mib(2.0/3.0*cache_mib(s.fx)), mib(2.0/3.0*cache_mib(s.fx)) };
     cparams.moe_cache_sizes   = sizes;
     cparams.n_moe_cache_sizes = 2;
     cparams.moe_cache_resize  = true;
@@ -764,6 +769,106 @@ static void scn_two_devices(scenario_ctx & s) {
         n_cached[0], n_cached[1], n_res[0], n_res[1]);
     s.check(c.n_restores == 2 && !c.released && c.spare_small.hits > 0, "released for the large batch and restored on both: %zu restores, %zu hits in small ubatches",
         c.n_restores, c.spare_small.hits);
+}
+
+// --moe-cache-jit: the ubatches above 32 tokens that keep the cache upload the experts 4 of their tokens select,
+// each layer before it runs, into slots that come out of each group's budget
+static void scn_jit(scenario_ctx & s) {
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
+    cparams.moe_cache_resize = true;
+    cparams.moe_cache_batch  = 256;
+    cparams.moe_cache_jit    = 4;
+    llama_context_ptr lctx = make_ctx(s.fx, cparams);
+    const run_result got = run_steps(s.fx.model.get(), lctx.get());
+    check_logits(s.check, s.fx.arch, s.ref, got);
+    const llama_moe_cache_counters c = get_counters(lctx.get());
+    check_hot_spare_counters(s.check, s.fx, c, got);
+    bool half = true;
+    std::string slots;
+    for (const auto & g : c.groups) {
+        half = half && g.n_jit > 0 && g.n_jit <= g.n_slots;
+        slots += string_format("%s%d + %d", slots.empty() ? "" : ", ", g.n_slots, g.n_jit);
+    }
+    s.check(half, "the jit takes at most half of each group's slots (resident + jit: %s)", slots.c_str());
+    s.check(c.jit.layers > 0 && c.jit.uploaded > 0 && c.jit.moved > 0, "large ubatches upload: %zu experts in %zu layer runs, %zu selections moved off the CPU, %zu experts over the slots",
+        c.jit.uploaded, c.jit.layers, c.jit.moved, c.jit.capped);
+    s.check(c.jit.checked > 0 && c.jit.bad_data == 0 && c.jit.bad_maps == 0, "LLAMA_MOE_CACHE_JIT_CHECK: %zu uploads read back, %zu differ, %zu bad map entries",
+        c.jit.checked, c.jit.bad_data, c.jit.bad_maps);
+    s.check(c.n_restores == 1 && !c.released, "no batch releases the cache (%zu restores)", c.n_restores);
+}
+
+// a predictor file of random weights from tools/moe-predictor/random_predictor.py; layers: with moe_predictor.layers
+static std::string predictor_file(const scenario_ctx & s, const char * name, const uint32_t n_layer, const bool start, const bool layers) {
+    const std::string script = (std::filesystem::path(__FILE__).parent_path().parent_path() / "tools" / "moe-predictor" / "random_predictor.py").string();
+    const std::string path   = s.tmp_dir + "/test-moe-cache-" + llama_arch_name(s.fx.arch) + "-" + std::to_string(self_pid()) + "-" + name + ".gguf";
+    std::string list;
+    for (uint32_t il = FIX_N_LAYER - n_layer; il < FIX_N_LAYER; il++) {
+        list += (list.empty() ? "" : ",") + std::to_string(il);
+    }
+    const std::string cmd = string_format("python3 '%s' '%s' %u %u %d %s %s > /dev/null 2>&1", script.c_str(), path.c_str(), n_layer, FIX_N_EXPERT,
+        llama_model_n_embd(s.fx.model.get()), start ? "start" : "2,5", layers ? list.c_str() : "");
+    if (std::system(cmd.c_str()) != 0) {
+        throw std::runtime_error("skip: python3 with numpy is needed to run " + script);
+    }
+    return path;
+}
+
+enum predictor_variant { PRED_MAIN, PRED_START, PRED_GAIN, PRED_CAP, PRED_DEVICE };
+
+// --moe-cache-predictor: the file's predictions rank the experts in place of the decayed scores. A model whose first
+// layers have no experts needs a file that names its layers, and refuses one that doesn't
+static void scn_predictor(scenario_ctx & s, const predictor_variant variant) {
+    const uint32_t n_moe = s.fx.n_moe_layers();
+    const bool dense = n_moe < FIX_N_LAYER;
+    const std::string main  = predictor_file(s, "main", n_moe, false, dense);
+    const std::string start = variant == PRED_START ? predictor_file(s, "start", n_moe, true, dense) : "";
+    const std::string dev   = ggml_backend_dev_name(s.fx.devs[0]);
+
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
+    cparams.moe_cache_refill    = 0;
+    cparams.moe_cache_predictor = main.c_str();
+    if (variant == PRED_START) {
+        cparams.moe_cache_predictor_start = start.c_str();
+    } else if (variant == PRED_GAIN) {
+        cparams.moe_cache_predictor_answer_gain = 2.0f;
+    } else if (variant == PRED_CAP) {
+        cparams.moe_cache_predictor_answer_cap = 1;
+    } else if (variant == PRED_DEVICE) {
+        cparams.moe_cache_predictor_device = dev.c_str();
+    }
+
+    if (dense) {
+        const std::string bare = predictor_file(s, "bare", n_moe, false, false);
+        llama_context_params cparams_bare = cparams;
+        cparams_bare.moe_cache_predictor = bare.c_str();
+        llama_context_ptr lctx(llama_init_from_model(s.fx.model.get(), cparams_bare));
+        s.check(lctx == nullptr, "a file of %u layers that does not name them is refused for a model of %u", n_moe, FIX_N_LAYER);
+        std::remove(bare.c_str());
+        g_log.clear();
+    }
+
+    {
+        llama_context_ptr lctx = make_ctx(s.fx, cparams);
+        const run_result got = run_steps(s.fx.model.get(), lctx.get());
+        check_logits(s.check, s.fx.arch, s.ref, got);
+        const llama_moe_cache_counters c = get_counters(lctx.get());
+        check_hot_spare_counters(s.check, s.fx, c, got);
+        s.check(c.has_predictor && c.n_pred > 0, "the predictor ranks the experts%s: %zu predictions", dense ? " through the file's layers" : "", c.n_pred);
+        // an answer after each of the three prompts
+        s.check(c.n_start == 3 && c.n_start_made <= c.n_start_all, "%zu answers' starts: %zu swaps asked for, %zu made", c.n_start, c.n_start_all, c.n_start_made);
+        s.check(c.spare_small.hits > 0 && c.spare_small.swaps > 0, "the hot spare serves and swaps: %zu hits, %zu swaps", c.spare_small.hits, c.spare_small.swaps);
+        if (variant == PRED_START) {
+            s.check(c.has_start && c.n_text > 0 && c.text_swaps > 0, "the start predictor reads the turns' text: %zu turns, %zu experts uploaded", c.n_text, c.text_swaps);
+        } else if (variant == PRED_CAP) {
+            s.check(c.n_start_made <= c.n_start && c.n_start_all > c.n_start, "at most 1 swap at an answer's start: %zu of %zu made at %zu starts", c.n_start_made, c.n_start_all, c.n_start);
+        } else if (variant == PRED_GAIN) {
+            s.check(c.n_start_all > c.n_start_made, "only the swaps that bring 2 more selections: %zu of %zu", c.n_start_made, c.n_start_all);
+        }
+    }
+    std::remove(main.c_str());
+    if (!start.empty()) {
+        std::remove(start.c_str());
+    }
 }
 
 // the MTP block drafts for the target with the hot spare and resize, as a server with --spec-type draft-mtp: the
@@ -801,7 +906,7 @@ static void scn_mtp(scenario_ctx & s) {
         base.n_vocab = n_vocab;
     }
 
-    llama_context_params cparams = hot_spare_params(s.fx, 12);
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
     cparams.moe_cache_resize = true;
     cparams.moe_cache_batch  = 64;
     cparams.n_rs_seq         = n_max;
@@ -910,6 +1015,20 @@ static const std::vector<scenario> SCENARIOS = {
         { { "GGML_VK_FORCE_MAX_BUFFER_SIZE", "8388608" }, { "GGML_VK_SUBALLOCATION_BLOCK_SIZE", "8388608" } }, scn_small_buffers },
     { "two-devices",   "layers split between two devices, a cache on each, with resize", 2, false, {}, scn_two_devices },
     { "mtp",           "drafts of the MTP block verified and rolled back, the target with the hot spare and resize", 1, true, {}, scn_mtp },
+    { "jit",           "--moe-cache-jit: large ubatches upload the experts they select", 1, false,
+        { { "LLAMA_MOE_CACHE_JIT_CHECK", "1" } }, scn_jit },
+    { "jit-slots-2",   "the same with two jit slots a group", 1, false,
+        { { "LLAMA_MOE_CACHE_JIT_CHECK", "1" }, { "LLAMA_MOE_CACHE_JIT_SLOTS", "2" } }, scn_jit },
+    { "predictor",        "--moe-cache-predictor: a file of random weights ranks the experts", 1, false, {},
+        [](scenario_ctx & s) { scn_predictor(s, PRED_MAIN); } },
+    { "predictor-start",  "with --moe-cache-predictor-start: uploads from the turn's text before the prompt runs", 1, false, {},
+        [](scenario_ctx & s) { scn_predictor(s, PRED_START); } },
+    { "predictor-gain",   "--moe-cache-predictor-answer-gain 2", 1, false, {},
+        [](scenario_ctx & s) { scn_predictor(s, PRED_GAIN); } },
+    { "predictor-cap",    "--moe-cache-predictor-answer-cap 1", 1, false, {},
+        [](scenario_ctx & s) { scn_predictor(s, PRED_CAP); } },
+    { "predictor-device", "--moe-cache-predictor-device: the predictor on the GPU", 1, false, {},
+        [](scenario_ctx & s) { scn_predictor(s, PRED_DEVICE); } },
 };
 
 static void usage(const char * argv0) {

@@ -72,6 +72,7 @@ struct llama_moe_cache_counters {
         int32_t   n_expert   = 0; // of each layer
         int32_t   n_slots    = 0; // 0: its budget is too small, its layers are not cached
         int32_t   n_resident = 0; // hot spare mode: slots in use
+        int32_t   n_jit      = 0; // --moe-cache-jit: slots after them where the layers of a large ubatch upload their experts
         std::vector<int32_t> residents; // hot spare mode: layer*n_expert + expert of each slot in use, in slot order
         std::vector<int32_t> uploading; // the ones of them whose upload is not done: they do not serve yet
     };
@@ -97,6 +98,26 @@ struct llama_moe_cache_counters {
     batches spare_large;
     lookups lru_small;        // lru mode: ubatches of up to 8 tokens
     lookups lru_large;
+    // --moe-cache-jit, see the jit's line in the log
+    struct jit_counters {
+        size_t layers   = 0; // layer runs that looked for experts to upload
+        size_t uploaded = 0; // experts uploaded
+        size_t capped   = 0; // experts left to the CPU because the slots were full
+        size_t moved    = 0; // selections the uploaded experts took from the CPU
+        size_t checked  = 0; // LLAMA_MOE_CACHE_JIT_CHECK: experts read back
+        size_t bad_data = 0; //   whose slot differs from the host expert
+        size_t bad_maps = 0; //   map entries that run an expert in neither or both branches, or point past the slots
+    };
+    jit_counters jit;
+    // --moe-cache-predictor
+    bool    has_predictor = false;
+    bool    has_start     = false;
+    size_t  n_pred        = 0; // predictions
+    size_t  n_start       = 0; // answers' starts ranked by a prediction
+    size_t  n_start_all   = 0; // the swaps the predictions asked for at them
+    size_t  n_start_made  = 0; // the ones made there (--moe-cache-predictor-answer-cap, -answer-gain)
+    size_t  n_text        = 0; // turns the start predictor read
+    size_t  text_swaps    = 0; // the experts it uploaded
     bool    released      = false; // with resize: the device memory is released now
     size_t  n_restores    = 0;     // with resize: times the cache came back after a release
     size_t  restore_bytes = 0;     // uploaded again by them

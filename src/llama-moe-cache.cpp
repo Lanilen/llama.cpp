@@ -3280,6 +3280,7 @@ llama_moe_cache_counters llama_moe_cache::counters() const {
         cg.n_expert   = (int32_t) g.ref[0]->ne[2];
         cg.n_slots    = g.n_slots;
         cg.n_resident = g.n_resident;
+        cg.n_jit      = g.n_jit;
         for (size_t sl = 0; sl < g.key_of_slot.size(); ++sl) {
             if (g.key_of_slot[sl] >= 0) {
                 cg.residents.push_back(g.key_of_slot[sl]);
@@ -3311,6 +3312,21 @@ llama_moe_cache_counters llama_moe_cache::counters() const {
     res.spare_large   = spare(p.spare_large);
     res.lru_small     = lru(p.stats_small);
     res.lru_large     = lru(p.stats_large);
+    res.jit.layers    = p.jit_st.layers;
+    res.jit.uploaded  = p.jit_st.uploaded;
+    res.jit.capped    = p.jit_st.capped;
+    res.jit.moved     = p.jit_st.moved;
+    res.jit.checked   = p.jit_st.checked;
+    res.jit.bad_data  = p.jit_st.bad_data;
+    res.jit.bad_maps  = p.jit_st.bad_maps;
+    res.has_predictor = p.predictor != nullptr;
+    res.has_start     = p.predictor_start != nullptr;
+    res.n_pred        = p.n_pred;
+    res.n_start       = p.n_start;
+    res.n_start_all   = p.n_start_all;
+    res.n_start_made  = p.n_start_made;
+    res.n_text        = p.n_text;
+    res.text_swaps    = p.text_swaps;
     res.released      = p.released;
     res.n_restores    = p.n_restores;
     res.restore_bytes = p.restore_bytes;
