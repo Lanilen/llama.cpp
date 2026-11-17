@@ -417,3 +417,11 @@ treat a small gain with care when the answers differ.
   ([the CPU's experts](../../docs/moe-hot-spare.md#the-cpus-experts)).
 - `llama-moe-predictor-check PREDICTOR.gguf VECTORS [DEVICE]` checks a predictor file against the model it was exported
   from ([docs/moe-predictor.md](../../docs/moe-predictor.md#5-export-and-check)).
+
+## Tests
+
+`moe-check.sh` runs the fork's checks from one command, after an upstream merge or a change to the caches: the caches
+on tiny models, the ops, the tools above, the tuner's own tests (`tests/test-tune.py`, against
+`tests/mock-llama-server.py` and against the real server) and the canary mode of `llama-moe-logit-drift`
+(`LLAMA_DRIFT_CANARY`), which the lab's canary script runs on the real models. What each check covers and what a
+failure means: [docs/moe-testing.md](../../docs/moe-testing.md).
