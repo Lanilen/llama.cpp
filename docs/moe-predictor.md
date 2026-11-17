@@ -20,45 +20,30 @@ loads what the answer is about to need instead of what the last answer used.
   pipeline is the main part of this document ([Training](#training)), because a predictor is only as good as its data
   and every model needs its own.
 
-**The file for Flash-Next.** The first predictor, and the one this document's results are from, is for
-Qwen3.8-Flash-Next (`qwen4exp`: 48 MoE layers, 512 experts, 10 used per token).
-- **Its data:** 1,181 traces of UD-Q4_K_XL's routing, 945 recorded on the 1920X + R9700 and 236 on the
-  14600KF + RTX 4070 Ti.
-- **Offline,** its top 164 experts per layer serve 86.7% of the next 128 tokens' selections from an answer's start,
-  against 75.8% for the decayed scores ([Results](#results)).
-- **In use:** both of the lab's setups run this one file, with UD-Q4_K_XL and UD-Q6_K_XL on the 1920X + R9700 and with
-  UD-IQ4_XS on the 1920X + RX480x2 ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups)). What
-  it adds there is rung 4 of [the ladder](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder), the
-  reference benchmark for every speed of those setups.
-- **The files** (the main predictor `flashnext-pred-v3.moepred`, the start predictor and their test vectors) are on
-  Hugging Face:
-  [Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).
-
-**The file for GLM-5.3-Flash.** A second model, of another architecture (`glm5-next`: 3 dense and 42 MoE layers, 288
-experts, 8 used per token), has a first predictor. The scripts made it as they are: they read the model's shape from
-the traces, and the file lists the model's MoE layers (`moe_predictor.layers`), as its first three have no experts.
-- **Its data:** 190 traces of UD-Q3_K_XL's routing (2.9M tokens, 4,882 answers), recorded in 20 hours on the
-  1920X + R9700x2 and trained there in 4 minutes. Of the 114 sessions the model wrote itself, 39 have it thinking.
-- **Offline,** its top 53 experts per layer (the cache holds 18% of a layer there) serve 53.0% of the next 128 tokens'
-  selections from an answer's start, against 44.2% for the decayed scores and 65.4% in hindsight.
-- **In use,** on the 1920X + R9700x2 with the experts of 35 layers in RAM under a 19900 MiB cache: a verify step
-  198.0 → 177.1 ms (−10.6%, every one of 7 requests ahead, two passes), hits 44.1% → 51.6%. A start predictor trained
-  with it added nothing (179.3 ms) and isn't published.
-- **The file** (`glm53-pred-v1.moepred`) and its test vectors are on Hugging Face:
-  [Lanilen/GLM-5.3-Flash-Expert-Predictor](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor).
+**Two models have a predictor:** Qwen3.8-Flash-Next and GLM-5.3-Flash. The files, where to get them and what each
+was measured to do are in [Available predictors](#available-predictors) and, in full, in [Results](#results).
 
 ## Contents
 
+- [Available predictors](#available-predictors)
 - [What it does in the cache](#what-it-does-in-the-cache)
   - [The start from a turn's text](#the-start-from-a-turns-text)
   - [Options and environment variables](#options-and-environment-variables)
 - [Results](#results)
-  - [Offline, on held-out conversations](#offline-on-held-out-conversations)
-  - [What more traces add](#what-more-traces-add)
-  - [The predictor against the decayed scores](#the-predictor-against-the-decayed-scores)
-  - [The answer's start by gain](#the-answers-start-by-gain)
-  - [The text start](#the-text-start)
-  - [On the CPU or on a GPU](#on-the-cpu-or-on-a-gpu)
+  - [At a glance](#at-a-glance)
+  - [Qwen3.8-Flash-Next](#qwen38-flash-next)
+    - [Offline, on held-out conversations](#offline-on-held-out-conversations)
+    - [What more traces add](#what-more-traces-add)
+    - [The predictor against the decayed scores](#the-predictor-against-the-decayed-scores)
+    - [The answer's start by gain](#the-answers-start-by-gain)
+    - [The text start](#the-text-start)
+    - [On the CPU or on a GPU](#on-the-cpu-or-on-a-gpu)
+  - [GLM-5.3-Flash](#glm-53-flash)
+    - [Its data](#its-data)
+    - [Offline scores](#offline-scores)
+    - [Live, against the decayed scores](#live-against-the-decayed-scores)
+    - [Its start predictor](#its-start-predictor)
+    - [Still to measure](#still-to-measure)
 - [The model](#the-model)
 - [Training](#training)
   - [1. Traces](#1-traces)
@@ -70,6 +55,37 @@ the traces, and the file lists the model's MoE layers (`moe_predictor.layers`), 
   - [What the experiments found](#what-the-experiments-found)
   - [Another model](#another-model)
 - [The file format](#the-file-format)
+
+## Available predictors
+
+A predictor belongs to one model: its layers, its experts and its router. These exist:
+
+| Model | Predictor file | Trained on | Where to get it | Results |
+|---|---|---|---|---|
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `flashnext-pred-v3.moepred`, and an optional start file, `flashnext-start-v3.moepred` | 1,181 traces of UD-Q4_K_XL's routing, 21.0M tokens | Hugging Face: [Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) | [Qwen3.8-Flash-Next](#qwen38-flash-next) |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `glm53-pred-v1.moepred` | 190 traces of UD-Q3_K_XL's routing, 2.9M tokens | not published yet | [GLM-5.3-Flash](#glm-53-flash) |
+
+**Qwen3.8-Flash-Next** (`qwen4exp`: 48 MoE layers, 512 experts, 10 used per token).
+- **Version 3,** the third file for this model. Most of this document's measurements are of it or of the file before
+  it.
+- **Quants:** trained on UD-Q4_K_XL, and it serves UD-Q6_K_XL and UD-IQ4_XS as it is
+  ([Other quants](#offline-on-held-out-conversations)).
+- **In use:** both of the lab's setups run this one file, with UD-Q4_K_XL and UD-Q6_K_XL on the 1920X + R9700 and with
+  UD-IQ4_XS on the 1920X + RX480x2 ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#setups)). What
+  it adds there is rung 4 of [the ladder](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder), the
+  reference benchmark for every speed of those setups.
+
+**GLM-5.3-Flash** (`glm5-next`: 3 dense layers, then 42 MoE layers of 288 experts, 8 used per token).
+- **Version 1,** a first file, on 190 traces where Flash-Next's has 1,181. The scripts made it as they are: they read
+  the model's shape from the traces, and the file lists the model's MoE layers (`moe_predictor.layers`). A build of
+  the fork from before 2026-11-17 refuses such a file.
+- **Quants:** trained and measured on UD-Q3_K_XL only.
+- **In use:** measured on the 1920X + R9700x2 (two R9700s: the first computes most layers and caches their experts,
+  the second holds the last seven layers whole). That layout isn't one of FORK.md's setups yet.
+- **No start file:** one was trained and added nothing ([Its start predictor](#its-start-predictor)).
+
+A published repository holds the file, the test vectors for `llama-moe-predictor-check` and a card with the command
+line. Any other model needs a predictor trained on its own routing: [Another model](#another-model).
 
 ## What it does in the cache
 
@@ -102,7 +118,7 @@ The predictor reads two kinds of input, both kept by the cache:
   the context, the current turn's prompt, the previous answer, the answer so far, and a static prior). The cache
   records them from the router's choices at no extra cost.
 - **Hidden rows:** the input of a few layers (the residual stream) at the newest token: layers 16 and 32 for
-  Flash-Next. The graph keeps only the newest token's row of those layers.
+  Flash-Next, 15 and 30 for GLM-5.3-Flash. The graph keeps only the newest token's row of those layers.
 
 **Where it runs.** By default it's a ggml graph on the CPU with 4 threads (`LLAMA_MOE_PREDICTOR_THREADS`); the
 generation thread waits for it, and the model's threads are idle then. `--moe-cache-predictor-device DEV` runs it, and
@@ -160,14 +176,43 @@ Each option also reads its `LLAMA_ARG_` variable (`LLAMA_ARG_MOE_CACHE_PREDICTOR
 
 ## Results
 
-All for Flash-Next. The offline scores say how much of what an answer selects the predictor's experts would serve.
-The speed of the lab's setups as a whole is in
-[the ladder](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder), and its rung for the predictor is
-here. The other measurements are of one option at a time, each with the configuration it ran in: their speeds compare
-within a table, not with the ladder. To find the settings for another machine, use
-[`moe-hot-spare-tune.py`](../tools/moe-trace/README.md#tuning-a-machine).
+Each predictor has two kinds of numbers:
 
-### Offline, on held-out conversations
+- **Offline scores** come from held-out conversations, ones the training never saw. The hit rate is the share of an
+  answer's next 128 tokens' expert selections that the experts the predictor ranks highest would serve, with as many
+  experts per layer as the cache holds. Beside it are the same share for the decayed scores (the cache without a
+  predictor) and for the best set in hindsight.
+- **Live measurements** are of one option at a time, each with the configuration it ran in: their speeds compare
+  within a table, not between tables. Where the text of two arms differs, the measure is the time of a verify step
+  (one pass of the model over the newest token and its drafts), which doesn't depend on how well each text drafts.
+
+The speed of the lab's setups as a whole is in
+[the ladder](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder). To find the settings for another
+machine, use [`moe-hot-spare-tune.py`](../tools/moe-trace/README.md#tuning-a-machine).
+
+### At a glance
+
+| | Qwen3.8-Flash-Next, version 3 | GLM-5.3-Flash, version 1 |
+|---|---|---|
+| traces behind it | 1,181 (34,603 answers) | 190 (4,882 answers) |
+| experts per layer the cache holds | 164 of 512 (32%), UD-Q4_K_XL | 53 of 288 (18%), UD-Q3_K_XL |
+| **offline,** at an answer's start: decayed scores → predictor | 75.8% → **86.7%** | 44.2% → **53.0%** |
+| best possible in hindsight | 95.7% | 65.4% |
+| **live,** selections served by the cache | 74.5% → 80.5% | 44.1% → 51.6% |
+| **live,** a verify step | −23.6% after a prompt, −5.1% in long answers | −10.6% over the test's seven requests |
+| measured on | 1920X + R9700, [rung 4 of the ladder](#the-predictor-against-the-decayed-scores) | 1920X + R9700x2, [its own test](#live-against-the-decayed-scores) |
+
+The two live columns are different tests: other requests, and Flash-Next's answers start with the swaps a gain of 8
+allows where GLM's rebalance in full. GLM's hit rates are far lower because its cache is far smaller against the
+model: even hindsight serves 65% from 53 experts a layer.
+
+### Qwen3.8-Flash-Next
+
+The measurements of the file for Flash-Next. They are of version 3, trained on 1,181 traces, unless a paragraph names
+the file before it, trained on 948. The ladder's rung for the predictor is
+[here](#the-predictor-against-the-decayed-scores).
+
+#### Offline, on held-out conversations
 
 The Flash-Next file's 1,181 traces hold 21.0M tokens and 34,603 answers. Every 5th trace of each source is held out:
 6828 answers that the training never sees.
@@ -209,7 +254,7 @@ highest would serve. The cache sizes are 164 experts per layer for UD-Q4_K_XL (7
   experts uploaded during a short prompt and a top-up capped at 1000, the answers after short turns got 85.7% hits with
   4.9 uploads per generated token; the main predictor alone got 86.1% with 13.7.
 
-### What more traces add
+#### What more traces add
 
 Data limits the predictor, not the model's size:
 - **160 traces → 948.** On the 4455 answers above, a predictor trained on the first 160 traces (5944 answers) gets
@@ -240,7 +285,7 @@ Data limits the predictor, not the model's size:
 
 The gap to hindsight is widest on agent conversations, so those are the traces to add.
 
-### The predictor against the decayed scores
+#### The predictor against the decayed scores
 
 Rung 4 of [the ladder](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#the-ladder) adds the predictor to
 rung 3, the hot spare with its decayed scores and its refill: `--moe-cache-predictor` with
@@ -275,7 +320,7 @@ session (two passes, generation over every request, weighted by tokens):
 The two passes of a configuration differ by about 0.2 tok/s. The lab's searches keep the refill off on both machines
 ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
 
-### The answer's start by gain
+#### The answer's start by gain
 
 An answer's start without a limit is a full rebalance, and its uploads land while the answer generates. A short
 answer ends before they pay. What the prediction asks for differs a lot from one start to the next: with
@@ -333,7 +378,7 @@ COMPUTE profile's in every arm, on the usual answers (a story, three questions a
 rebalance at each start costs the agent's answers 4.9%
 ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine)).
 
-### The text start
+#### The text start
 
 The text start moves uploads out of the answer and into the prompt. On the 1920X + R9700 it loses overall, and
 neither setup uses it. Measured with a file trained on 948 traces and the start file trained with it, 2 drafts, the
@@ -356,13 +401,98 @@ better than the text start: Q4's agent turns gain 11.7% against 8.3%, the usual 
 the text start's prompts are 4% slower and its run 10 s longer. It does cut the uploads, from 40.8 to 24.6 MiB a token.
 There is no measurement of the text start on the 1920X + RX480x2.
 
-### On the CPU or on a GPU
+#### On the CPU or on a GPU
 
 On the 1920X's CPU a prediction takes 3.7 ms with the default 4 threads, every 16 tokens.
 - **The 1920X + R9700** runs it on the R9700 (`--moe-cache-predictor-device Vulkan0`): a verify step is 1.0% shorter on
   Q4 and 0.6% on Q6 than with it on the CPU. More CPU threads for it, or a prediction every 8 or 4 tokens, gain
   nothing there.
 - **The 1920X + RX480x2** runs it on the CPU: its cards have no memory to spare.
+
+### GLM-5.3-Flash
+
+The measurements of the first file for GLM-5.3-Flash, all with UD-Q3_K_XL on the 1920X + R9700x2:
+
+- **The layout.** The first R9700 computes layers 0–37; the experts of its 35 MoE layers (104 GiB) stay in RAM under
+  a 19900 MiB hot spare. The second R9700 holds layers 38–44 and the model's MTP layer whole, experts included.
+- **The cache is small against the model:** 53 experts of a layer's 288 on average, 18%. Flash-Next's setup holds 32%.
+
+#### Its data
+
+- **190 traces,** 2.9M tokens and 4,882 answers, recorded in 20 hours on that machine.
+- **114 sessions the model wrote itself:** its own answers to the first messages of the corpus, in multi-turn
+  sessions. In 75 of them it answers with `reasoning_effort` low, in 39 it thinks first.
+- **76 conversations read as given** from the same corpus as Flash-Next's traces ([1. Traces](#1-traces)).
+- **Split:** every 5th trace of each source is held out, 348 answers; the other 4,534 train it.
+- **Training** took 4 minutes on one R9700 (PyTorch on ROCm, 6 epochs), on the machine that recorded the traces. The
+  exported file agrees with PyTorch to 6.0e-7 on its 24 test vectors, at 2.0 ms a prediction on the CPU.
+
+#### Offline scores
+
+On the 348 held-out answers, at 53 experts per layer:
+
+| tokens into the answer | decayed scores (the cache without a predictor) | predictor | best possible in hindsight |
+|---|---|---|---|
+| 0 (the answer's start) | 44.2% | **53.0%** | 65.4% |
+| 64 | 48.7% | **52.1%** | 64.9% |
+| 256 | 50.6% | **52.2%** | 65.0% |
+
+- **The same shape as Flash-Next's table:** furthest ahead at the answer's start, and the decayed scores catch up as
+  the answer goes on.
+- **Over the next 512 tokens,** at the answer's start: 39.4% → 47.2%, against 57.6% in hindsight.
+- **Replays at the cache's default budget.** The held-out answers replayed with a refresh every 16 tokens at 1.7 swaps
+  per token: the cache without a predictor, with the refill at 64 tokens, serves 48.7% at 5.1 swaps per token; the
+  predictor 52.5% at 1.6. At twice the budget, 50.3% at 6.5 swaps against 53.8% at 3.3.
+- **How much is left.** The predictor closes 8.8 of the 21.2 points between the decayed scores and hindsight at the
+  answer's start. Flash-Next's closes 10.9 of 19.9, on 1,181 traces.
+
+#### Live, against the decayed scores
+
+`--moe-cache-predictor` and nothing else, against the hot spare with its decayed scores and its refill. 2 drafts from
+the MTP layer, the predictor on the CPU, every answer's start a full rebalance (no gain, no cap). Seven requests of
+about 2,800 generated tokens, two alternating passes, in ms a verify step:
+
+| request | decayed scores | predictor | |
+|---|---|---|---|
+| a story, 512 tokens, thinking | 174.9 | 157.6 | −9.9% |
+| a question after 2k tokens of code | 197.6 | 184.6 | −6.6% |
+| another, thinking | 208.5 | 181.0 | −13.2% |
+| a session's first turn, after 1.8k tokens of code | 208.7 | 173.2 | −17.0% |
+| its second turn | 195.2 | 192.1 | −1.6% |
+| its third turn | 208.4 | 177.5 | −14.8% |
+| its fourth turn | 192.5 | 173.7 | −9.8% |
+| **all** | **198.0** | **177.1** | **−10.6%** |
+
+- **Selections served by the cache:** 44.1% → 51.6%, about the offline table's gap.
+- **Generation:** 11.1–13.0 → 13.0–13.8 tok/s by request.
+- **Every request is ahead in both passes.** A pass differs from the other by 1–3%.
+- **Thinking or not** makes no clear difference: the two requests where the model thinks gain 9.9% and 13.2%.
+- **After a prompt that releases the cache,** the restore uploads the predicted set, as for Flash-Next: 15.9 GiB in
+  about 1.35 s on this machine.
+
+#### Its start predictor
+
+A start file was trained with the main one and isn't published:
+
+- **Offline,** over the first 128 tokens of 248 held-out answers: what the cache holds from the turn before serves
+  36.4%, the decayed scores at the answer's start 44.3% and the text start 48.0%, against 52.9% at the end of the
+  prompt.
+- **Live,** in the test above: 179.3 ms a verify step with it against 177.1 without (−9.4% against −10.6% over the
+  decayed scores), 50.3% of the selections served against 51.6%, and the 2k-token prompts at 30.7 tok/s against 32.9.
+
+As on Flash-Next ([The text start](#the-text-start)), it moves uploads into the prompt and gains nothing overall.
+
+#### Still to measure
+
+- **The answer's start by gain or by cap.** The test above rebalances in full, which costs Flash-Next's agent turns
+  ([The answer's start by gain](#the-answers-start-by-gain)).
+- **The predictor on a GPU** (`--moe-cache-predictor-device`).
+- **The tuning script's search** on this layout, which settles those two with the drafts, the budget and the cache's
+  size.
+- **Other quants,** UD-IQ4_XS first.
+- **More traces.** Flash-Next's file kept gaining from 160 to 1,181 traces
+  ([What more traces add](#what-more-traces-add)), and this one has 190, with the model's thinking in a third of its
+  own sessions.
 
 ## The model
 
@@ -665,6 +795,9 @@ What depends on the model:
 
 The rest of the pipeline reads the shape from the traces: the number of MoE layers, experts, experts used and the
 embedding size. Trace your own use: the predictor learns the routing of the text it is trained on.
+
+[GLM-5.3-Flash](#glm-53-flash) is the worked example: another architecture, whose first three layers have no experts.
+Its file took 20 hours of traces and 4 minutes of training with these scripts, and gave a first gain on 190 traces.
 
 ## The file format
 
