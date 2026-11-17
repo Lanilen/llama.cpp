@@ -63,7 +63,7 @@ A predictor belongs to one model: its layers, its experts and its router. These 
 | Model | Predictor file | Trained on | Where to get it | Results |
 |---|---|---|---|---|
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `flashnext-pred-v3.moepred`, and an optional start file, `flashnext-start-v3.moepred` | 1,181 traces of UD-Q4_K_XL's routing, 21.0M tokens | Hugging Face: [Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) | [Qwen3.8-Flash-Next](#qwen38-flash-next) |
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `glm53-pred-v1.moepred` | 190 traces of UD-Q3_K_XL's routing, 2.9M tokens | not published yet | [GLM-5.3-Flash](#glm-53-flash) |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `glm53-pred-v1.moepred` | 190 traces of UD-Q3_K_XL's routing, 2.9M tokens | Hugging Face: [Lanilen/GLM-5.3-Flash-Expert-Predictor](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor) | [GLM-5.3-Flash](#glm-53-flash) |
 
 **Qwen3.8-Flash-Next** (`qwen4exp`: 48 MoE layers, 512 experts, 10 used per token).
 - **Version 3,** the third file for this model. Most of this document's measurements are of it or of the file before
