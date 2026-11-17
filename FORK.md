@@ -176,8 +176,9 @@ slots (`LLAMA_MOE_CACHE_JIT_SLOTS`) can serve large batches.
 ### The expert predictor
 
 *Branch `moe-predictor`, guide [docs/moe-predictor.md](docs/moe-predictor.md), with
-[the predictors that exist](docs/moe-predictor.md#available-predictors) and the results of each; the trained Flash-Next
-files on [Hugging Face](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor).*
+[the predictors that exist](docs/moe-predictor.md#available-predictors) and the results of each; the trained files on
+Hugging Face, for [Flash-Next](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) and for
+[GLM-5.3-Flash](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor).*
 
 The cache's scores look back. The predictor is a small learned model (a ~35 MB file of its own) that ranks each layer's
 experts by how often the router will pick them over the next tokens. It reads the same counts plus the input of two
@@ -209,8 +210,7 @@ changes: a verify step in the answers after a prompt is 11%, 24% and 24% shorter
 a layer's 288 experts, where Flash-Next's holds 164 of 512: the top 53 serve 53.0% of the next 128 tokens' selections
 from an answer's start, against 44.2% for the decayed scores and 65.4% in hindsight. Live on that machine a verify step
 is 10.6% shorter (198.0 → 177.1 ms over seven requests, every one ahead) and the cache serves 51.6% of the selections in
-place of 44.1%. It isn't published yet and that layout isn't one of the setups below ([its
-results](docs/moe-predictor.md#glm-53-flash)).
+place of 44.1%. That layout isn't one of the setups below yet ([its results](docs/moe-predictor.md#glm-53-flash)).
 
 ### The CPU's experts
 
