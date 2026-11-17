@@ -246,18 +246,24 @@ struct step {
     bool    all;       // every token is output (generation, or the verification of drafts), else the last one (a prompt)
 };
 
-// a prompt, an answer, verify batches of 3 and 8, a prompt that fits a small reserve and one that doesn't, each
-// followed by an answer: 432 tokens
-static const std::vector<step> STEPS = {
-    {  1,  24, false },
-    { 48,   1, true  },
-    {  8,   3, true  },
-    {  4,   8, true  },
-    {  1,  64, false },
-    { 16,   1, true  },
-    {  1, 200, false },
-    { 24,   1, true  },
-};
+// a prompt, an answer, verify batches of 3, 8 and 1 tokens in turn (a graph of another length each time), a prompt
+// that fits a small reserve and one that doesn't, each followed by an answer: 440 tokens
+static std::vector<step> make_steps() {
+    std::vector<step> steps = { { 1, 24, false }, { 40, 1, true } };
+    for (int i = 0; i < 6; i++) {
+        steps.push_back({ 1, 3, true });
+        steps.push_back({ 1, 8, true });
+        steps.push_back({ 1, 1, true });
+    }
+    steps.push_back({  1,  64, false });
+    steps.push_back({ 16,   1, true  });
+    steps.push_back({  1, 200, false });
+    steps.push_back({ 24,   1, true  });
+    return steps;
+}
+static const std::vector<step> STEPS = make_steps();
+static const size_t N_STEPS_SMALL = 20; // before the batch of 64 tokens
+static const size_t N_STEPS_KEPT  = 22; // before the batch of 200
 
 struct run_result {
     uint32_t n_vocab = 0;
@@ -501,7 +507,9 @@ static llama_context_ptr make_ctx(const fixture & fx, const llama_context_params
     return lctx;
 }
 
+// with the resident experts read back first (LLAMA_MOE_CACHE_VERIFY, which main sets)
 static llama_moe_cache_counters get_counters(llama_context * lctx) {
+    llama_moe_cache_verify(lctx);
     llama_moe_cache_counters c;
     if (!llama_moe_cache_get_counters(lctx, c)) {
         throw std::runtime_error("the context has no MoE cache");
@@ -553,13 +561,14 @@ static std::string groups_str(const llama_moe_cache_counters & c) {
 }
 
 // what holds for the hot spare after any run
-static void check_hot_spare_counters(check_list & check, const fixture & fx, const llama_moe_cache_counters & c, const run_result & run, const bool every_layer = true) {
+// split: the batches ran in smaller ubatches (LLAMA_MOE_RESIZE_SPLIT), only the sums are known
+static void check_hot_spare_counters(check_list & check, const fixture & fx, const llama_moe_cache_counters & c, const run_result & run, const bool every_layer = true, const bool split = false) {
     int32_t n_layers = 0;
     bool slots_ok = true;
     for (const auto & g : c.groups) {
         n_layers += (int32_t) g.layers.size();
         std::set<int32_t> keys(g.residents.begin(), g.residents.end());
-        slots_ok = slots_ok && g.n_resident <= g.n_slots && (int32_t) g.residents.size() == g.n_resident && keys.size() == g.residents.size() &&
+        slots_ok = slots_ok && g.n_resident <= g.n_slots + g.n_share && (int32_t) g.residents.size() == g.n_resident && keys.size() == g.residents.size() &&
             (keys.empty() || (*keys.begin() >= 0 && *keys.rbegin() < (int32_t) (FIX_N_LAYER*FIX_N_EXPERT)));
     }
     check(c.mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE && c.n_expert_used == (int32_t) FIX_N_USED, "hot spare mode, %d experts a token", c.n_expert_used);
@@ -567,15 +576,24 @@ static void check_hot_spare_counters(check_list & check, const fixture & fx, con
     if (every_layer) {
         check(cached_layers(c) == n_layers, "every MoE layer is cached (%d of %d)", cached_layers(c), n_layers);
     }
-    check(slots_ok, "each group: residents <= slots, every resident expert once");
-    check(c.spare_small.tokens == run.n_tokens_small && c.spare_large.tokens == run.n_tokens_large, "every token is counted: %zu in small ubatches, %zu in large ones",
-        c.spare_small.tokens, c.spare_large.tokens);
-    const size_t n_small = expected_selections(fx, c, run.n_tokens_small, run.n_out_small);
-    const size_t n_large = expected_selections(fx, c, run.n_tokens_large, run.n_out_large);
-    check(c.spare_small.hits + c.spare_small.misses == n_small, "small ubatches: hits %zu + misses %zu = the selections of the cached layers (%zu)",
-        c.spare_small.hits, c.spare_small.misses, n_small);
-    check(c.spare_large.hits + c.spare_large.misses == n_large, "large ubatches: hits %zu + misses %zu = the selections of the cached layers (%zu)",
-        c.spare_large.hits, c.spare_large.misses, n_large);
+    check(slots_ok, "each group: residents <= slots (with the jit's shared ones), every resident expert once");
+    if (split) {
+        const size_t n_all = expected_selections(fx, c, run.n_tokens_small + run.n_tokens_large, run.n_out_small + run.n_out_large);
+        check(c.spare_small.tokens + c.spare_large.tokens == run.n_tokens, "every token is counted: %zu in small ubatches, %zu in large ones",
+            c.spare_small.tokens, c.spare_large.tokens);
+        check(c.spare_small.hits + c.spare_small.misses + c.spare_large.hits + c.spare_large.misses == n_all, "hits %zu + misses %zu = the selections of the cached layers (%zu)",
+            c.spare_small.hits + c.spare_large.hits, c.spare_small.misses + c.spare_large.misses, n_all);
+    } else {
+        check(c.spare_small.tokens == run.n_tokens_small && c.spare_large.tokens == run.n_tokens_large, "every token is counted: %zu in small ubatches, %zu in large ones",
+            c.spare_small.tokens, c.spare_large.tokens);
+        const size_t n_small = expected_selections(fx, c, run.n_tokens_small, run.n_out_small);
+        const size_t n_large = expected_selections(fx, c, run.n_tokens_large, run.n_out_large);
+        check(c.spare_small.hits + c.spare_small.misses == n_small, "small ubatches: hits %zu + misses %zu = the selections of the cached layers (%zu)",
+            c.spare_small.hits, c.spare_small.misses, n_small);
+        check(c.spare_large.hits + c.spare_large.misses == n_large, "large ubatches: hits %zu + misses %zu = the selections of the cached layers (%zu)",
+            c.spare_large.hits, c.spare_large.misses, n_large);
+    }
+    check(c.verify_checked > 0 && c.verify_bad == 0, "LLAMA_MOE_CACHE_VERIFY: %zu resident experts read back, %zu differ from the host's", c.verify_checked, c.verify_bad);
 }
 
 // MiB of cache that hold a quarter of the experts: the fixture's experts are half the size with n_embd 128
@@ -730,7 +748,7 @@ static void scn_small_buffers(scenario_ctx & s) {
     }
     // no large batch: with buffers this small the backend's own staging buffer for its copies does not fit
     llama_context_ptr lctx = make_ctx(s.fx, hot_spare_params(s.fx, 40));
-    const run_result got = run_steps(s.fx.model.get(), lctx.get(), 4);
+    const run_result got = run_steps(s.fx.model.get(), lctx.get(), N_STEPS_SMALL);
     check_logits(s.check, s.fx.arch, s.ref, got);
     const llama_moe_cache_counters c = get_counters(lctx.get());
     check_hot_spare_counters(s.check, s.fx, c, got);
@@ -753,7 +771,7 @@ static void scn_two_devices(scenario_ctx & s) {
     cparams.moe_cache_batch   = 32;
     // up to the batch of 64 tokens and the answer after it: the second device may be a software one
     llama_context_ptr lctx = make_ctx(s.fx, cparams);
-    const run_result got = run_steps(s.fx.model.get(), lctx.get(), 6);
+    const run_result got = run_steps(s.fx.model.get(), lctx.get(), N_STEPS_KEPT);
     check_logits(s.check, s.fx.arch, s.ref, got);
     const llama_moe_cache_counters c = get_counters(lctx.get());
     check_hot_spare_counters(s.check, s.fx, c, got);
@@ -795,6 +813,13 @@ static void scn_jit(scenario_ctx & s) {
     s.check(c.jit.checked > 0 && c.jit.bad_data == 0 && c.jit.bad_maps == 0, "LLAMA_MOE_CACHE_JIT_CHECK: %zu uploads read back, %zu differ, %zu bad map entries",
         c.jit.checked, c.jit.bad_data, c.jit.bad_maps);
     s.check(c.n_restores == 1 && !c.released, "no batch releases the cache (%zu restores)", c.n_restores);
+    if (getenv("LLAMA_MOE_CACHE_JIT_SHARE") != nullptr) {
+        bool shared = true;
+        for (const auto & g : c.groups) {
+            shared = shared && g.n_share == g.n_jit;
+        }
+        s.check(shared && c.n_lends > 0, "the jit's slots hold residents while it is idle: lent %zu times", c.n_lends);
+    }
 }
 
 // a predictor file of random weights from tools/moe-predictor/random_predictor.py; layers: with moe_predictor.layers
@@ -830,7 +855,7 @@ static void scn_predictor(scenario_ctx & s, const predictor_variant variant) {
     if (variant == PRED_START) {
         cparams.moe_cache_predictor_start = start.c_str();
     } else if (variant == PRED_GAIN) {
-        cparams.moe_cache_predictor_answer_gain = 2.0f;
+        cparams.moe_cache_predictor_answer_gain = 1000.0f;
     } else if (variant == PRED_CAP) {
         cparams.moe_cache_predictor_answer_cap = 1;
     } else if (variant == PRED_DEVICE) {
@@ -862,13 +887,81 @@ static void scn_predictor(scenario_ctx & s, const predictor_variant variant) {
         } else if (variant == PRED_CAP) {
             s.check(c.n_start_made <= c.n_start && c.n_start_all > c.n_start, "at most 1 swap at an answer's start: %zu of %zu made at %zu starts", c.n_start_made, c.n_start_all, c.n_start);
         } else if (variant == PRED_GAIN) {
-            s.check(c.n_start_all > c.n_start_made, "only the swaps that bring 2 more selections: %zu of %zu", c.n_start_made, c.n_start_all);
+            s.check(c.n_start_all > 0 && c.n_start_made == 0, "no swap brings 1000 more selections: %zu of %zu made", c.n_start_made, c.n_start_all);
         }
     }
     std::remove(main.c_str());
     if (!start.empty()) {
         std::remove(start.c_str());
     }
+}
+
+// LLAMA_GRAPH_CACHE: a scheduler and graph for each small batch length
+static void scn_graph_cache(scenario_ctx & s) {
+    llama_context_ptr lctx = make_ctx(s.fx, hot_spare_params(s.fx, cache_mib(s.fx)));
+    const run_result got = run_steps(s.fx.model.get(), lctx.get());
+    check_logits(s.check, s.fx.arch, s.ref, got);
+    const llama_moe_cache_counters c = get_counters(lctx.get());
+    check_hot_spare_counters(s.check, s.fx, c, got);
+    // lengths 1, 3 and 8; the first batch of 24 tokens is above LLAMA_GRAPH_CACHE_TOKENS
+    s.check(c.graph_slots_made >= 3 && c.graphs_reused >= 80, "a graph a batch length: %lld schedulers made, %lld graphs reused",
+        (long long) c.graph_slots_made, (long long) c.graphs_reused);
+}
+
+// LLAMA_MOE_RESIZE_SPLIT: the batch of 200 tokens keeps the cache and runs in the ubatches that fit next to it
+static void scn_resize_split(scenario_ctx & s) {
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
+    cparams.moe_cache_resize = true;
+    cparams.moe_cache_batch  = 64;
+    llama_context_ptr lctx = make_ctx(s.fx, cparams);
+    const run_result got = run_steps(s.fx.model.get(), lctx.get());
+    check_logits(s.check, s.fx.arch, s.ref, got);
+    const llama_moe_cache_counters c = get_counters(lctx.get());
+    check_hot_spare_counters(s.check, s.fx, c, got, true, true);
+    s.check(c.n_restores == 1 && !c.released, "no batch releases the cache (%zu restores)", c.n_restores);
+    s.check(c.spare_small.tokens > got.n_tokens_small, "the batch of 200 tokens ran in ubatches that fit: %zu more tokens in small ubatches",
+        c.spare_small.tokens - got.n_tokens_small);
+}
+
+// LLAMA_OFFLOAD_FAST: the host experts of a batch that released the cache go up through its staging memory
+static void scn_offload_fast(scenario_ctx & s) {
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
+    cparams.moe_cache_resize = true;
+    cparams.moe_cache_batch  = 64;
+    llama_context_ptr lctx = make_ctx(s.fx, cparams);
+    const run_result got = run_steps(s.fx.model.get(), lctx.get());
+    check_logits(s.check, s.fx.arch, s.ref, got);
+    const llama_moe_cache_counters c = get_counters(lctx.get());
+    check_hot_spare_counters(s.check, s.fx, c, got);
+    s.check(c.n_restores == 2 && c.offload_uploads > 0 && c.offload_checked > 0 && c.offload_bad == 0,
+        "LLAMA_OFFLOAD_FAST_CHECK: %zu uploads, %zu parts read back, %zu differ (%zu restores)", c.offload_uploads, c.offload_checked, c.offload_bad, c.n_restores);
+}
+
+// the settings of the lab's presets together: predictor, answer gain, jit with shared slots, resize, and their switches
+static void scn_kit(scenario_ctx & s) {
+    const uint32_t n_moe = s.fx.n_moe_layers();
+    const std::string main = predictor_file(s, "main", n_moe, false, n_moe < FIX_N_LAYER);
+    llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
+    cparams.moe_cache_resize    = true;
+    cparams.moe_cache_batch     = 64;
+    cparams.moe_cache_jit       = 4;
+    cparams.moe_cache_refill    = 0;
+    cparams.moe_cache_predictor = main.c_str();
+    cparams.moe_cache_predictor_answer_gain = 2.0f;
+    {
+        llama_context_ptr lctx = make_ctx(s.fx, cparams);
+        const run_result got = run_steps(s.fx.model.get(), lctx.get());
+        check_logits(s.check, s.fx.arch, s.ref, got);
+        const llama_moe_cache_counters c = get_counters(lctx.get());
+        check_hot_spare_counters(s.check, s.fx, c, got, true, true);
+        s.check(c.n_pred > 0 && c.n_start == 3, "the predictor ranks the experts: %zu predictions, %zu answers' starts", c.n_pred, c.n_start);
+        s.check(c.jit.uploaded > 0 && c.jit.checked > 0 && c.jit.bad_data == 0 && c.jit.bad_maps == 0, "the jit: %zu experts uploaded, %zu read back, %zu differ, %zu bad map entries",
+            c.jit.uploaded, c.jit.checked, c.jit.bad_data, c.jit.bad_maps);
+        s.check(c.n_restores == 2 && c.offload_checked > 0 && c.offload_bad == 0, "released for the batch of 200 tokens: %zu restores, %zu offloaded parts read back, %zu differ",
+            c.n_restores, c.offload_checked, c.offload_bad);
+        s.check(c.graphs_reused >= 80, "%lld graphs reused", (long long) c.graphs_reused);
+    }
+    std::remove(main.c_str());
 }
 
 // the MTP block drafts for the target with the hot spare and resize, as a server with --spec-type draft-mtp: the
@@ -1002,6 +1095,14 @@ static void scn_mtp(scenario_ctx & s) {
         "the target's hot spare serves next to the draft context: %s, %zu hits", groups_str(c).c_str(), c.spare_small.hits);
 }
 
+// the environment of the lab's presets (Local Coder's config/env), the slots and sizes scaled to the fixture, and the read-back checks
+static const std::vector<std::pair<const char *, const char *>> ENV_KIT = {
+    { "GGML_CPU_MMID_FLAT", "128" }, { "GGML_CPU_MMID_GLU", "1" }, { "GGML_CPU_MMID_FFN", "1" }, { "GGML_VK_SPIN_WAIT", "2000" },
+    { "GGML_VK_FLOPS_PER_SUBMIT", "100000000" }, { "LLAMA_GRAPH_CACHE", "8" }, { "LLAMA_MOE_CACHE_JIT_SHARE", "1" }, { "LLAMA_MOE_CACHE_JIT_SLOTS", "8" },
+    { "LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT", "8" }, { "LLAMA_MOE_RESIZE_SPLIT", "128" }, { "LLAMA_OFFLOAD_FAST", "1" }, { "LLAMA_MOE_HOST_SUM", "64" },
+    { "LLAMA_MOE_RESIZE_DRAFT", "64" }, { "LLAMA_MOE_CACHE_JIT_CHECK", "1" }, { "LLAMA_OFFLOAD_FAST_CHECK", "1" },
+};
+
 static const std::vector<scenario> SCENARIOS = {
     { "lru",           "upstream's cache: the selected experts of small ubatches from a device buffer", 1, false, {},
         [](scenario_ctx & s) { scn_lru(s, 0.0f); } },
@@ -1023,12 +1124,30 @@ static const std::vector<scenario> SCENARIOS = {
         [](scenario_ctx & s) { scn_predictor(s, PRED_MAIN); } },
     { "predictor-start",  "with --moe-cache-predictor-start: uploads from the turn's text before the prompt runs", 1, false, {},
         [](scenario_ctx & s) { scn_predictor(s, PRED_START); } },
-    { "predictor-gain",   "--moe-cache-predictor-answer-gain 2", 1, false, {},
+    { "predictor-gain",   "--moe-cache-predictor-answer-gain: only the swaps that bring that many more selections", 1, false, {},
         [](scenario_ctx & s) { scn_predictor(s, PRED_GAIN); } },
     { "predictor-cap",    "--moe-cache-predictor-answer-cap 1", 1, false, {},
         [](scenario_ctx & s) { scn_predictor(s, PRED_CAP); } },
     { "predictor-device", "--moe-cache-predictor-device: the predictor on the GPU", 1, false, {},
         [](scenario_ctx & s) { scn_predictor(s, PRED_DEVICE); } },
+    { "graph-cache",   "LLAMA_GRAPH_CACHE=8: a scheduler and graph a small batch length", 1, false, { { "LLAMA_GRAPH_CACHE", "8" } }, scn_graph_cache },
+    { "host-sum",      "LLAMA_MOE_HOST_SUM=64: the CPU sums its experts' outputs in the batches that keep the cache", 1, false,
+        { { "LLAMA_MOE_HOST_SUM", "64" }, { "LLAMA_MOE_CACHE_JIT_CHECK", "1" } }, scn_jit },
+    { "jit-share",     "LLAMA_MOE_CACHE_JIT_SHARE=1: the jit's slots hold residents while it is idle", 1, false,
+        { { "LLAMA_MOE_CACHE_JIT_SHARE", "1" }, { "LLAMA_MOE_CACHE_JIT_SLOTS", "8" }, { "LLAMA_MOE_CACHE_JIT_TOKENS_PER_SLOT", "8" }, { "LLAMA_MOE_CACHE_JIT_CHECK", "1" } }, scn_jit },
+    { "resize-split",  "LLAMA_MOE_RESIZE_SPLIT=256: a batch above the kept size runs in ubatches next to the cache", 1, false,
+        { { "LLAMA_MOE_RESIZE_SPLIT", "256" } }, scn_resize_split },
+    { "offload-fast",  "LLAMA_OFFLOAD_FAST=1: the experts of a released batch through the staging memory", 1, false,
+        { { "LLAMA_OFFLOAD_FAST", "1" }, { "LLAMA_OFFLOAD_FAST_CHECK", "1" } }, scn_offload_fast },
+    { "cpu-flat",      "GGML_CPU_MMID_FLAT=128: the CPU's experts in chunks of rows", 1, false, { { "GGML_CPU_MMID_FLAT", "128" } }, scn_hot_spare },
+    { "cpu-fused",     "GGML_CPU_MMID_GLU and GGML_CPU_MMID_FFN: gate, up, activation and down as one op", 1, false,
+        { { "GGML_CPU_MMID_FLAT", "128" }, { "GGML_CPU_MMID_GLU", "1" }, { "GGML_CPU_MMID_FFN", "1" } }, scn_hot_spare },
+    { "cpu-plain",     "the CPU's experts without the fusions", 1, false,
+        { { "GGML_CPU_MMID_FLAT", "0" }, { "GGML_CPU_MMID_GLU", "0" }, { "GGML_CPU_MMID_FFN", "0" } }, scn_hot_spare },
+    { "kit",           "the lab's settings together: predictor, jit, resize and every switch of its environment", 1, false,
+        ENV_KIT, scn_kit },
+    { "kit-mtp",       "the MTP block's drafts with the lab's environment", 1, true,
+        ENV_KIT, scn_mtp },
 };
 
 static void usage(const char * argv0) {
@@ -1094,14 +1213,26 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // before anything reads them: the switches are read once a process
+    // the switches are read once a process, some before main: a scenario runs in a process started with its environment
     if (!write_ref.empty()) {
         clean_env();
     } else {
+        std::vector<std::pair<std::string, std::string>> env;
         for (const auto & kv : scn->env) {
             if (getenv(kv.first) == nullptr) { // a value from outside stands, to try another one
-                setenv(kv.first, kv.second, 1);
+                env.emplace_back(kv.first, kv.second);
             }
+        }
+        if (getenv("LLAMA_MOE_CACHE_VERIFY") == nullptr) { // see get_counters
+            env.emplace_back("LLAMA_MOE_CACHE_VERIFY", "1");
+        }
+        if (!env.empty()) {
+            const int rc = run_self(std::vector<std::string>(argv + 1, argv + argc), env);
+            if (rc >= 0 && rc != 127) {
+                return rc;
+            }
+            fprintf(stderr, "failed to start the scenario's process\n");
+            return 1;
         }
     }
     const int n_devices = write_ref.empty() ? scn->n_devices : write_ref_devices;
@@ -1139,7 +1270,7 @@ int main(int argc, char ** argv) {
             fixture fx(arch, devs, false);
             llama_context_ptr lctx = make_ctx(fx, fx.ctx_params());
             // the scenarios on two devices stop after the batch of 64 tokens
-            const run_result r = run_steps(fx.model.get(), lctx.get(), n_devices == 2 ? 6 : STEPS.size());
+            const run_result r = run_steps(fx.model.get(), lctx.get(), n_devices == 2 ? N_STEPS_KEPT : STEPS.size());
             return ref_save(r, write_ref) ? 0 : 1;
         }
 

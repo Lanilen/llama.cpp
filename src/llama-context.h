@@ -286,6 +286,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
+    llama_moe_cache * get_moe_cache() { return moe_cache.get(); }
+    void get_graph_cache_counters(int64_t & n_made, int64_t & n_graphs_reused) const { n_made = n_graph_slots_made; n_graphs_reused = n_reused; }
 
 private:
     llm_graph_result * get_gf_res_prev();

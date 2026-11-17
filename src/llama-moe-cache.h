@@ -73,6 +73,7 @@ struct llama_moe_cache_counters {
         int32_t   n_slots    = 0; // 0: its budget is too small, its layers are not cached
         int32_t   n_resident = 0; // hot spare mode: slots in use
         int32_t   n_jit      = 0; // --moe-cache-jit: slots after them where the layers of a large ubatch upload their experts
+        int32_t   n_share    = 0; // LLAMA_MOE_CACHE_JIT_SHARE: of those, the slots that hold residents while no batch uses the jit
         std::vector<int32_t> residents; // hot spare mode: layer*n_expert + expert of each slot in use, in slot order
         std::vector<int32_t> uploading; // the ones of them whose upload is not done: they do not serve yet
     };
@@ -118,6 +119,17 @@ struct llama_moe_cache_counters {
     size_t  n_start_made  = 0; // the ones made there (--moe-cache-predictor-answer-cap, -answer-gain)
     size_t  n_text        = 0; // turns the start predictor read
     size_t  text_swaps    = 0; // the experts it uploaded
+    size_t  n_lends       = 0; // LLAMA_MOE_CACHE_JIT_SHARE: times the shared slots went to the jit
+    // the read-back checks: LLAMA_MOE_CACHE_VERIFY (the resident experts, before a release, at exit and by
+    // llama_moe_cache_verify) and LLAMA_OFFLOAD_FAST_CHECK (the parts LLAMA_OFFLOAD_FAST uploaded)
+    size_t  verify_checked  = 0;
+    size_t  verify_bad      = 0;
+    size_t  offload_uploads = 0;
+    size_t  offload_checked = 0;
+    size_t  offload_bad     = 0;
+    // LLAMA_GRAPH_CACHE, the context's: schedulers of a batch length made, graphs reused
+    int64_t graph_slots_made = 0;
+    int64_t graphs_reused    = 0;
     bool    released      = false; // with resize: the device memory is released now
     size_t  n_restores    = 0;     // with resize: times the cache came back after a release
     size_t  restore_bytes = 0;     // uploaded again by them
@@ -224,6 +236,9 @@ public:
     // read between two decodes
     llama_moe_cache_counters counters() const;
 
+    // LLAMA_MOE_CACHE_VERIFY=1: reads every resident expert back now, as at exit
+    void verify();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -233,3 +248,6 @@ using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
 
 // the counters of the context's MoE cache, false if it has none
 LLAMA_API bool llama_moe_cache_get_counters(const struct llama_context * ctx, llama_moe_cache_counters & counters);
+
+// LLAMA_MOE_CACHE_VERIFY=1: reads the resident experts of the context's MoE cache back now, for the counters
+LLAMA_API void llama_moe_cache_verify(struct llama_context * ctx);

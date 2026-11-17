@@ -815,6 +815,7 @@ struct llama_moe_cache::impl {
     struct offload_stats {
         size_t  checked = 0, bad = 0;
         size_t  bytes = 0, uploads = 0, finishes = 0;
+        size_t  verify_checked = 0, verify_bad = 0; // LLAMA_MOE_CACHE_VERIFY, see verify_resident
         int64_t t_wait_us = 0; // waiting for a half's uploads before reusing it
         int64_t t_copy_us = 0; // the copies to the staging memory at the end of a tensor
     } offload_st;
@@ -2778,6 +2779,8 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        offload_st.verify_checked += n_checked;
+        offload_st.verify_bad     += n_bad;
         // straight to stderr: at exit the log's worker thread may not print it
         fprintf(stderr, "llama_moe_cache: LLAMA_MOE_CACHE_VERIFY %s: %zu resident experts read back, %zu differ (%zu still uploading)\n",
             when, n_checked, n_bad, n_pending);
@@ -3623,6 +3626,7 @@ llama_moe_cache_counters llama_moe_cache::counters() const {
         cg.n_slots    = g.n_slots;
         cg.n_resident = g.n_resident;
         cg.n_jit      = g.n_jit;
+        cg.n_share    = g.n_share;
         for (size_t sl = 0; sl < g.key_of_slot.size(); ++sl) {
             if (g.key_of_slot[sl] >= 0) {
                 cg.residents.push_back(g.key_of_slot[sl]);
@@ -3669,8 +3673,18 @@ llama_moe_cache_counters llama_moe_cache::counters() const {
     res.n_start_made  = p.n_start_made;
     res.n_text        = p.n_text;
     res.text_swaps    = p.text_swaps;
+    res.n_lends         = p.n_lends;
+    res.verify_checked  = p.offload_st.verify_checked;
+    res.verify_bad      = p.offload_st.verify_bad;
+    res.offload_uploads = p.offload_st.uploads;
+    res.offload_checked = p.offload_st.checked;
+    res.offload_bad     = p.offload_st.bad;
     res.released      = p.released;
     res.n_restores    = p.n_restores;
     res.restore_bytes = p.restore_bytes;
     return res;
+}
+
+void llama_moe_cache::verify() {
+    pimpl->verify_resident("on request");
 }

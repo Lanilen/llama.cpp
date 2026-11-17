@@ -237,7 +237,8 @@ if (NOT WIN32)
     set(MOE_CACHE_REF_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-moe-cache")
     file(MAKE_DIRECTORY "${MOE_CACHE_REF_DIR}")
     set(MOE_CACHE_SCENARIOS lru lru-cpu-share hot-spare hot-file resize resize-warm small-buffers two-devices mtp
-        jit jit-slots-2 predictor predictor-start predictor-gain predictor-cap predictor-device)
+        jit jit-slots-2 predictor predictor-start predictor-gain predictor-cap predictor-device
+        graph-cache host-sum jit-share resize-split offload-fast cpu-flat cpu-fused cpu-plain kit kit-mtp)
     foreach(arch IN ITEMS qwen4exp glm5-next)
         llama_test(test-moe-cache NAME test-moe-cache-${arch}-ref LABEL moe
             ARGS --arch ${arch} --make-ref --ref-dir "${MOE_CACHE_REF_DIR}")

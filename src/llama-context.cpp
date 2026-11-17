@@ -5844,5 +5844,12 @@ bool llama_moe_cache_get_counters(const struct llama_context * ctx, llama_moe_ca
         return false;
     }
     counters = cache->counters();
+    ctx->get_graph_cache_counters(counters.graph_slots_made, counters.graphs_reused);
     return true;
+}
+
+void llama_moe_cache_verify(struct llama_context * ctx) {
+    if (llama_moe_cache * cache = ctx->get_moe_cache()) {
+        cache->verify();
+    }
 }
