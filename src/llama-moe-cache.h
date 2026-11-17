@@ -94,6 +94,7 @@ struct llama_moe_cache_counters {
 
     llama_moe_cache_mode mode = LLAMA_MOE_CACHE_MODE_LRU;
     int32_t n_expert_used = 0;
+    int64_t hot_batch     = 0; // hot spare mode: ubatches of up to this many tokens run on the hot spare (with resize: what fits next to it)
     std::vector<group> groups;
     batches spare_small;      // ubatches of up to 32 tokens, the ones that run on the hot spare without resize
     batches spare_large;

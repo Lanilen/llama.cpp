@@ -3617,6 +3617,7 @@ llama_moe_cache_counters llama_moe_cache::counters() const {
     llama_moe_cache_counters res;
     res.mode          = p.mode;
     res.n_expert_used = p.n_expert_used;
+    res.hot_batch     = p.hot_batch;
     for (const auto & g : p.groups) {
         llama_moe_cache_counters::group cg;
         cg.device     = g.id;

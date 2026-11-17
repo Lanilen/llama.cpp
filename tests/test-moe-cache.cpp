@@ -7,6 +7,8 @@
 // logits, and checks the cache's counters. Exit code 77: skipped (no GPU, no second device).
 //   test-moe-cache --arch qwen4exp --make-ref --ref-dir DIR
 // writes the references of this build once for all scenarios (ctest does); without --ref-dir each scenario makes its own.
+//   test-moe-cache --arch qwen4exp --save-model FILE.gguf
+// writes the fixture to a file, for the tools that load one.
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -1151,7 +1153,7 @@ static const std::vector<scenario> SCENARIOS = {
 };
 
 static void usage(const char * argv0) {
-    printf("usage: %s --arch ARCH --scenario NAME [--ref-dir DIR] [-v]\n       %s --arch ARCH --make-ref --ref-dir DIR\n       %s --list\n", argv0, argv0, argv0);
+    printf("usage: %s --arch ARCH --scenario NAME [--ref-dir DIR] [-v]\n       %s --arch ARCH --make-ref --ref-dir DIR\n       %s --arch ARCH --save-model FILE.gguf\n       %s --list\n", argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char ** argv) {
@@ -1161,6 +1163,7 @@ int main(int argc, char ** argv) {
     std::string write_ref;
     int write_ref_devices = 1;
     bool make_ref = false;
+    std::string save_model;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--list") {
@@ -1176,6 +1179,8 @@ int main(int argc, char ** argv) {
             scenario_name = argv[++i];
         } else if (a == "--ref-dir" && i + 1 < argc) {
             ref_dir = argv[++i];
+        } else if (a == "--save-model" && i + 1 < argc) {
+            save_model = argv[++i];
         } else if (a == "--make-ref") {
             make_ref = true;
         } else if (a == "--write-ref" && i + 2 < argc) {
@@ -1206,6 +1211,26 @@ int main(int argc, char ** argv) {
                 return rc;
             }
         }
+        return 0;
+    }
+    if (!save_model.empty()) {
+        // the fixture as a file for the tools that load one, without the MTP block (the saver writes a per-layer array too short for it)
+        llama_log_set(log_callback, nullptr);
+        llama_backend_init();
+        init_normal_pool(FIX_SEED, FIX_STDEV);
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        if (arch == LLM_ARCH_UNKNOWN) {
+            fprintf(stderr, "unknown architecture %s\n", arch_name.c_str());
+            return 1;
+        }
+        try {
+            fixture fx(arch, {}, false);
+            llama_model_save_to_file(fx.model.get(), save_model.c_str());
+        } catch (const std::exception & err) {
+            fprintf(stderr, "failed to save the model: %s\n", err.what());
+            return 1;
+        }
+        printf("wrote %s\n", save_model.c_str());
         return 0;
     }
     if (write_ref.empty() && scn == nullptr) {
