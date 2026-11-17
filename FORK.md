@@ -210,7 +210,9 @@ changes: a verify step in the answers after a prompt is 11%, 24% and 24% shorter
 a layer's 288 experts, where Flash-Next's holds 164 of 512: the top 53 serve 53.0% of the next 128 tokens' selections
 from an answer's start, against 44.2% for the decayed scores and 65.4% in hindsight. Live on that machine a verify step
 is 10.6% shorter (198.0 → 177.1 ms over seven requests, every one ahead) and the cache serves 51.6% of the selections in
-place of 44.1%. That layout isn't one of the setups below yet ([its results](docs/moe-predictor.md#glm-53-flash)).
+place of 44.1%. The tuning script's search on that layout ends at a balance of 12.19 tok/s against 10.11 for nothing
+set, with the predictor worth 8.8% at its stage. That layout isn't one of the setups below yet ([its
+results](docs/moe-predictor.md#glm-53-flash)).
 
 ### The CPU's experts
 
