@@ -259,7 +259,7 @@ void ggml_vk_print_device_lost_info(const vk_device& device) {
 }
 void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
-uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
+size_t vk_tensor_offset(const ggml_tensor * tensor) {
     if (tensor->view_src) {
         return (uint8_t *) tensor->view_src->data - (uint8_t *) vk_ptr_base;
     }
@@ -3909,8 +3909,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // variant (spec constant 1) additionally gathers the qwen4 indexer input on the fly.
     {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+        // the bucket scan needs one invocation per radix bucket
+        if (BLOCK_SIZE >= 256) {
+            if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+                ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_subgroup_len, topk_radix_select_f32_subgroup_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0, device->subgroup_size}, 1, true, true, device->subgroup_size);
+                ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_subgroup_len, topk_radix_select_f32_subgroup_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1, device->subgroup_size}, 1, true, true, device->subgroup_size);
+            } else {
+                ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
+                ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+            }
+        }
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -17804,7 +17812,7 @@ void vk_queue_handle_unsynchronized::submit(vk::ArrayProxy<const vk::SubmitInfo>
 
 vk_device_struct::~vk_device_struct() {
     // the build failed before the device was created, nothing to destroy
-    if (device == VK_NULL_HANDLE) {
+    if (!device) {
         return;
     }
 
