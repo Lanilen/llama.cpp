@@ -1080,8 +1080,16 @@ struct llama_moe_cache::impl {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            // the slots of --moe-cache-jit come out of the budget
+            // the slots of --moe-cache-jit come out of the budget; a group whose budget holds few slots (one layer of larger
+            // experts in a group of its own) gives it at most half of them, so that its experts stay cached
             g.n_jit = jit_min > 0 ? std::min<int32_t>(jit_slots, n_expert) : 0;
+            if (g.n_jit > 0) {
+                int32_t fit = 0;
+                while (fit < 2*g.n_jit && fit < g.max_slots && alloc_size(g, fit + 2) <= budget) {
+                    fit++;
+                }
+                g.n_jit = std::min(g.n_jit, fit/2);
+            }
             const int32_t max_slots = std::min<int32_t>(g.layers.size()*n_expert, g.max_slots - g.n_jit);
             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + g.n_jit + 1) <= budget) {
                 g.n_slots++;
