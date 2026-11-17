@@ -43,6 +43,7 @@ was measured to do are in [Available predictors](#available-predictors) and, in 
     - [Offline scores](#offline-scores)
     - [Live, against the decayed scores](#live-against-the-decayed-scores)
     - [Its start predictor](#its-start-predictor)
+    - [In the tuning search](#in-the-tuning-search)
     - [Still to measure](#still-to-measure)
 - [The model](#the-model)
 - [Training](#training)
@@ -482,13 +483,40 @@ A start file was trained with the main one and isn't published:
 
 As on Flash-Next ([The text start](#the-text-start)), it moves uploads into the prompt and gains nothing overall.
 
+#### In the tuning search
+
+[`moe-hot-spare-tune.py`](../tools/moe-trace/README.md#tuning-a-machine) searched this layout from nothing set: 99 runs
+at half scale (answers of 48–256 tokens, prompts of up to 9k), the model answering with `reasoning_effort` low. Its
+predictor stage, with 2 drafts and before the just-in-time uploads, by the balance of its three kinds of request:
+
+| the answer's start | balance | uploads per generated token | selections served |
+|---|---|---|---|
+| no predictor (decayed scores, refill) | 11.41 tok/s | 151 MiB | 40.4% |
+| predictor, a full rebalance | 12.30 (+7.8%) | 189 MiB | 49.7% |
+| predictor, gain 4 | **12.42** (+8.8%) | 48 MiB | 47.3% |
+| predictor, gain 8 | 11.67 | 32 MiB | 44.5% |
+| predictor, gain 16 | 11.77 | 25 MiB | 41.2% |
+| predictor, caps of 140 / 280 / 560 swaps | 11.74 / 11.89 / 11.98 | 36 / 48 / 72 MiB | 43.7 / 45.3 / 47.2% |
+
+- **The search kept the predictor with a gain of 4,** a tie with the full rebalance on its requests (two passes of one
+  configuration differ by up to 0.5 tok/s there) at a quarter of the uploads. A refill on top adds nothing.
+- **Its whole result,** with 2 drafts, the CPU's chunks and `--moe-cache-jit 4`: a balance of 12.19 tok/s against 10.11
+  for nothing set (+20.5%), and an agent's whole turns 51% faster
+  ([FORK.md](https://github.com/Lanilen/llama.cpp/blob/polaris/FORK.md#tuning-a-machine) has the method).
+- **On longer answers the gain loses.** The requests of the [live test](#live-against-the-decayed-scores) (answers of
+  256–512 tokens), with the search's result around it, two passes: 183.9 ms a verify step with a gain of 4 against
+  179.9 with a full rebalance (+2.2%), and 48.2% of the selections served against 50.7%. So this setup rebalances in
+  full.
+- **Unlike Flash-Next,** where a gain of 8 beats the full rebalance
+  ([The answer's start by gain](#the-answers-start-by-gain)). The likely reason: there the cache holds a third of each
+  layer and most starts need few swaps; here it holds 18%, more of every answer misses, and each miss is a larger
+  expert on the CPU, so a swap left out costs more than its upload.
+
 #### Still to measure
 
-- **The answer's start by gain or by cap.** The test above rebalances in full, which costs Flash-Next's agent turns
-  ([The answer's start by gain](#the-answers-start-by-gain)).
 - **The predictor on a GPU** (`--moe-cache-predictor-device`).
-- **The tuning script's search** on this layout, which settles those two with the drafts, the budget and the cache's
-  size.
+- **Recorded agent turns.** The search's agent turns are made up from source code, and the gain's trade between short
+  and long answers is decided by the work.
 - **Other quants,** UD-IQ4_XS first.
 - **More traces.** Flash-Next's file kept gaining from 160 to 1,181 traces
   ([What more traces add](#what-more-traces-add)), and this one has 190, with the model's thinking in a third of its
