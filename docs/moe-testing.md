@@ -90,22 +90,32 @@ They stay with `test-backend-ops` on the lab's cards.
 
 ## The lab canary
 
-One script on the lab, about 30 minutes, safe to run before and after a merge on the same day. Per setup it loads
-the model once and runs `llama-moe-logit-drift` with `LLAMA_DRIFT_CANARY=FILE`: no free generation, so nothing drifts
+One script on the lab, 28 minutes for its four setups and the fork's ops on both kinds of card (1920X + R9700 and
+1920X + RX480x2, measured), safe to run before and after a merge on the same day. Per setup it loads the model once
+and runs `llama-moe-logit-drift` with `LLAMA_DRIFT_CANARY=FILE`: no free generation, so nothing drifts
 with the text. The tokens of a text file are the prompt (1024 tokens), then:
 
 1. 256 positions one token at a time: their 64 top logits against FILE (written by the first run), the time of a
    step, the hit rate.
 2. verify batches of 3 and 8 tokens, 64 of each: the time of a step.
 3. prompt batches that should keep the cache (512 and 2048 tokens), then the size the hot spare takes (the fit).
-4. one batch that should release it (4096 tokens), the first token after it (the restore), 64 more steps and their
-   hit rate.
+4. one batch that should release it, the first token after it (the restore), 64 more steps and their hit rate. The
+   batch has to be above the setup's fit: the tool has no draft context, so the R9700's hot spare keeps batches up to
+   8192 tokens there and the releasing batch is 16384.
 5. the cache's read-back checks and counters.
 
 Each is a line `canary: NAME VALUE ...`. The script holds each setup's numbers from a known-good build and prints
-`PASS` or `FAIL` per line: the logits and the fit must be equal, the hit rate within a point, a time within 3% or
-three times the spread of the recording's repeats, whichever is larger. The sizes are `LLAMA_DRIFT_CANARY_PREFIX`,
-`_POS`, `_VERIFY`, `_BATCHES`, `_KEPT`, `_RELEASE` and `_AFTER`.
+`PASS` or `FAIL` per line: the logits and the fit must be equal, the hit rate within a point, the release and the
+restore as recorded, a time within 3% or three times the spread of the recording's repeats, whichever is larger. The
+sizes are `LLAMA_DRIFT_CANARY_PREFIX`, `_POS`, `_VERIFY`, `_BATCHES`, `_KEPT`, `_RELEASE` and `_AFTER`.
+
+One run against a median of three is noisy at 3%: the first check of a build against its own recording, an hour
+apart, had one time at +3.8% with 3.3% allowed. So a setup whose only misses are times runs twice more and the
+medians of the three decide, as the reference's were made; a real slowdown is there in all three.
+
+The canary's times are for before and after, not the server's: the tool has no draft head, so the fit and the kept
+prompts are not the server's (the RX480x2 setup's fit is 32 tokens in the tool). Its 3-token step is close to the
+server's verify step (GLM-5.3-Flash: 180 ms and 178 ms).
 
 ## What this does not replace
 
