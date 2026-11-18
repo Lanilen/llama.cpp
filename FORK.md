@@ -703,7 +703,7 @@ What it shows, in the order IQ4_XS on the RX 480s, then Q4 and Q6 on the R9700:
 
 ## The fork and upstream
 
-The fork follows upstream by merges, never rebases; every branch is at upstream `ded522f83` (2026-11-13), past
+The fork follows upstream by merges, never rebases; every branch is at upstream `513ad7ae0` (2026-11-17), past
 upstream's `v1.0.0`. The rule for a conflict: where upstream has its own version of something the fork built and it
 performs about as well in general, upstream's version stays and ours goes; ours stays only where it measures better on
 the real workload.
@@ -740,6 +740,17 @@ the real workload.
   ([Sparse attention](#sparse-attention-on-gpus-without-fp16)).
 - **`GGML_VK_KEEPALIVE`,** a small write every N seconds that keeps an idle GPU from suspending. Not used by the
   setups, which keep the RX 480s awake with a udev rule; the two have not been compared.
+- **Flash attention for prompts on RDNA3 and RDNA4** (2026-11-16). On the R9700, Flash-Next's attention (head size
+  256, 12 query heads per KV head) over a 512- or 2048-token batch takes 36–41% less time at 4k and 16k of context;
+  one token is unchanged. It changes the R9700's rounding a little (logits below); the RX 480s are untouched.
+- **Narrow-batch matmul tiles** (9–32 columns) for the coopmat paths. They reach the R9700's float and dequantized
+  matmuls only: its int8 matmuls and the RX 480s don't take them, and Flash-Next's matrices take the same time at
+  1–8 and 512 columns as before.
+- **A deterministic radix top-k** for the sparse-attention indexer and the router's ties. It needs full subgroups,
+  which Polaris has, so the RX 480s keep the radix path: a top-k of 1024 or more takes 67% less time on an RX 460
+  than before, and the indexer itself is unchanged.
+- **A slot scheduler in the server with a running hash of the prompt.** It reuses the same prefixes as before:
+  kept prompts give the same cache and prompt counts, so the cache's release and restore see the same batches.
 
 **The merge of 2026-11-14** (131 upstream commits, in six stages so that a break had few suspects) was accepted on
 the tuned setups, the build before against the build after, back to back, two passes each:
@@ -753,6 +764,23 @@ the tuned setups, the build before against the build after, back to back, two pa
 Logits against the build before are within the run-to-run spread of either build, and `test-backend-ops` passes on
 the R9700 and on an RX 480 (22425 cases each). [The ladder](#the-ladder) is as measured on 2026-11-13, at upstream
 `3b4d6ab3f`.
+
+**The merge of 2026-11-18** (103 upstream commits, in ten stages, each with at most one upstream change to a path the
+fork's features run through) was accepted the same way, on the tuned rung with kept prompts. The build before ran
+twice, first and last, to show its own spread:
+
+| | verify step before | after | prompts before | after |
+|---|---|---|---|---|
+| 1920X + R9700, UD-Q4_K_XL | 60.13 / 60.85 ms | 61.25 ms | 433 / 435 tok/s | 437 tok/s |
+| 1920X + R9700, UD-Q6_K_XL | 76.29 / 75.34 ms | 75.16 ms | 360 / 361 tok/s | 358 tok/s |
+| 1920X + RX480x2, UD-IQ4_XS | 92.85 ms | 92.62 ms | 78 tok/s | 78 tok/s |
+
+Every difference is within the build's own spread; the 20k-token prompt on Q4 is 3% faster (595 to 611 tok/s, the
+flash attention above). Logits over 2048 positions (1024 on the RX 480s) are within the run-to-run spread: on the
+RX 480s they are the same to the last digit, and on the R9700 the new flash attention moves them a little, at the
+same mean KL as a rerun. `test-backend-ops` passes on the R9700 and an RX 480 (22496 cases each, the sparse-attention
+ops 248 of 248). GLM-5.3-Flash on its preset gives the same answers, draft acceptance, swaps and hit rate before and
+after.
 
 **Upstream's cache against the hot spare at the same memory.** The ladder's rung 1 gives upstream's cache what its own
 build can allocate. In the fork's build, which splits the cache's banks, it can take the hot spare's 20900 MiB on the
