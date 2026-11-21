@@ -137,7 +137,6 @@ reuse:
   later pass would read the first pass's uploads after the next layer reused their slots. The later passes of a batch
   the jit serves take the scheduler's offload instead, as large batches do without the jit.
 - `--moe-cache-mode lru` keeps a layer per pass, as before: its lookups upload during the graph.
-- A predictor must name the physical layers ([docs/moe-predictor.md](moe-predictor.md)).
 
 The scheduler's offload of host experts for a large batch copies the experts the batch selects, and copies each weight
 to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
