@@ -293,6 +293,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     ggml_tensor * inpSA = cur;
 
+    // the layer's input: the rows of llama_get_embeddings_layer_inp (llama-moe-trace's hidden rows) and the MoE
+    // predictor's hidden state, as qwen4exp and glm5-next give them; il is the cache slot, so each pass of a looped layer
+    // has its own
+    if (((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) ||
+        ((size_t) il < cparams.moe_hidden_inp.size() && cparams.moe_hidden_inp[il])) {
+        res->t_layer_inp[il] = cur;
+        cb(res->t_layer_inp[il], "layer_inp", il);
+        ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+    }
+
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
