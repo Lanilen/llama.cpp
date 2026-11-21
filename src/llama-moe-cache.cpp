@@ -18,6 +18,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <chrono>
@@ -807,6 +808,9 @@ struct llama_moe_cache::impl {
     std::vector<device> devices;
     std::vector<group> groups;
     std::vector<layer> layers;
+    // hot spare mode: the layer whose resident experts a layer uses, itself unless it runs the expert tensors of an earlier
+    // layer (the later passes of a looped model): the passes then share one resident set, its slots and its scores
+    std::vector<int32_t> alias;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, bool>> layer_of; // slot map -> layer, and if the graph that looks it up has a CPU part
 
@@ -939,10 +943,29 @@ struct llama_moe_cache::impl {
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
+        alias.resize(model.layers.size());
+        std::iota(alias.begin(), alias.end(), 0);
+        size_t n_alias = 0;
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
+            }
+            // a layer that runs the experts of an earlier cached layer: in hot spare mode it uses that layer's resident set
+            // (the maps do not change during a ubatch), in lru mode it keeps its own (its lookups upload during the graph)
+            if (mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
+                const auto it_same = std::find_if(groups.begin(), groups.end(), [&](const group & g) {
+                    return std::any_of(g.layers.begin(), g.layers.end(), [&](int32_t ip) { return llama_moe_cache_layer_experts(model.layers[ip]) == experts; });
+                });
+                if (it_same != groups.end()) {
+                    for (int32_t ip : it_same->layers) {
+                        if (llama_moe_cache_layer_experts(model.layers[ip]) == experts) {
+                            alias[il] = ip;
+                        }
+                    }
+                    n_alias++;
+                    continue;
+                }
             }
             int32_t id = spare_id;
             if (id < 0) {
@@ -968,6 +991,9 @@ struct llama_moe_cache::impl {
         if (groups.empty()) {
             LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
             return;
+        }
+        if (n_alias > 0) {
+            LLAMA_LOG_INFO("%s: %zu layers run the experts of earlier layers (a looped model), they share their resident experts\n", __func__, n_alias);
         }
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
@@ -1279,7 +1305,7 @@ struct llama_moe_cache::impl {
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const {
-        return devices[groups[layers[il].ig].id].backend;
+        return devices[groups[layers[alias[il]].ig].id].backend;
     }
 
     ggml_backend_t layer_backend(int32_t il) const {
@@ -1649,7 +1675,11 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * record(ggml_context * ctx, int32_t il, ggml_tensor * ids) {
-        if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size() || layers[il].miss_map == nullptr) {
+        if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size()) {
+            return nullptr;
+        }
+        il = alias[il]; // the passes of a looped layer add their selections up
+        if (layers[il].miss_map == nullptr) {
             return nullptr;
         }
         return ggml_map_custom1(ctx, ids, llama_moe_cache_record, 1, &layers[il].rec);
@@ -2527,7 +2557,7 @@ struct llama_moe_cache::impl {
     }
 
     bool get_hot_spare_maps(int32_t il, int64_t n_tokens, llama_moe_cache_hot_spare_maps & maps) const {
-        if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size() || layers[il].miss_map == nullptr) {
+        if (mode != LLAMA_MOE_CACHE_MODE_HOT_SPARE || il < 0 || il >= (int32_t) layers.size() || layers[alias[il]].miss_map == nullptr) {
             return false;
         }
         // large batches use most experts of a layer, they keep running all host experts with the scheduler's offload
@@ -2535,7 +2565,7 @@ struct llama_moe_cache::impl {
         if (n_tokens == 0 || n_tokens > hot_batch || released) {
             return false;
         }
-        const layer & l = layers[il];
+        const layer & l = layers[alias[il]];
         maps = { l.miss_map, l.slot_dev, l.hit_dev };
         if (n_tokens > max_batch && l.jit_slot != nullptr && groups[l.ig].n_jit > 0) {
             maps = { l.jit_miss, l.jit_slot, l.jit_hit };
