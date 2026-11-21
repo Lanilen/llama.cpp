@@ -3431,6 +3431,24 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return true;
     }
 
+    // an expert tensor that several layers run (the passes of a looped model) is copied to a device once per graph, at the
+    // first split that reads it: a copy of that split's selected experts only would leave the later passes reading experts
+    // that were never copied, so such a tensor is copied whole (once, for all its passes)
+    if (!lctx->shared_exps_init) {
+        std::unordered_map<const ggml_tensor *, int> n_runs;
+        for (const auto & layer : lctx->model.layers) {
+            for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                if (t != nullptr && ++n_runs[t] == 2) {
+                    lctx->shared_exps.insert(t);
+                }
+            }
+        }
+        lctx->shared_exps_init = true;
+    }
+    if (lctx->shared_exps.count(src) > 0) {
+        return false;
+    }
+
     auto & st = lctx->copy_experts;
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
