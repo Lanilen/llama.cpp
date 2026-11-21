@@ -2577,6 +2577,11 @@ struct llama_moe_cache::impl {
         const layer & l = layers[alias[il]];
         maps = { l.miss_map, l.slot_dev, l.hit_dev };
         if (n_tokens > max_batch && l.jit_slot != nullptr && groups[l.ig].n_jit > 0) {
+            // the jit maps are filled when the layer's run copies them, and the scheduler copies a host map once per graph:
+            // the later passes of a looped layer take the scheduler's offload, as large batches do without the jit
+            if (alias[il] != il) {
+                return false;
+            }
             maps = { l.jit_miss, l.jit_slot, l.jit_hit };
         }
         return true;
