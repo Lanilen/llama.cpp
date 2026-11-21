@@ -11847,6 +11847,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F16, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F16, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F16, {100, 10, 10, 10}, 0.5f, 0.0f));
+    // non-contiguous a (a view of a larger tensor), as the halves of a merged gate_up (Inkling 2's SITU)
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32,  {10, 10, 10, 10}, 2.0f, 1.0f, false, 1));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32,  {1152, 8, 1, 1}, 0.25f, 0.0f, false, 1));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F16,  {10, 10, 10, 10}, 2.0f, 1.0f, false, 1));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 0.5f, 0.0f, false, 1));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 0.0f, false, 1)); // view test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // view test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1));  // view test, inplace
