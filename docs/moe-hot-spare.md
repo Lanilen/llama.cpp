@@ -42,6 +42,7 @@ numbers come from.
   - [The compute queue on RADV](#the-compute-queue-on-radv)
   - [Fused adds on GPUs without fp16](#fused-adds-on-gpus-without-fp16)
   - [The mat-vec store](#the-mat-vec-store) (`moe-tuning`)
+  - [Inkling 2's small ops](#inkling-2s-small-ops) (`moe-tuning`)
   - [Changes that apply without any option](#changes-that-apply-without-any-option)
   - [Changes without an option on `moe-tuning`](#changes-without-an-option-on-moe-tuning) (`moe-tuning`)
 - [Prompts](#prompts---moe-cache-resize)
@@ -368,6 +369,28 @@ hyper-connections. The fused path gives the same logits as the unfused one. On t
 groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU's work is exposed (one submit per split).
 `GGML_VK_DISABLE_MM_POST=1` turns it off.
 
+### Inkling 2's small ops
+
+*Branch `moe-tuning`.*
+
+Inkling 2 Mini runs about 7000 dispatches a token, most of them tiny ops, and its SITU activation scales the gate and
+the up halves of the merged gate_up: views, which Vulkan's SCALE refused, so the scheduler ran those two scales a layer
+slot on the CPU and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary
+ops do, so the graph stays on the GPU. Three fusions take out about 1500 more dispatches a token:
+
+- a mat-vec MUL_MAT followed directly by a tanh or a sigmoid (the loop controllers' gain and forget, the attention
+  gate), in the mat-vec's store as above;
+- the row clip to an L2 norm after an optional per-channel scale, MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP
+  and MUL (the q, k and r clips), in one shader (`clip_rows.comp`);
+- a short convolution with its residual and scale, SSM_CONV, RESHAPE, ADD and SCALE, as a mode of the conv shader.
+
+The graph itself normalizes the depth mix's blocks once instead of at each of its 120 mixes a token. On the
+1920X + R9700 the Q8_0 runs at 43.6 tokens a second instead of 21.3, prompts of 512 at 1437 instead of 380; the
+SCALE alone gives 37.2, the fusions the rest (the clip about 13%, the convolutions 3.6%, the mat-vec store 2.5%).
+Upstream's ROCm build gives 31.2. The clip sums in another order than the separate ops: the test Q4_K_M's perplexity
+is 4.0683 against 4.0697. `GGML_VK_DISABLE_CLIP_ROWS=1` and `GGML_VK_DISABLE_CONV_RES=1` turn their fusions off,
+`GGML_VK_DISABLE_MM_POST=1` the mat-vec store's.
+
 ### Changes that apply without any option
 
 These change behaviour for every model and GPU, with or without the cache:
@@ -393,6 +416,9 @@ sparse-attention shaders and the RDNA4 kernels of other branches): a verify step
 | Change | Applies to | Switch |
 | --- | --- | --- |
 | Vulkan: a mat-vec MUL_MAT followed by SCALE and SiLU or sigmoid runs as one dispatch ([The mat-vec store](#the-mat-vec-store)) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1` |
+| Vulkan: SCALE of a view runs on the GPU ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | none |
+| Vulkan: MUL_MAT followed by tanh or sigmoid, the row clip, and SSM_CONV with its residual and scale run as one dispatch each ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1`, `GGML_VK_DISABLE_CLIP_ROWS=1`, `GGML_VK_DISABLE_CONV_RES=1` |
+| Inkling 2: the depth mix's blocks are normalized once ([Inkling 2's small ops](#inkling-2s-small-ops)) | `inkling2`, `inkling2_loop` | none |
 | Flash-Next's MTP draft: the rows without an output stop after the attention ([The draft's catch-up](#the-drafts-catch-up)) | `qwen4exp` draft heads | `LLAMA_MTP_FFN_ALL=1` |
 
 ## Prompts: `--moe-cache-resize`
@@ -820,7 +846,8 @@ budget raises the hit rate, but its copies and uploads cost time too, so judge i
 - **`llama-mmid-glu-check`** compares the CPU's fused expert ops with the same ops unfused
   (`GGML_CPU_MMID_GLU=1 GGML_CPU_MMID_FFN=1 GGML_CPU_MMID_FLAT=128 llama-mmid-glu-check [--threads N] [--glu-ref]`);
   with `--glu-ref` the reference has the gate/up fusion, and only down is apart.
-- **`test-backend-ops -o MUL_MAT_SCALE_UNARY`** checks the mat-vec store fusion, and
+- **`test-backend-ops -o MUL_MAT_SCALE_UNARY`** checks the mat-vec store fusion (`MUL_MAT_UNARY` the one without the
+  SCALE), `-o CLIP_ROWS` and `-o SSM_CONV_RES_SCALE` Inkling 2's other fusions, `-o SCALE` a scale of a view, and
   `test-backend-ops perf -o MUL_MAT_ID -b CPU` has Flash-Next's expert shapes as the hot spare leaves them to the CPU.
 - **`LLAMA_OFFLOAD_FAST_CHECK=1`** reads every part of a fast copy back after its upload and compares it with the host
   weights: all 29,104 parts of a run on the 1920X + R9700 were the same. A long greedy answer read again in batches of
@@ -958,7 +985,9 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `LLAMA_GRAPH_CACHE=N` | a scheduler and graph of its own for each of up to N small batch lengths, so a verify batch of another length than the last one reuses its graph instead of rebuilding and reallocating it (default 0, off; 8 in both setups) ([A graph per batch length](#a-graph-per-batch-length-llama_graph_cache)) |
 | `LLAMA_GRAPH_CACHE_TOKENS=N` | the longest batch that gets a graph of its own with `LLAMA_GRAPH_CACHE` (default 16) |
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
-| `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid in the mat-vec's store |
+| `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid or MUL_MAT → tanh/sigmoid in the mat-vec's store |
+| `GGML_VK_DISABLE_CLIP_ROWS=1` | Vulkan: no fused row clip ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_CONV_RES=1` | Vulkan: no fused SSM_CONV → ADD(residual) → SCALE |
 
 **Diagnostics**
 
