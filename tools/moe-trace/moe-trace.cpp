@@ -428,7 +428,16 @@ int main(int argc, char ** argv) {
             bytes += b;
             tensors[name] = { { "type", info.types.at(name) }, { "bytes_per_expert", b } };
         }
-        layers.push_back({ { "il", il }, { "n_expert", info.n_expert }, { "expert_bytes", bytes }, { "tensors", tensors } });
+        // the layer whose expert tensors it runs: il itself, or for the later passes of a looped model (inkling2_loop's cache
+        // slots) the physical layer of the core whose weights they reuse; prep.py pools the passes on it
+        int phys = il;
+        for (const auto & [name, b] : info.expert_bytes) {
+            if (name.rfind("blk.", 0) == 0) {
+                phys = atoi(name.c_str() + 4);
+                break;
+            }
+        }
+        layers.push_back({ { "il", il }, { "phys", phys }, { "n_expert", info.n_expert }, { "expert_bytes", bytes }, { "tensors", tensors } });
     }
     meta["layers"] = layers;
     meta["generated_tokens"] = generated;
