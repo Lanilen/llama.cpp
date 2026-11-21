@@ -33,6 +33,7 @@ numbers come from.
   - [A learned predictor](#a-learned-predictor---moe-cache-predictor) (`moe-predictor`)
   - [The two branches at the same time](#the-two-branches-at-the-same-time)
   - [Work beside the MoE](#work-beside-the-moe) (`moe-predictor`)
+  - [Looped models](#looped-models)
   - [Reads from the GPUs](#reads-from-the-gpus)
   - [The CPU's experts](#the-cpus-experts) (`moe-tuning`)
   - [Vulkan submits](#vulkan-submits-ggml_vk_flops_per_submit)
@@ -164,6 +165,10 @@ Upstream's input prefetch (`ggml_backend_sched_prefetch_inputs`) then reads the 
 branch is launched, and the CPU computes its experts while the GPU computes the resident ones. `GGML_SCHED_OVERLAP=0`
 turns the boundary off.
 
+The ops of the cache branch are placed on the cache device so that the activations stay there, but only those the
+device runs: Vulkan, for one, runs a `SCALE` only on a contiguous input, and Inkling 2's activation scales a strided
+view of the fused gate and up output. Such an op is left to the scheduler, which runs it on a backend that has it.
+
 ### Work beside the MoE
 
 *Branch `moe-predictor`.*
@@ -184,6 +189,25 @@ Measured on the 1920X + R9700 against `LLAMA_MOE_SIDE=0` (`llama-server`, an MTP
 four runs each): a pass of the model takes 3.2 ms less with both quants, 61.8 → 58.6 ms on UD-Q4_K_XL and 75.9 → 72.7
 ms on UD-Q6_K_XL, and answers come 4.6% and 3.5% faster. In a single-token verify, the CPU's wait for the GPU goes from
 11.9 to 8.7 ms (Q4).
+
+### Looped models
+
+A looped model runs some layers more than once a token. Inkling 2 Mini (`inkling2_loop`) runs its layers 6 to 17 three
+times; the later passes are cache slots 24 to 47, each with its own attention and state, that reuse the core's
+weights. The hot spare finds such slots by their expert tensors and gives them the resident set of the layer they
+reuse:
+
+- One set of slots, maps and scores per physical layer: an expert resident for one pass serves the others, takes one
+  slot, and the selections of every pass count for it.
+- `--moe-cache-jit` uploads for the first pass only. The scheduler copies a map to the device once per graph, so a
+  later pass would read the first pass's uploads after the next layer reused their slots. The later passes of a batch
+  the jit serves take the scheduler's offload instead, as large batches do without the jit.
+- `--moe-cache-mode lru` keeps a layer per pass, as before: its lookups upload during the graph.
+- A predictor must name the physical layers ([docs/moe-predictor.md](moe-predictor.md)).
+
+The scheduler's offload of host experts for a large batch copies the experts the batch selects, and copies each weight
+to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
+passes find every expert they select.
 
 ### Reads from the GPUs
 
@@ -355,6 +379,7 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: fused f32 adds don't need `shaderRoundingModeRTEFloat16` ([Fused adds](#fused-adds-on-gpus-without-fp16)) | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
 | Vulkan: a graph within one submit's node limit is submitted once ([Vulkan submits](#vulkan-submits-ggml_vk_flops_per_submit)) | all Vulkan GPUs | none; `GGML_VK_FLOPS_PER_SUBMIT=N` sets a size for every graph |
 | draft-mtp: the two transfers of target rows a pass are queued on the compute queue ([Speculative decoding with MTP](#speculative-decoding-with-mtp)) | models with an MTP draft on a GPU | none; `LLAMA_MTP_DEV_ROWS=0` keeps the rows on the host |
+| The offload of host experts copies an expert tensor that several layers run whole, not only the batch's selected experts ([Looped models](#looped-models)) | looped models (`inkling2_loop`) with experts in host memory | none |
 
 **On the ladder** (rung 2, the whole fork's build with upstream's flags and no cache, which also has the
 sparse-attention shaders and the RDNA4 kernels of other branches): a verify step 10.7% shorter than upstream's on the
