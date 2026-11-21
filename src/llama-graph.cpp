@@ -2323,6 +2323,14 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// the hot spare places the ops of a branch on its device so that the activations stay there; an op the device does not
+// run (a SCALE of a strided view on Vulkan, say) is left to the scheduler, which runs it elsewhere, rather than run wrong
+static void llm_moe_set_backend(ggml_backend_sched_t sched, ggml_tensor * t, ggml_backend_t backend) {
+    if (ggml_backend_supports_op(backend, t)) {
+        ggml_backend_sched_set_tensor_backend(sched, t, backend);
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2830,7 +2838,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // every op of the cache branch runs on the cache device, otherwise the scheduler may move the activations between devices
             for (ggml_tensor * t = first_c; t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
                 if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
-                    ggml_backend_sched_set_tensor_backend(sched, t, backend_cache);
+                    llm_moe_set_backend(sched, t, backend_cache);
                 }
             }
             // the cache branch is a split of its own that runs while the CPU computes the misses
@@ -2859,7 +2867,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // each expert output comes from one branch and is zero in the other, so the sum is exact
             ggml_tensor * experts = ggml_add(ctx0, experts_c, experts_h);
             if (ggml_backend_t backend_layer = moe_cache->layer_backend(il)) {
-                ggml_backend_sched_set_tensor_backend(sched, experts, backend_layer);
+                llm_moe_set_backend(sched, experts, backend_layer);
             }
             cb(experts, "ffn_moe_down", il);
 
