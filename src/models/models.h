@@ -2508,6 +2508,10 @@ struct llama_model_inkling2 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        // the normalized block outputs of mix(), [n_embd, n_blocks, n_tokens] from the last block to the first, built once
+        // for each list of blocks: a list that grows by one block concats one row set onto the list before it
+        ggml_tensor * mix_blocks(const std::vector<ggml_tensor *> & blocks);
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mixed_blocks;
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
