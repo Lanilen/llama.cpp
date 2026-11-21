@@ -979,7 +979,8 @@ static void scn_offload_fast(scenario_ctx & s) {
 // the settings of the lab's presets together: predictor, answer gain, jit with shared slots, resize, and their switches
 static void scn_kit(scenario_ctx & s) {
     const uint32_t n_moe = s.fx.n_moe_layers();
-    const std::string main = predictor_file(s, "main", n_moe, false, n_moe < FIX_N_LAYER);
+    // named as scn_predictor's: a model with dense first layers, or a looped one (the physical layers)
+    const std::string main = predictor_file(s, "main", n_moe, false, n_moe < FIX_N_LAYER || s.fx.arch == LLM_ARCH_INKLING2_LOOP);
     llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
     cparams.moe_cache_resize    = true;
     cparams.moe_cache_batch     = 64;
