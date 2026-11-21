@@ -237,11 +237,17 @@ if (NOT WIN32)
     set(MOE_CACHE_REF_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-moe-cache")
     file(MAKE_DIRECTORY "${MOE_CACHE_REF_DIR}")
     set(MOE_CACHE_SCENARIOS lru lru-cpu-share hot-spare hot-file resize resize-warm small-buffers two-devices mtp)
-    foreach(arch IN ITEMS qwen4exp glm5-next)
+    foreach(arch IN ITEMS qwen4exp glm5-next inkling2_loop)
         llama_test(test-moe-cache NAME test-moe-cache-${arch}-ref LABEL moe
             ARGS --arch ${arch} --make-ref --ref-dir "${MOE_CACHE_REF_DIR}")
         set_tests_properties(test-moe-cache-${arch}-ref PROPERTIES FIXTURES_SETUP moe-cache-ref-${arch} SKIP_RETURN_CODE 77)
-        foreach(scn IN LISTS MOE_CACHE_SCENARIOS)
+        set(scns ${MOE_CACHE_SCENARIOS})
+        if (arch STREQUAL "inkling2_loop")
+            # a looped model has no MTP block and takes no predictor; its tiny experts never fill a buffer, and the layer
+            # split counts the cache slots, so every physical layer (and its experts) is on the first device
+            list(REMOVE_ITEM scns small-buffers two-devices mtp kit-mtp kit predictor predictor-start predictor-gain predictor-cap predictor-device)
+        endif()
+        foreach(scn IN LISTS scns)
             llama_test(test-moe-cache NAME test-moe-cache-${arch}-${scn} LABEL moe
                 ARGS --arch ${arch} --scenario ${scn} --ref-dir "${MOE_CACHE_REF_DIR}")
             set_tests_properties(test-moe-cache-${arch}-${scn} PROPERTIES FIXTURES_REQUIRED moe-cache-ref-${arch} SKIP_RETURN_CODE 77)
