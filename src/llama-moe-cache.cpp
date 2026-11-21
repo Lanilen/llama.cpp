@@ -994,6 +994,15 @@ struct llama_moe_cache::impl {
         }
         if (n_alias > 0) {
             LLAMA_LOG_INFO("%s: %zu layers run the experts of earlier layers (a looped model), they share their resident experts\n", __func__, n_alias);
+            // a predictor ranks the experts of each layer it was trained on, the passes of a looped layer share one set
+            if (predictor) {
+                LLAMA_LOG_WARN("%s: --moe-cache-predictor is not supported for a looped model, ignored\n", __func__);
+                predictor.reset();
+                predictor_start.reset();
+                hidden_layers.clear();
+                hidden.clear();
+                hidden_prompt.clear();
+            }
         }
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
