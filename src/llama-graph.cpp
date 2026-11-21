@@ -1595,9 +1595,10 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     model            (*params.model),
-    hparams          (params.hparams),
+    hparams          (model.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
+    prec_policy      (model.prec_policy),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),
@@ -1631,8 +1632,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
-    prec_policy      (params.prec_policy),
-    hdmd             (params.hdmd),
+    hdmd             (model.hdmd.rot.empty() ? nullptr : &model.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
@@ -1729,9 +1729,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
-    if (prec_policy) {
-        prec_policy->apply(res);
-    }
+    prec_policy.apply(res);
 
     if (w->type == GGML_TYPE_NVFP4) {
         ggml_prec_set_acc(res, GGML_PREC_BF16);
@@ -1813,9 +1811,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
 
-    if (prec_policy) {
-        prec_policy->apply(res);
-    }
+    prec_policy.apply(res);
 
     if (w->type == GGML_TYPE_NVFP4) {
         ggml_prec_set_acc(res, GGML_PREC_BF16);
