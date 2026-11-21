@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -498,6 +499,10 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // expert tensors that several layers run (the passes of a looped model), see sched_copy_experts
+    std::unordered_set<const ggml_tensor *> shared_exps;
+    bool shared_exps_init = false;
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
