@@ -1,0 +1,87 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Clip each row to an L2 norm, after an optional per-channel scale (Inkling 2's q, k and r clips):
+//
+//   c   = x*s                  (s broadcast over the rows; c = x without a scale)
+//   n   = sqrt(sum(c*c))*norm_scale + norm_bias
+//   dst = c*clamp(threshold/n, clamp_lo, clamp_hi)
+//
+// the graph's MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP and MUL in one pass, one workgroup a row
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne00; uint ne01; uint ne02; uint ne03;   // x and dst
+    uint nbx1; uint nbx2; uint nbx3;              // x, in elements (rows contiguous)
+    uint ne11; uint ne12; uint ne13;              // the scale, broadcast over x's rows
+    uint nbs1; uint nbs2; uint nbs3;
+    uint nbd1; uint nbd2; uint nbd3;              // dst
+
+    uint x_offset;
+    uint s_offset;
+    uint d_offset;
+
+    uint has_scale;
+    float norm_scale;
+    float norm_bias;
+    float threshold;
+    float clamp_lo;
+    float clamp_hi;
+} p;
+
+layout(binding = 0) readonly buffer X {float data_x[];};
+layout(binding = 1) readonly buffer S {float data_s[];};
+layout(binding = 2) writeonly buffer D {float data_d[];};
+
+shared float sums[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.ne01 * p.ne02 * p.ne03) {
+        return;
+    }
+
+    const uint i3 = row / (p.ne01 * p.ne02);
+    const uint i2 = (row - i3 * p.ne01 * p.ne02) / p.ne01;
+    const uint i1 = row - i3 * p.ne01 * p.ne02 - i2 * p.ne01;
+
+    const uint x_base = p.x_offset + i3 * p.nbx3 + i2 * p.nbx2 + i1 * p.nbx1;
+    const uint s_base = p.s_offset + (i3 % p.ne13) * p.nbs3 + (i2 % p.ne12) * p.nbs2 + (i1 % p.ne11) * p.nbs1;
+    const uint d_base = p.d_offset + i3 * p.nbd3 + i2 * p.nbd2 + i1 * p.nbd1;
+
+    float acc = 0.0f;
+    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+        float c = data_x[x_base + i0];
+        if (p.has_scale != 0) {
+            c = c * data_s[s_base + i0];
+        }
+        acc += c * c;
+    }
+    sums[tid] = acc;
+
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sums[tid] += sums[tid + s];
+        }
+        barrier();
+    }
+
+    const float n = sqrt(sums[0]) * p.norm_scale + p.norm_bias;
+    const float f = clamp(p.threshold / n, p.clamp_lo, p.clamp_hi);
+
+    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+        float c = data_x[x_base + i0];
+        if (p.has_scale != 0) {
+            c = c * data_s[s_base + i0];
+        }
+        data_d[d_base + i0] = c * f;
+    }
+}

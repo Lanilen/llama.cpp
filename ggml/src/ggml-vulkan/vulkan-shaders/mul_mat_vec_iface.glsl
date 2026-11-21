@@ -8,6 +8,7 @@
 #define MAT_VEC_FUSION_FLAGS_POST_SCALE   0x10
 #define MAT_VEC_FUSION_FLAGS_POST_SILU    0x20
 #define MAT_VEC_FUSION_FLAGS_POST_SIGMOID 0x40
+#define MAT_VEC_FUSION_FLAGS_POST_TANH    0x80
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

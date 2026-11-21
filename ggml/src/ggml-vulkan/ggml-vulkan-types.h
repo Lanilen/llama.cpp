@@ -589,6 +589,28 @@ static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGM
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 // a mat-vec whose SCALE and SiLU/sigmoid are folded into its store (Flash-Next's hyper-connection down projection)
 static constexpr std::initializer_list<ggml_op> mm_scale_unary_pattern { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY };
+// the same without the SCALE: a tanh or sigmoid straight on the product (Inkling 2's loop controllers and attention gate)
+static constexpr std::initializer_list<ggml_op> mm_unary_pattern { GGML_OP_MUL_MAT, GGML_OP_UNARY };
+
+// (residual + ssm_conv(x, w))*s: Inkling 2's short convolutions with their residual
+static constexpr std::initializer_list<ggml_op> ssm_conv_res_scale_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+// c*clamp(t/(sqrt(sum_rows(c*c))*a + b), lo, hi), c = x*s or x: Inkling 2's q, k and r clips
+static constexpr std::initializer_list<ggml_op> clip_rows_scale_pattern { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS,
+    GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+static constexpr std::initializer_list<ggml_op> clip_rows_pattern { GGML_OP_SQR, GGML_OP_SUM_ROWS,
+    GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+// the edges after the leading MUL, as {dst, src slot, src} with the indices of clip_rows_pattern
+static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
+    { 1, 0, 0 }, // sum_rows->src[0] == sqr
+    { 2, 0, 1 }, // sqrt->src[0]     == sum_rows
+    { 3, 0, 2 }, // scale->src[0]    == sqrt
+    { 4, 0, 3 }, // fill->src[0]     == scale
+    { 5, 0, 4 }, // div->src[0]      == fill
+    { 5, 1, 3 }, // div->src[1]      == scale
+    { 6, 0, 5 }, // clamp->src[0]    == div
+    { 7, 1, 6 }, // mul->src[1]      == clamp
+};
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
 static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
@@ -996,6 +1018,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_clip_rows_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1027,6 +1050,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_res_scale_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1174,6 +1198,8 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_POST_SILU    0x20
 
 #define MAT_VEC_FUSION_FLAGS_POST_SIGMOID 0x40
+
+#define MAT_VEC_FUSION_FLAGS_POST_TANH    0x80
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1429,7 +1455,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
-    bool fused_mm_post {};      // MUL_MAT + SCALE + UNARY in the mat-vec's store
+    bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
+    bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

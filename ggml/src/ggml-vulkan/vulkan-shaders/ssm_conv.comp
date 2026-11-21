@@ -8,6 +8,8 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 layout(constant_id = 2) const bool APPLY_BIAS = false;
 layout(constant_id = 3) const bool APPLY_SILU = false;
+// (residual + conv)*res_scale, the residual in the Bias binding (Inkling 2's short convolutions)
+layout(constant_id = 4) const bool APPLY_RES_SCALE = false;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
@@ -21,6 +23,7 @@ layout(push_constant) uniform PushConstants {
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+    uint res_nb1; float res_scale;
 };
 
 void main() {
@@ -53,6 +56,9 @@ void main() {
     }
     if (APPLY_SILU) {
         sum = sum / (1.0f + exp(-sum));
+    }
+    if (APPLY_RES_SCALE) {
+        sum = (bias[(i3 * n_t + i2) * (res_nb1 / 4) + i1] + sum) * res_scale;
     }
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;

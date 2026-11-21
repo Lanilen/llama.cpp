@@ -55,6 +55,8 @@ D_TYPE mv_post(const FLOAT_TYPE v) {
         x = x / (1.0f + exp(-x));
     } else if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_POST_SIGMOID) != 0) {
         x = 1.0f / (1.0f + exp(-x));
+    } else if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_POST_TANH) != 0) {
+        x = 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
     }
     return D_TYPE(x);
 }

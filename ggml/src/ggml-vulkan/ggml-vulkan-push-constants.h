@@ -234,6 +234,25 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_clip_rows_push_constants {
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t ne03;
+    uint32_t nbx1; uint32_t nbx2; uint32_t nbx3;
+    uint32_t ne11; uint32_t ne12; uint32_t ne13;
+    uint32_t nbs1; uint32_t nbs2; uint32_t nbs3;
+    uint32_t nbd1; uint32_t nbd2; uint32_t nbd3;
+
+    uint32_t x_offset;
+    uint32_t s_offset;
+    uint32_t d_offset;
+
+    uint32_t has_scale;
+    float norm_scale;
+    float norm_bias;
+    float threshold;
+    float clamp_lo;
+    float clamp_hi;
+};
+
 struct vk_op_dsv4_hc_post_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -812,6 +831,7 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+    uint32_t res_nb1; float res_scale;   // APPLY_RES_SCALE: the residual's row stride (bytes) and the scale
 };
 
 struct vk_op_conv2d_push_constants {
