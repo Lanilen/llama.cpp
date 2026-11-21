@@ -426,6 +426,15 @@ llama_context::llama_context(
         graph_cache_max_tokens = std::max(1, atoi(e));
     }
 
+    {
+        const char * LLAMA_MOE_RANDOM_ROUTING = getenv("LLAMA_MOE_RANDOM_ROUTING");
+        cparams.moe_random_routing = LLAMA_MOE_RANDOM_ROUTING ? (atoi(LLAMA_MOE_RANDOM_ROUTING) != 0) : false;
+
+        if (cparams.moe_random_routing && hparams.n_expert > 0) {
+            LLAMA_LOG_WARN("%s: MoE random routing enabled - the output is not valid, use for benchmarks only\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
