@@ -14,6 +14,12 @@ The model's shape comes from the first trace and is written to WORK/model.json (
 n_layer (MoE layers), n_expert, n_expert_used, n_embd and hidden_layers (the layers whose inputs the traces hold).
 L, E, K and H below are n_layer, n_expert, n_expert_used and the number of hidden layers.
 
+A looped model (inkling2_loop) runs its core layers more than once a token, the later passes in cache slots that
+reuse the core's expert tensors; the trace has a column per slot (S of them, its "moe_layers"), each naming its
+physical layer ("phys"). The cache keeps one resident set per physical layer, so the records pool the passes: L counts
+the physical MoE layers, model.json's layer_of gives each of the S columns its row of the [L, E] maps, and ids keep the
+S columns ([..., S, K]). For any other model S = L and layer_of is the identity.
+
 For each answer (a generated segment of at least MIN_LEN tokens) of trace <name>, WORK/<name>.npz gets
   starts, lens        position and length of each answer (lens capped at MAX_LEN)
   ctx                 f16 [n, 6, L, E] what the context says at the answer's start (all tokens before it):
@@ -38,18 +44,24 @@ HLS = (64.0, 512.0)
 # set in main() from the first trace (the workers inherit them)
 NL = NE = K = N_EMBD = 0
 HID_LAYERS = []
+LAYER_OF = []   # the [L, E] row of each of the trace's S columns (the passes of a looped layer share one)
 DATA = OUT = None
 EMB = None
 
 def shape_of(meta):
     hid = meta.get("hidden") or {}
-    return {"n_layer": len(meta["moe_layers"]), "moe_layers": [int(x) for x in meta["moe_layers"]], "n_expert": int(meta["layers"][0]["n_expert"]),
+    slots = [int(x) for x in meta["moe_layers"]]
+    by_il = {int(l["il"]): int(l.get("phys", l["il"])) for l in meta["layers"]}
+    phys_of = [by_il.get(il, il) for il in slots]
+    phys = sorted(set(phys_of))
+    return {"n_layer": len(phys), "moe_layers": phys, "n_slot": len(slots), "slot_layers": slots,
+            "layer_of": [phys.index(p) for p in phys_of], "n_expert": int(meta["layers"][0]["n_expert"]),
             "n_expert_used": int(meta["n_expert_used"]), "n_embd": int(hid.get("n_embd", 0)),
             "hidden_layers": [int(x) for x in hid.get("layers", [])], "model": meta.get("model_name", "")}
 
 def flat(ids):
-    """[n, L, K] experts -> [n, L*K] indices into L*E"""
-    return (ids.astype(np.int64) + (np.arange(NL) * NE)[None, :, None]).reshape(len(ids), -1)
+    """[n, S, K] experts -> [n, S*K] indices into L*E (a looped layer's passes into its one row)"""
+    return (ids.astype(np.int64) + (np.asarray(LAYER_OF) * NE)[None, :, None]).reshape(len(ids), -1)
 
 def decay_to(score, ids, d):
     """score after the tokens ids (oldest first), each token decaying the score by d"""
@@ -58,7 +70,7 @@ def decay_to(score, ids, d):
         return score
     w = d ** np.arange(n - 1, -1, -1, dtype=np.float64)
     out = score * d ** n
-    np.add.at(out, flat(ids).ravel(), np.repeat(w, NL * K))
+    np.add.at(out, flat(ids).ravel(), np.repeat(w, len(LAYER_OF) * K))
     return out
 
 def counts(ids):
@@ -70,7 +82,7 @@ def counts(ids):
 def one(name):
     meta = json.load(open(f"{DATA}/{name}.json"))
     sh = shape_of(meta)
-    if any(sh[k] != v for k, v in (("n_layer", NL), ("n_expert", NE), ("n_expert_used", K))) or \
+    if any(sh[k] != v for k, v in (("n_layer", NL), ("n_expert", NE), ("n_expert_used", K), ("layer_of", LAYER_OF))) or \
        (sh["hidden_layers"] and (sh["hidden_layers"] != HID_LAYERS or sh["n_embd"] != N_EMBD)):
         print(f"{name}: skipped, traced from another model shape: {sh}", flush=True)
         return name, 0
@@ -127,13 +139,14 @@ def one(name):
 
 def init(shape, data, out, tok_embd):
     """the settings of main() in each worker (also where processes are spawned, not forked)"""
-    global NL, NE, K, N_EMBD, HID_LAYERS, DATA, OUT, EMB
+    global NL, NE, K, N_EMBD, HID_LAYERS, LAYER_OF, DATA, OUT, EMB
     NL, NE, K, N_EMBD, HID_LAYERS = shape["n_layer"], shape["n_expert"], shape["n_expert_used"], shape["n_embd"], shape["hidden_layers"]
+    LAYER_OF = shape["layer_of"]
     DATA, OUT = data, out
     EMB = np.load(tok_embd, mmap_mode="r") if tok_embd else None
 
 def main():
-    global NL, NE, K, N_EMBD, HID_LAYERS, DATA, OUT, EMB
+    global NL, NE, K, N_EMBD, HID_LAYERS, LAYER_OF, DATA, OUT, EMB
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--traces", required=True, help="the directory of the llama-moe-trace traces (<name>.json/.npy/.hid.npy)")
     ap.add_argument("--work", default=os.environ.get("MOE_PRED_WORK", "work"), help="where the records go (MOE_PRED_WORK for the other scripts)")
@@ -147,6 +160,7 @@ def main():
         raise SystemExit(f"no traces (<name>.json with <name>.npy) in {DATA}")
     sh = shape_of(json.load(open(f"{DATA}/{names[0]}.json")))
     NL, NE, K, N_EMBD, HID_LAYERS = sh["n_layer"], sh["n_expert"], sh["n_expert_used"], sh["n_embd"], sh["hidden_layers"]
+    LAYER_OF = sh["layer_of"]
     if args.tok_embd:
         EMB = np.load(args.tok_embd, mmap_mode="r")
         if N_EMBD and EMB.shape[1] != N_EMBD:
@@ -160,7 +174,8 @@ def main():
         if any(old.get(k) != shape[k] for k in ("n_layer", "n_expert", "n_expert_used", "n_embd", "hidden_layers")):
             raise SystemExit(f"{mp} is for another model shape: {old}")
     json.dump(shape, open(mp, "w"), indent=1)
-    print(f"{sh['model'] or 'model'}: {NL} MoE layers, {NE} experts, {K} used, hidden layers {HID_LAYERS or 'none'}, "
+    loop = f" (a looped model: {sh['n_slot']} slots, the passes pooled)" if sh["n_slot"] != NL else ""
+    print(f"{sh['model'] or 'model'}: {NL} MoE layers{loop}, {NE} experts, {K} used, hidden layers {HID_LAYERS or 'none'}, "
           f"n_embd {N_EMBD or '?'}, " + (f"token embeddings {args.tok_embd}" if args.tok_embd else "no token embeddings"))
     names = [n for n in names if not os.path.exists(f"{OUT}/{n}.npz")] if args.resume else names
     with Pool(args.jobs, initializer=init, initargs=(shape, DATA, OUT, args.tok_embd)) as p:

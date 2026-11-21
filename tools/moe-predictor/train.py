@@ -77,7 +77,7 @@ def load(names):
     D["src"] = [source(n) for n in names for _ in range(int(np.load(f"{WORK}/{n}.npz")["lens"].shape[0]))]
     return D
 
-LAYER = torch.arange(NL, device=dev).view(1, NL, 1) * NE
+LAYER = torch.tensor(LAYER_OF, device=dev).view(1, NS, 1) * NE   # each column's row (a looped layer's passes share one)
 SRCS = []   # with --source-input: the sources, in the order of their one-hot input
 
 def src_of(D, a):
@@ -100,7 +100,7 @@ def scatter(D, a, t0, t1, w_fn):
     first = torch.cumsum(n, 0) - n
     k = torch.arange(tot, device=dev) - first[b] + t0[b]
     rows = D["off"][a][b] + k
-    ix = take(D["ids"], rows).long() + LAYER                      # [tot, 48, 10]
+    ix = take(D["ids"], rows).long() + LAYER                      # [tot, S, K]
     w = w_fn(k, t1[b]).view(-1, 1, 1).expand_as(ix).float()
     out.view(-1).index_add_(0, (ix + (b * NL * NE).view(-1, 1, 1)).reshape(-1), w.reshape(-1))
     return out
@@ -296,14 +296,14 @@ if __name__ == "__main__":
             for p in EPROBES:
                 if (H, p, "oracle", sn) not in res:
                     continue
-                n = res[(H, p, "oracle", sn)][1] / NL / K
+                n = res[(H, p, "oracle", sn)][1] / NS / K
                 print(f"{H:5d} {p:6d} {n:8.0f} " + " ".join(f"{100 * res[(H, p, c, sn)][0] / res[(H, p, c, sn)][1]:6.1f}%" for c in cols))
     if args.save:
         # with what an exporter needs (export_predictor.py)
         torch.save({"state": model.state_dict(), "prior": prior.view(NL, NE).cpu(), "buckets": BUCKETS, "horizons": HS,
                     "slots": ["last"] if args.hid_last_only else ["last", "prompt_mean", "answer_mean"],
                     "rank": args.rank, "hid_layers": HID_LAYERS, "n_embd": N_EMBD, "n_expert_used": K, "maps": MAPS, "no_hidden": args.no_hidden,
-                    "moe_layers": MODEL.get("moe_layers"), **({"sources": SRCS} if SRCS else {})}, args.save)
+                    "moe_layers": MODEL.get("moe_layers"), "looped": NS != NL, **({"sources": SRCS} if SRCS else {})}, args.save)
 
     if args.sim:
         # swap-limited replays of a third of the held-out answers (their first 512 tokens): the live rule with the
@@ -338,12 +338,12 @@ if __name__ == "__main__":
                     at = lambda t, s=s, full=full: (full[t // 16], True) if full is not None and t == 64 else (s[t // 16], False)
                     for sn, S in SLOTS.items():
                         for bud in budgets:
-                            r = replay(ids, S, at, bud, 16, L)
+                            r = replay(ids, S, at, bud, 16, L, LAYER.view(-1) // NE)
                             x = tot.setdefault((sn, bud, kind), [0, 0, 0])
                             x[0] += r[0]; x[1] += r[1]; x[2] += r[2]
         print(f"replays: {time.time() - t_start:.0f} s")
         for sn in SLOTS:
             for bud in budgets:
                 print(f"replay {sn} budget {bud:5.1f} swaps/tok: " + " | ".join(
-                    f"{k} {100 * tot[(sn, bud, k)][0] / tot[(sn, bud, k)][1]:5.1f}% ({tot[(sn, bud, k)][2] / (tot[(sn, bud, k)][1] / NL / K):4.1f}/tok)"
+                    f"{k} {100 * tot[(sn, bud, k)][0] / tot[(sn, bud, k)][1]:5.1f}% ({tot[(sn, bud, k)][2] / (tot[(sn, bud, k)][1] / NS / K):4.1f}/tok)"
                     for k in kinds), flush=True)
