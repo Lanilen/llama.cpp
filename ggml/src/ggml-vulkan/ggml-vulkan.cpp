@@ -16104,10 +16104,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 3)) {
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "SSM_CONV_RES_SCALE";
+                // the conv reads several input tokens per output; the residual add and the scale are elementwise
+                // (the allocator may give the output the residual's memory)
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
-                op_srcs_fused_elementwise[2] = false;
-                op_srcs_fused_elementwise[3] = false;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -17741,7 +17743,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SLEEP:
             return device->shader_clock;
         case GGML_OP_SCALE:
-            return ggml_is_contiguous(op->src[0]) && ggml_vk_is_float_elementwise(op);
+            // scale.comp reads and writes through the strides
+            return ggml_vk_is_float_elementwise(op);
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ROLL:
