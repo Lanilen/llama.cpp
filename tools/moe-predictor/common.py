@@ -16,6 +16,10 @@ def model_shape():
 
 MODEL = model_shape()
 NL, NE, K = MODEL["n_layer"], MODEL["n_expert"], MODEL["n_expert_used"]
+# the [L, E] row of each of the records' S columns of experts (prep.py): the identity but for a looped model, whose
+# later passes' slots pool on the physical layer they run
+LAYER_OF = MODEL.get("layer_of") or list(range(NL))
+NS = len(LAYER_OF)
 N_EMBD, HID_LAYERS = MODEL["n_embd"], MODEL["hidden_layers"]
 # the cache sizes to report hit rates at, in resident experts per layer: MOE_PRED_SLOTS=name=n,name=n (Flash-Next's
 # 7860 and 5543 slots on a 32 GB GPU with Q4_K_XL and Q6_K_XL: q4=164,q6=115); by default a third of the experts
@@ -33,6 +37,8 @@ def store(names):
             with np.load(f"{WORK}/{n}.npz") as z:
                 for k in STORE_KEYS:
                     x = z[k]
+                    if k in ("ctx", "ctx_pre"):
+                        x = x.astype(np.float32)        # records from before prep.py wrote them as float32 were float16
                     if k == "hid_ans":
                         x = x + na                      # the answer's index in the whole store
                     if k not in files:
@@ -84,10 +90,10 @@ class Trace:
         return self.ids[self.off[i]:self.off[i] + self.lens[i]]
 
 def counts(ids):
-    """[n, L, K] experts -> [L, E] uses"""
+    """[n, S, K] experts -> [L, E] uses"""
     c = np.zeros((NL, NE), np.float32)
     if len(ids):
-        np.add.at(c, (np.broadcast_to(np.arange(NL)[None, :, None], ids.shape), ids.astype(np.int64)), 1.0)
+        np.add.at(c, (np.broadcast_to(np.asarray(LAYER_OF)[None, :, None], ids.shape), ids.astype(np.int64)), 1.0)
     return c
 
 def decayed(ids, hl, score=None):
@@ -97,7 +103,7 @@ def decayed(ids, hl, score=None):
     out = np.zeros((NL, NE), np.float64) if score is None else score.astype(np.float64) * d ** n
     if n:
         w = d ** np.arange(n - 1, -1, -1, dtype=np.float64)
-        np.add.at(out, (np.broadcast_to(np.arange(NL)[None, :, None], ids.shape), ids.astype(np.int64)),
+        np.add.at(out, (np.broadcast_to(np.asarray(LAYER_OF)[None, :, None], ids.shape), ids.astype(np.int64)),
                   np.broadcast_to(w[:, None, None], ids.shape))
     return out.astype(np.float32)
 

@@ -8,8 +8,9 @@ Hits are counted on every token from the probe on. Swaps land immediately (the l
 """
 import torch
 
-def replay(ids, S, scores_at, budget, every, t_end):
-    """ids: [T, L, K] long (one answer on the GPU); scores_at(t) -> ([L, E] priority scores with t tokens known,
+def replay(ids, S, scores_at, budget, every, t_end, layer_of=None):
+    """ids: [T, S, K] long (one answer on the GPU), layer_of: [S] the row of the scores of each column (default: the
+    identity; a looped layer's passes share a row and its residents); scores_at(t) -> ([L, E] priority scores with t tokens known,
     full): full makes that refresh unlimited (the refill); t = 0 is the initial fill; budget: swaps per token over all
     layers (float); returns (hits, uses, swaps)"""
     sc, _ = scores_at(0)
@@ -18,7 +19,7 @@ def replay(ids, S, scores_at, budget, every, t_end):
     res.scatter_(1, sc.topk(S, dim=1).indices, True)
     hits = uses = swaps = 0
     bank = 0.0
-    lay = torch.arange(NL, device=ids.device).view(NL, 1)
+    lay = (torch.arange(NL, device=ids.device) if layer_of is None else layer_of.to(ids.device)).view(-1, 1)
     for t0 in range(0, t_end, every):
         if t0 > 0:
             bank = min(bank + budget * every, 8 * budget * every + 1)
@@ -42,6 +43,6 @@ def replay(ids, S, scores_at, budget, every, t_end):
                     swaps += k
         t1 = min(t0 + every, t_end)
         win = ids[t0:t1]                                         # [n, L, K]
-        hits += int(res[lay.view(1, NL, 1).expand_as(win), win].sum())
+        hits += int(res[lay.view(1, -1, 1).expand_as(win), win].sum())
         uses += win.numel()
     return hits, uses, swaps

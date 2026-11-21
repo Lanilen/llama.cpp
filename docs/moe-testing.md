@@ -26,6 +26,7 @@ the canary mode; the branch with every part also the documents' check and the sp
 | `ops-sparse` | TOP_K_MASK and LIGHTNING_INDEXER without fp16, no case unsupported | an op fell back to the CPU on a GPU without fp16: the splits of every token grow |
 | `cpu-fusions` | `llama-mmid-glu-check` | the CPU's fused experts differ from the unfused ops |
 | `predictor-files` | `llama-moe-predictor-check` on the published predictor files, when they are on the machine | the loader or the predictor's graph no longer reproduces the exporter's numbers |
+| `predictor-tools` | `tools/moe-predictor/selftest.py --loop`: the training pipeline (prep, train, train_pre, both exports) on made-up traces of a looped model, then `llama-moe-predictor-check` on its files | the records stopped pooling a looped layer's passes on its physical layer, the files stopped naming those layers, or a tool broke |
 | `py-compile`, `py-types` | `py_compile` and `ty check` on `tools/moe-trace` and `tools/moe-predictor` | a script does not parse, or the push would fail upstream's type-check workflow |
 | `tuner-mock` | `tests/test-tune.py`: the tuner's search against a server whose speeds are a known function of its settings | the search logic changed: it no longer finds the best value, resumes, revisits, or holds the start under noise |
 | `tuner-server` | two tuner stages on the real server and a tiny model | the server no longer takes an option the tuner passes, or the tuner no longer reads a line of the server's log |
@@ -44,9 +45,9 @@ quantized with a type per layer (q4_K, one layer with a q6_K down projection, iq
 `inkling2_loop` (Inkling 2 Mini's looped core) is the third model: of its 6 layers the core, layers 2 and 3, runs three
 times a token, the later passes in cache slots 6 to 9 that reuse the core's tensors. The cache keeps one resident set
 for the passes of a layer, so its cached layers are the 6 physical ones and each pass's selections count for its layer.
-It has no MTP block and takes no predictor, and two scenarios do not apply: `small-buffers` (its tiny experts never
-fill a buffer) and `two-devices` (the layer split counts the cache slots and puts every physical layer, with its
-experts, on the first device).
+Its predictor files name the 6 physical layers (a file made for the 10 slots is ignored). It has no MTP block, and two
+more scenarios do not apply: `small-buffers` (its tiny experts never fill a buffer) and `two-devices` (the layer split
+counts the cache slots and puts every physical layer, with its experts, on the first device).
 
 Every scenario is a process of its own, started with its environment, because the switches are read once a process
 and some before `main`. It decodes 440 fixed tokens in fixed batches (a prompt, an answer, verify batches of 3, 8 and

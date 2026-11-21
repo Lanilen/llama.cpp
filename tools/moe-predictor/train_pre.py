@@ -13,7 +13,7 @@ the text set already holds (what is left to upload once the prompt is processed)
 
 (--no-hidden is the live start predictor's form: llama.cpp gives it the counts and the turn's text only.)
 """
-import argparse, sys, time
+import argparse, math, sys, time
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 
@@ -101,6 +101,8 @@ for ep in range(args.epochs):
             loss = loss - (q * F.log_softmax(model(logp, x, H), -1)).sum(-1).mean()
         opt.zero_grad(); loss.backward(); opt.step(); sched.step(); tl += float(loss.detach())
     print(f"epoch {ep}: loss {tl / ((len(perm) + 31) // 32):.4f} ({time.time() - t0:.0f} s)", flush=True)
+    if not math.isfinite(tl / ((len(perm) + 31) // 32)):
+        sys.exit(f"epoch {ep}: the loss is not finite: an input carries inf or nan, nothing saved")
 
 # held-out: the text set, the end-of-prompt set, the set the counts alone give, and their overlap
 endm = T.Model(prior.view(NL, NE)).to(dev); endm.load_state_dict(ck["state"]); endm.eval(); model.eval()
