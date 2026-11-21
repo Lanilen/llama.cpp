@@ -16,7 +16,7 @@ Model per horizon: logits[l, e] = sum_f w[f, l, bucket(t)] * logp_f[l, e] + bias
 an MLP of the hidden states (z = 0 with --no-hidden; --no-counts drops the count maps). Loss: per-layer cross entropy
 against the target distribution. Reports the top-S hit rate on the held-out traces next to the rules.
 """
-import argparse, math, time
+import argparse, math, sys, time
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from common import *
@@ -248,6 +248,8 @@ if __name__ == "__main__":
             opt.zero_grad(); loss.backward(); opt.step(); sched.step(); step += 1
             tl += float(loss.detach()); tn += 1
         print(f"epoch {ep}: loss {tl / tn:.4f} ({time.time() - t0:.0f} s)", flush=True)
+        if not math.isfinite(tl / tn):
+            sys.exit(f"epoch {ep}: the loss is not finite: an input carries inf or nan (the records' counts?), nothing saved")
 
     # held-out: the model and the rules at each probe and horizon, micro-averaged hit rates
     model.eval()

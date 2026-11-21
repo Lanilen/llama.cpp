@@ -37,6 +37,8 @@ def store(names):
             with np.load(f"{WORK}/{n}.npz") as z:
                 for k in STORE_KEYS:
                     x = z[k]
+                    if k in ("ctx", "ctx_pre"):
+                        x = x.astype(np.float32)        # records from before prep.py wrote them as float32 were float16
                     if k == "hid_ans":
                         x = x + na                      # the answer's index in the whole store
                     if k not in files:

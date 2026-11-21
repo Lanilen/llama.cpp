@@ -106,7 +106,8 @@ def one(name):
         chunk = np.asarray(ids[at:turn_start])
         sc = [decay_to(x, chunk, d) for x, d in zip(sc, ds)]
         allc += counts(chunk)
-        ctx_pre.append(np.stack([sc[0], sc[1], allc]).reshape(3, NL, NE).astype(np.float16))
+        # float32: a looped model's passes add up in one layer's row, and a long conversation's counts pass f16's 65504
+        ctx_pre.append(np.stack([sc[0], sc[1], allc]).reshape(3, NL, NE).astype(np.float32))
         r = np.nonzero(hpos < turn_start)[0] if hid is not None else []
         hid_pre.append(np.asarray(hid[r[-1]]) if hid is not None and len(r) else np.zeros((len(HID_LAYERS), N_EMBD), np.float16))
         tt = toks[turn_start:s]
@@ -119,7 +120,7 @@ def one(name):
         at = s
         pa = counts(np.asarray(ids[prev[-1][0]:prev[-1][1]])) if prev else np.zeros(NL * NE)
         aa = sum((counts(np.asarray(ids[g0:g1])) for g0, g1 in prev), np.zeros(NL * NE))
-        ctx.append(np.stack([sc[0], sc[1], allc, counts(np.asarray(ids[turn_start:s])), pa, aa]).reshape(6, NL, NE).astype(np.float16))
+        ctx.append(np.stack([sc[0], sc[1], allc, counts(np.asarray(ids[turn_start:s])), pa, aa]).reshape(6, NL, NE).astype(np.float32))
         L = min(e - s, MAX_LEN)
         starts.append(s); lens.append(L)
         ids_out.append(np.asarray(ids[s:s + L]))
