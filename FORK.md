@@ -703,7 +703,7 @@ What it shows, in the order IQ4_XS on the RX 480s, then Q4 and Q6 on the R9700:
 
 ## The fork and upstream
 
-The fork follows upstream by merges, never rebases; every branch is at upstream `513ad7ae0` (2026-11-17), past
+The fork follows upstream by merges, never rebases; every branch is at upstream `46eb1742d` (2026-11-21), past
 upstream's `v1.0.0`. The rule for a conflict: where upstream has its own version of something the fork built and it
 performs about as well in general, upstream's version stays and ours goes; ours stays only where it measures better on
 the real workload.
@@ -751,6 +751,15 @@ the real workload.
   than before, and the indexer itself is unchanged.
 - **A slot scheduler in the server with a running hash of the prompt.** It reuses the same prefixes as before:
   kept prompts give the same cache and prompt counts, so the cache's release and restore see the same batches.
+- **Stream-k matmuls and mixed-signedness int8 dots on Vulkan, and a chunked GATED_DELTA_NET** (2026-11-19 and 20,
+  tuned for RDNA4). Flash-Next's matmul shapes take the same time on the R9700 and on an RX 480 as before, within
+  the back and forth of the R9700's small-batch q4_K cases between stages, and the tuned setups' prompts are as fast
+  as before (below). Prompts through the delta net round a little differently (logits below).
+- **The graph's node budget in the model classes,** with the MoE cache's share on top: the hot spare's second build of
+  each layer's experts keeps its own share.
+- **Looped models** (Inkling 2 Mini: 24 layers, the middle twelve run three times, 48 slots). The MoE cache sees the
+  slots; in hot-spare mode the passes of a layer share one resident set
+  ([docs/moe-hot-spare.md](docs/moe-hot-spare.md#looped-models)). A predictor is not used for one yet.
 
 **The merge of 2026-11-14** (131 upstream commits, in six stages so that a break had few suspects) was accepted on
 the tuned setups, the build before against the build after, back to back, two passes each:
@@ -781,6 +790,30 @@ RX 480s they are the same to the last digit, and on the R9700 the new flash atte
 same mean KL as a rerun. `test-backend-ops` passes on the R9700 and an RX 480 (22496 cases each, the sparse-attention
 ops 248 of 248). GLM-5.3-Flash on its preset gives the same answers, draft acceptance, swaps and hit rate before and
 after.
+
+**The merge of 2026-11-21** (128 upstream commits to Inkling 2 Mini, in seventeen stages, the same rule) was accepted
+the same way:
+
+| | verify step before | after | prompts before | after |
+|---|---|---|---|---|
+| 1920X + R9700, UD-Q4_K_XL | 61.60 / 60.29 ms | 61.05 ms | 438 / 438 tok/s | 439 tok/s |
+| 1920X + R9700, UD-Q6_K_XL | 75.21 / 75.53 ms | 74.49 ms | 361 / 361 tok/s | 365 tok/s |
+| 1920X + RX480x2, UD-IQ4_XS | 92.26 / 92.31 ms | 92.12 ms | 78 / 78 tok/s | 78 tok/s |
+
+Every difference is within the build's own spread. Logits over 2048 positions on the R9700 are the same to the last
+digit for one token at a time and within the run-to-run spread for the larger rounds, where the chunked delta net
+rounds differently; over 1024 positions on the RX 480s likewise (the same for one token at a time, within the spread
+for the rest). `test-backend-ops` passes on the R9700 and an RX 480 (23247 cases each, the
+sparse-attention ops 248 of 248), and the scheduler's splits are the same. GLM-5.3-Flash on its preset runs at the
+same speed (prompts 141–142 tok/s, answers 10.8–13.5 tok/s on both builds), with other answers at temperature 0 from the
+first request on: its delta net rounds differently too; its logits were not measured.
+
+The merge brought two bugs of the hot spare to light, both on looped models and both fixed: the cache branch forced
+its ops onto the cache's device even where that device can't run them (Vulkan's SCALE wants a contiguous input, and
+Inkling's activation scales a strided view), and upstream's copy of the selected experts only, for a weight that the
+scheduler copies once per graph, left the later passes of a layer reading experts that were never copied (a weight
+that several layers share is now copied whole). Unsloth's first UD-Q4_K_XL of Inkling 2 Mini is in the format from
+before upstream's merge (`inkling2`, `loop_*` tensors) and loads in neither build; ggml-org's Q8_0 is in the final one.
 
 **Upstream's cache against the hot spare at the same memory.** The ladder's rung 1 gives upstream's cache what its own
 build can allocate. In the fork's build, which splits the cache's banks, it can take the hot spare's 20900 MiB on the
