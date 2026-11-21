@@ -42,9 +42,10 @@ w.add_string(a + "role", "start")
 w.add_uint32(a + "n_layer", NL); w.add_uint32(a + "n_expert", NE); w.add_uint32(a + "n_expert_used", KU)
 w.add_uint32(a + "n_embd", N_EMBD); w.add_uint32(a + "every", 16)
 w.add_array(a + "hidden_slots", ["turn_embd_mean"])
-# the model's layer of each MoE layer, where they aren't simply all of the model's layers (GLM-5.3: 3-44 of 45)
+# the model's layer of each MoE layer, where they aren't simply all of the model's layers (GLM-5.3: 3-44 of 45), and
+# always for a looped model: its file's layers are the physical ones, fewer than the model's cache slots
 ML = mk.get("moe_layers")
-if ML and [int(x) for x in ML] != list(range(NL)):
+if ML and ([int(x) for x in ML] != list(range(NL)) or mk.get("looped")):
     w.add_array(a + "layers", [int(x) for x in ML])
 w.add_float32(a + "turn_embd_scale", SCALE)
 w.add_array(a + "maps", MAPS)

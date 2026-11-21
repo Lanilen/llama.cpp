@@ -104,6 +104,14 @@ if have llama-moe-predictor-check tools/moe-trace/moe-predictor-check.cpp; then
     run predictor-files "llama-moe-predictor-check: $(echo $P | wc -w) published files against their exporters' vectors" check_predictors
   else skip predictor-files "no published predictor files here (MOE_CHECK_PREDICTORS)"; fi
 else skip predictor-files "no llama-moe-predictor-check on this branch"; fi
+# the training pipeline on made-up traces of a looped model (its passes pooled per physical layer), on the CPU
+if [ -f tools/moe-predictor/selftest.py ] && have llama-moe-predictor-check; then
+  VENV=${MOE_CHECK_PYTHON:-$HOME/moe-pred/venv}
+  if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import torch, numpy" 2> /dev/null; then
+    run predictor-tools "tools/moe-predictor/selftest.py --loop: prep, train, export, checked by llama-moe-predictor-check" \
+      env CUDA_VISIBLE_DEVICES= "$VENV/bin/python" tools/moe-predictor/selftest.py --loop --check "$BIN/llama-moe-predictor-check"
+  else skip predictor-tools "no Python with numpy and torch (MOE_CHECK_PYTHON)"; fi
+else skip predictor-tools "no tools/moe-predictor/selftest.py or llama-moe-predictor-check on this branch"; fi
 
 # tier 3: the tools
 PY=$(ls -d tools/moe-trace tools/moe-predictor 2>/dev/null)

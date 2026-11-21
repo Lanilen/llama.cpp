@@ -839,6 +839,21 @@ embedding size. Trace your own use: the predictor learns the routing of the text
 [GLM-5.3-Flash](#glm-53-flash) is the worked example: another architecture, whose first three layers have no experts.
 Its file took 20 hours of traces and 4 minutes of training with these scripts, and gave a first gain on 190 traces.
 
+**A looped model** (Inkling 2 Mini, `inkling2_loop`: layers 6 to 17 run three passes a token, the later ones in cache
+slots 24 to 47 that reuse those layers' expert tensors) needs nothing extra. The cache keeps one resident set per
+physical layer for all its passes (see [docs/moe-hot-spare.md](moe-hot-spare.md)), so the predictor predicts the
+physical layers:
+
+- `llama-moe-trace` writes a column per slot and names each slot's physical layer (`"phys"` in the json's `layers`).
+- `prep.py` pools the passes: the count maps have a row per physical layer, `model.json`'s `layer_of` gives each
+  trace column its row, and the answers keep every column. `train.py` and the replays add each column's experts to
+  its row, so a core layer's target is the selections of its three passes.
+- The files name the physical layers (`layers` 0 to 23), and the cache ignores a file whose layers include a later
+  pass's slot.
+- The hidden layers are slots: `LLAMA_MOE_TRACE_HIDDEN=8,16` reads layers 8 and 16 in the first pass.
+
+`tools/moe-predictor/selftest.py --loop` runs the whole pipeline on made-up traces of a looped model.
+
 ## The file format
 
 `moe_predictor.version` 1, written by `export_predictor.py` and `export_start.py` and read by
@@ -849,7 +864,9 @@ Its file took 20 hours of traces and 4 minutes of training with these scripts, a
     `n_expert` or `n_embd` differs from the model's doesn't load.
   - `role`: `main` or `start`.
   - `layers` (optional): the model's layer of each of its `n_layer` layers, for a model whose every layer isn't a
-    MoE layer (GLM-5.3-Flash: layers 3 to 44 of 45). Without it `n_layer` must be the model's layer count.
+    MoE layer (GLM-5.3-Flash: layers 3 to 44 of 45), and for a looped model, whose file covers its physical layers
+    but not the later passes' cache slots (Inkling 2 Mini: 0 to 23 of 48). Without it `n_layer` must be the model's
+    layer count.
   - `hidden_layers`: the layers whose input it reads.
   - `hidden_slots`: what it reads of them, `last` (the newest row) or `turn_embd_mean` (the start predictor), with
     `turn_embd_scale`.

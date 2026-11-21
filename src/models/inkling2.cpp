@@ -175,12 +175,29 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
-ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+// the rows are normalized one by one, so normalizing each block once and concatenating the results gives the states of
+// normalizing the whole concatenation, with one concat a mix instead of one a block
+ggml_tensor * llama_model_inkling2::graph::mix_blocks(const std::vector<ggml_tensor *> & blocks) {
+    if (blocks.empty()) {
+        return nullptr;
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
+    auto it = mixed_blocks.find(blocks);
+    if (it != mixed_blocks.end()) {
+        return it->second;
+    }
+    ggml_tensor * last = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks.back(), n_embd, 1, n_tokens), 1e-6f);
+    ggml_tensor * rest = mix_blocks(std::vector<ggml_tensor *>(blocks.begin(), blocks.end() - 1));
+    ggml_tensor * normed = rest ? ggml_concat(ctx0, last, rest, 1) : last;
+    mixed_blocks.emplace(blocks, normed);
+    return normed;
+}
+
+ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    // the states from the last block to the first, then cur
+    ggml_tensor * states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
+    if (ggml_tensor * normed = mix_blocks(blocks)) {
+        states = ggml_concat(ctx0, normed, states, 1);
+    }
 
     ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
@@ -238,7 +255,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    // [norm(cur); norm(message)] by rows: the two side by side as [n_embd, 2, n_tokens], one norm, read as [2 n_embd, n_tokens]
+    ggml_tensor * gate = ggml_concat(ctx0, ggml_reshape_3d(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), n_embd, 1, n_tokens),
+            ggml_reshape_3d(ctx0, message, n_embd, 1, n_tokens), 1);
+    gate = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, gate, 1e-6f), 2*n_embd, n_tokens);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
@@ -292,6 +312,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
 
     ggml_tensor * inpSA = cur;
+
+    // the layer's input: the rows of llama_get_embeddings_layer_inp (llama-moe-trace's hidden rows) and the MoE
+    // predictor's hidden state, as qwen4exp and glm5-next give them; il is the cache slot, so each pass of a looped layer
+    // has its own
+    if (((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) ||
+        ((size_t) il < cparams.moe_hidden_inp.size() && cparams.moe_hidden_inp[il])) {
+        res->t_layer_inp[il] = cur;
+        cb(res->t_layer_inp[il], "layer_inp", il);
+        ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+    }
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
