@@ -117,6 +117,17 @@ static bool fixture_last_layer_outputs_only(const llm_arch arch) {
     return arch == LLM_ARCH_QWEN4EXP;
 }
 
+// inkling2_loop: the core [FIX_LOOP_START, FIX_LOOP_END) runs FIX_LOOP_PASSES times, the later passes in cache slots after
+// the physical layers that reuse the core's weights: the cache keeps one resident set for the passes of a layer
+static const uint32_t FIX_LOOP_START  = 2;
+static const uint32_t FIX_LOOP_END    = 4;
+static const uint32_t FIX_LOOP_PASSES = 3;
+
+// the times a token runs physical layer il
+static uint32_t fixture_passes(const llm_arch arch, const int32_t il) {
+    return arch == LLM_ARCH_INKLING2_LOOP && il >= (int32_t) FIX_LOOP_START && il < (int32_t) FIX_LOOP_END ? FIX_LOOP_PASSES : 1;
+}
+
 static uint32_t fixture_n_dense(const llm_arch arch) {
     return arch == LLM_ARCH_GLM5_NEXT ? 1 : 0; // get_gguf_ctx's leading_dense_block_count, which only glm5-next reads
 }
@@ -129,6 +140,11 @@ static gguf_context_ptr fixture_gguf(const llm_arch arch, const bool mtp) {
     ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, FIX_N_FF_EXP);
     if (mtp) {
         ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
+    if (arch == LLM_ARCH_INKLING2_LOOP) {
+        ms.add_kv(LLM_KV_LOOP_START, FIX_LOOP_START);
+        ms.add_kv(LLM_KV_LOOP_END,   FIX_LOOP_END);
+        ms.add_kv(LLM_KV_LOOP_COUNT, FIX_LOOP_PASSES);
     }
 
     const int64_t kid = gguf_find_key(ret.get(), llama_arch_kv_name(arch, LLM_KV_EMBEDDING_LENGTH).c_str());
@@ -541,7 +557,7 @@ static size_t expected_selections(const fixture & fx, const llama_moe_cache_coun
     for (const auto & g : c.groups) {
         for (const int32_t il : g.layers) {
             if (g.n_slots > 0) {
-                n += FIX_N_USED*(il == (int32_t) FIX_N_LAYER - 1 && fixture_last_layer_outputs_only(fx.arch) ? n_out : n_tokens);
+                n += FIX_N_USED*fixture_passes(fx.arch, il)*(il == (int32_t) FIX_N_LAYER - 1 && fixture_last_layer_outputs_only(fx.arch) ? n_out : n_tokens);
             }
         }
     }

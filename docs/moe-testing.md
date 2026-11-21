@@ -41,13 +41,20 @@ dense, as GLM-5.3-Flash's first three), 32 experts of which a token uses 4, and 
 quantized with a type per layer (q4_K, one layer with a q6_K down projection, iq4_xs; the legacy quants where a row is
 128 wide), so the cache forms three groups and one of them is a single layer, as GLM-5.3-Flash's layers 11 and 12.
 
+`inkling2_loop` (Inkling 2 Mini's looped core) is the third model: of its 6 layers the core, layers 2 and 3, runs three
+times a token, the later passes in cache slots 6 to 9 that reuse the core's tensors. The cache keeps one resident set
+for the passes of a layer, so its cached layers are the 6 physical ones and each pass's selections count for its layer.
+It has no MTP block and takes no predictor, and two scenarios do not apply: `small-buffers` (its tiny experts never
+fill a buffer) and `two-devices` (the layer split counts the cache slots and puts every physical layer, with its
+experts, on the first device).
+
 Every scenario is a process of its own, started with its environment, because the switches are read once a process
 and some before `main`. It decodes 440 fixed tokens in fixed batches (a prompt, an answer, verify batches of 3, 8 and
 1 tokens in turn, a prompt of 64 tokens and one of 200, each followed by an answer) and checks three things:
 
 - **Logits** against the same model and batches without a cache, from a process with none of the switches set. The
-  bound is a share of the logits' deviation: 0.002 on `qwen4exp`, 0.1 on `glm5-next` (measured: up to 0.0007 and
-  0.024). This catches a computation that went wrong, not a wrong expert in a slot: with a quarter of the uploaded
+  bound is a share of the logits' deviation: 0.002 on `qwen4exp` and `inkling2_loop`, 0.1 on `glm5-next` (measured: up
+  to 0.0007, 0.0013 and 0.024). This catches a computation that went wrong, not a wrong expert in a slot: with a quarter of the uploaded
   experts replaced by their neighbours these random models' logits move by about the bound.
 - **Read-back checks**, which do catch that: `LLAMA_MOE_CACHE_VERIFY` (every resident expert byte for byte against the
   host's, at the end of every scenario), `LLAMA_MOE_CACHE_JIT_CHECK` and `LLAMA_OFFLOAD_FAST_CHECK` where they apply.
