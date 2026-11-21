@@ -836,12 +836,15 @@ static std::string predictor_file(const scenario_ctx & s, const char * name, con
 enum predictor_variant { PRED_MAIN, PRED_START, PRED_GAIN, PRED_CAP, PRED_DEVICE };
 
 // --moe-cache-predictor: the file's predictions rank the experts in place of the decayed scores. A model whose first
-// layers have no experts needs a file that names its layers, and refuses one that doesn't
+// layers have no experts needs a file that names its layers, and refuses one that doesn't; so does a looped model,
+// whose file is made for its physical layers (fewer than its cache slots), and one made for the slots is ignored
 static void scn_predictor(scenario_ctx & s, const predictor_variant variant) {
     const uint32_t n_moe = s.fx.n_moe_layers();
+    const bool loop  = s.fx.arch == LLM_ARCH_INKLING2_LOOP;
     const bool dense = n_moe < FIX_N_LAYER;
-    const std::string main  = predictor_file(s, "main", n_moe, false, dense);
-    const std::string start = variant == PRED_START ? predictor_file(s, "start", n_moe, true, dense) : "";
+    const bool named = dense || loop;
+    const std::string main  = predictor_file(s, "main", n_moe, false, named);
+    const std::string start = variant == PRED_START ? predictor_file(s, "start", n_moe, true, named) : "";
     const std::string dev   = ggml_backend_dev_name(s.fx.devs[0]);
 
     llama_context_params cparams = hot_spare_params(s.fx, cache_mib(s.fx));
@@ -857,13 +860,26 @@ static void scn_predictor(scenario_ctx & s, const predictor_variant variant) {
         cparams.moe_cache_predictor_device = dev.c_str();
     }
 
-    if (dense) {
+    if (named) {
+        const uint32_t n_model = (uint32_t) llama_model_n_layer(s.fx.model.get());
         const std::string bare = predictor_file(s, "bare", n_moe, false, false);
         llama_context_params cparams_bare = cparams;
         cparams_bare.moe_cache_predictor = bare.c_str();
         llama_context_ptr lctx(llama_init_from_model(s.fx.model.get(), cparams_bare));
-        s.check(lctx == nullptr, "a file of %u layers that does not name them is refused for a model of %u", n_moe, FIX_N_LAYER);
+        s.check(lctx == nullptr, "a file of %u layers that does not name them is refused for a model of %u", n_moe, n_model);
         std::remove(bare.c_str());
+        g_log.clear();
+    }
+    if (loop && variant == PRED_MAIN) {
+        // a file made for every cache slot: the later passes' slots keep no resident set of their own
+        const uint32_t n_slot = (uint32_t) llama_model_n_layer(s.fx.model.get());
+        const std::string slots = predictor_file(s, "slots", n_slot, false, false);
+        llama_context_params cparams_slots = cparams;
+        cparams_slots.moe_cache_predictor = slots.c_str();
+        llama_context_ptr lctx = make_ctx(s.fx, cparams_slots);
+        const llama_moe_cache_counters c = get_counters(lctx.get());
+        s.check(!c.has_predictor, "a file made for the %u cache slots is ignored: the passes share the physical layers' resident sets", n_slot);
+        std::remove(slots.c_str());
         g_log.clear();
     }
 

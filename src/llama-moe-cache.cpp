@@ -994,9 +994,16 @@ struct llama_moe_cache::impl {
         }
         if (n_alias > 0) {
             LLAMA_LOG_INFO("%s: %zu layers run the experts of earlier layers (a looped model), they share their resident experts\n", __func__, n_alias);
-            // a predictor ranks the experts of each layer it was trained on, the passes of a looped layer share one set
-            if (predictor) {
-                LLAMA_LOG_WARN("%s: --moe-cache-predictor is not supported for a looped model, ignored\n", __func__);
+            // a predictor ranks the experts of the layers it names, which for a looped model are the physical layers that
+            // keep the resident sets (its training pools the passes, tools/moe-predictor/prep.py); a file made for the slots
+            // would rank a pass's experts on a layer the cache doesn't keep
+            auto own = [&](const std::unique_ptr<llama_moe_predictor> & p) {
+                return !p || std::all_of(p->layers().begin(), p->layers().end(), [&](int32_t il) {
+                    return il >= 0 && il < (int32_t) alias.size() && alias[il] == il; });
+            };
+            if (!own(predictor) || !own(predictor_start)) {
+                LLAMA_LOG_WARN("%s: the predictor names layers that share another layer's experts (made for the passes of a "
+                    "looped model, not its physical layers), ignored\n", __func__);
                 predictor.reset();
                 predictor_start.reset();
                 hidden_layers.clear();

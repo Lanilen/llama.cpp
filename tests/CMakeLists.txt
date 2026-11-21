@@ -244,9 +244,9 @@ if (NOT WIN32)
         set_tests_properties(test-moe-cache-${arch}-ref PROPERTIES FIXTURES_SETUP moe-cache-ref-${arch} SKIP_RETURN_CODE 77)
         set(scns ${MOE_CACHE_SCENARIOS})
         if (arch STREQUAL "inkling2_loop")
-            # a looped model has no MTP block and takes no predictor; its tiny experts never fill a buffer, and the layer
-            # split counts the cache slots, so every physical layer (and its experts) is on the first device
-            list(REMOVE_ITEM scns small-buffers two-devices mtp kit-mtp kit predictor predictor-start predictor-gain predictor-cap predictor-device)
+            # a looped model has no MTP block; its tiny experts never fill a buffer, and the layer split counts the cache
+            # slots, so every physical layer (and its experts) is on the first device
+            list(REMOVE_ITEM scns small-buffers two-devices mtp kit-mtp)
         endif()
         foreach(scn IN LISTS scns)
             llama_test(test-moe-cache NAME test-moe-cache-${arch}-${scn} LABEL moe
