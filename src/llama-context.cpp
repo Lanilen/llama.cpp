@@ -3228,9 +3228,15 @@ uint32_t llama_context::graph_max_nodes() const {
         }
     }
 
-    // the hot spare MoE cache builds the experts of each layer twice, see llm_graph_context::build_moe_ffn
+    // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
+    // which the per-tensor estimates above do not cover for models with few tensors per layer
+    if (cparams.moe_cache_size > 0) {
+        res += 32u*model.hparams.n_layer_all;
+    }
+
+    // the hot spare builds the experts of each layer twice (see llm_graph_context::build_moe_ffn), on top of the above
     if (cparams.moe_cache_size > 0 && cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_HOT_SPARE) {
-        res += 64u * model.hparams.n_layer();
+        res += 64u*model.hparams.n_layer_all;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
