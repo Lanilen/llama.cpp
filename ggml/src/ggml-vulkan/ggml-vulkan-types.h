@@ -603,6 +603,21 @@ static constexpr std::initializer_list<ggml_op> mm_unary_pattern { GGML_OP_MUL_M
 static constexpr std::initializer_list<ggml_op> ssm_conv_res_scale_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 
 // c*clamp(t/(sqrt(sum_rows(c*c))*a + b), lo, hi), c = x*s or x: Inkling 2's q, k and r clips
+// Inkling 2's depth mix for a ubatch whose query needs no repeat (one token): states = concat(blocks, rms_norm(cur)),
+// scores = states . query, softmax, out = cont(transpose(states)) . weights; the edges as {dst, src slot, src}
+static constexpr std::initializer_list<ggml_op> depth_mix_pattern { GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE,
+                                                                     GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX,
+                                                                     GGML_OP_MUL_MAT };
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_edges {
+    { 1, 1, 0 }, // concat->src[1]   == rms_norm
+    { 2, 0, 1 }, // transpose->src[0] == concat
+    { 3, 0, 2 }, // cont->src[0]     == transpose
+    { 4, 0, 1 }, // mul_mat->src[0]  == concat (the scores)
+    { 5, 0, 4 }, // soft_max->src[0] == the scores
+    { 6, 0, 3 }, // mul_mat->src[0]  == cont (the mix)
+    { 6, 1, 5 }, // mul_mat->src[1]  == soft_max
+};
+
 static constexpr std::initializer_list<ggml_op> clip_rows_scale_pattern { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS,
     GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> clip_rows_pattern { GGML_OP_SQR, GGML_OP_SUM_ROWS,
@@ -1026,6 +1041,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_clip_rows_f32;
+    vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1463,6 +1479,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
+    bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 

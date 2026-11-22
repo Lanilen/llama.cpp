@@ -1,0 +1,137 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Inkling 2's depth mix, attention over the earlier block outputs, one workgroup a token:
+//
+//   states = [blocks (normalized already), rms_norm(cur)]      n_blocks + 1 rows of n_embd
+//   w_q    = softmax(scale * states . query_q)                 for each of the n_query queries
+//   dst_q  = sum_n w_q[n] * states[n]
+//
+// the graph's RMS_NORM, CONCAT, TRANSPOSE + CONT, MUL_MAT, SOFT_MAX and MUL_MAT in one pass
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+#define MAX_STATES  32
+#define MAX_QUERIES 4
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd; uint n_blocks; uint n_query; uint n_tokens;
+    uint nbb1; uint nbb2;           // blocks [n_embd, n_blocks, n_tokens], in elements
+    uint nbc2;                      // cur [n_embd, 1, n_tokens]
+    uint nbq1; uint nbq2; uint nq2; // query [n_embd, n_query, nq2], nq2 = 1 or n_tokens
+    uint nbd1; uint nbd2;           // dst [n_embd, n_query, n_tokens]
+
+    uint b_offset;
+    uint c_offset;
+    uint q_offset;
+    uint d_offset;
+
+    float eps;
+    float scale;
+} p;
+
+layout(binding = 0) readonly buffer B {float data_b[];};
+layout(binding = 1) readonly buffer C {float data_c[];};
+layout(binding = 2) readonly buffer Q {float data_q[];};
+layout(binding = 3) writeonly buffer D {float data_d[];};
+
+shared float red[BLOCK_SIZE * MAX_QUERIES];
+shared float w[MAX_QUERIES * MAX_STATES];
+
+void main() {
+    const uint t   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (t >= p.n_tokens) {
+        return;
+    }
+
+    const uint b_base = p.b_offset + t * p.nbb2;
+    const uint c_base = p.c_offset + t * p.nbc2;
+    const uint q_base = p.q_offset + (t % p.nq2) * p.nbq2;
+    const uint d_base = p.d_offset + t * p.nbd2;
+    const uint n_states = p.n_blocks + 1;
+
+    // the norm of cur
+    float acc = 0.0f;
+    for (uint e = tid; e < p.n_embd; e += BLOCK_SIZE) {
+        const float c = data_c[c_base + e];
+        acc += c * c;
+    }
+    red[tid] = acc;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    const float inv = inversesqrt(red[0] / float(p.n_embd) + p.eps);
+    barrier();
+
+    // the scores of each state against every query, the queries reduced together
+    for (uint n = 0; n < n_states; ++n) {
+        float part[MAX_QUERIES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint e = tid; e < p.n_embd; e += BLOCK_SIZE) {
+            const float s = n < p.n_blocks ? data_b[b_base + n * p.nbb1 + e] : data_c[c_base + e] * inv;
+            [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+                if (q < p.n_query) {
+                    part[q] += s * data_q[q_base + q * p.nbq1 + e];
+                }
+            }
+        }
+        [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+            red[q * BLOCK_SIZE + tid] = part[q];
+        }
+        barrier();
+        [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+                    red[q * BLOCK_SIZE + tid] += red[q * BLOCK_SIZE + tid + s];
+                }
+            }
+            barrier();
+        }
+        if (tid < p.n_query) {
+            w[tid * MAX_STATES + n] = red[tid * BLOCK_SIZE] * p.scale;
+        }
+        barrier();
+    }
+
+    // the softmax of each query's scores
+    if (tid < p.n_query) {
+        float m = -1.0f / 0.0f;
+        for (uint n = 0; n < n_states; ++n) {
+            m = max(m, w[tid * MAX_STATES + n]);
+        }
+        float sum = 0.0f;
+        for (uint n = 0; n < n_states; ++n) {
+            const float x = exp(w[tid * MAX_STATES + n] - m);
+            w[tid * MAX_STATES + n] = x;
+            sum += x;
+        }
+        for (uint n = 0; n < n_states; ++n) {
+            w[tid * MAX_STATES + n] /= sum;
+        }
+    }
+    barrier();
+
+    // the mixes
+    for (uint e = tid; e < p.n_embd; e += BLOCK_SIZE) {
+        float mixed[MAX_QUERIES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint n = 0; n < n_states; ++n) {
+            const float s = n < p.n_blocks ? data_b[b_base + n * p.nbb1 + e] : data_c[c_base + e] * inv;
+            [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+                mixed[q] += w[q * MAX_STATES + n] * s;
+            }
+        }
+        [[unroll]] for (uint q = 0; q < MAX_QUERIES; ++q) {
+            if (q < p.n_query) {
+                data_d[d_base + q * p.nbd1 + e] = mixed[q];
+            }
+        }
+    }
+}

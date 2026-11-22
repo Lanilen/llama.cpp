@@ -4086,6 +4086,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_clip_rows_f32, "clip_rows_f32", clip_rows_f32_len, clip_rows_f32_data, "main", 3, sizeof(vk_op_clip_rows_push_constants), {1, 1, 1}, { 128 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_depth_mix_f32, "depth_mix_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, { 256 }, 1);
 
     const uint32_t top_k_mask_wg = std::min({256u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
     ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {top_k_mask_wg}, 1);
@@ -8247,6 +8248,41 @@ static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
         elements = { nr, 1, 1 };
     }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, s_buf, d_buf }, pc, elements);
+}
+
+// a fused depth mix (depth_mix_pattern starting at node_idx), one workgroup a token
+static void ggml_vk_depth_mix(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * rms    = cgraph->nodes[node_idx];
+    const ggml_tensor * concat = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scores = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * sm     = cgraph->nodes[node_idx + 5];
+    ggml_tensor       * dst    = cgraph->nodes[node_idx + 6];
+    const ggml_tensor * cur    = rms->src[0];
+    const ggml_tensor * blocks = concat->src[0];
+    const ggml_tensor * query  = scores->src[1];
+    VK_LOG_DEBUG("ggml_vk_depth_mix(" << blocks << ", " << cur << ", " << query << ", " << dst << ")");
+
+    vk_pipeline pipeline = ctx->device->pipeline_depth_mix_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, blocks, true);
+    const vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, cur, true);
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, query, true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    vk_op_depth_mix_push_constants pc = {
+        (uint32_t)cur->ne[0], (uint32_t)blocks->ne[1], (uint32_t)query->ne[1], (uint32_t)cur->ne[2],
+        ggml_vk_nb_elem(blocks, 1), ggml_vk_nb_elem(blocks, 2),
+        ggml_vk_nb_elem(cur, 2),
+        ggml_vk_nb_elem(query, 1), ggml_vk_nb_elem(query, 2), (uint32_t)query->ne[2],
+        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2),
+        get_misalign_bytes(ctx, blocks) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, cur) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, query) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
+        ggml_get_op_params_f32(rms, 0), ggml_get_op_params_f32(sm, 0),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { b_buf, c_buf, q_buf, d_buf }, pc, { (uint32_t)cur->ne[2], 1, 1 });
 }
 
 void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -13805,7 +13841,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_RMS_NORM:
-        ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
+        if (ctx->fused_depth_mix) {
+            ggml_vk_depth_mix(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
+        }
         break;
     case GGML_OP_RMS_NORM_BACK:
         ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
@@ -15075,6 +15115,47 @@ static bool ggml_vk_can_fuse_clip_rows(const struct ggml_cgraph * cgraph, int no
     return true;
 }
 
+// depth_mix_pattern at node_idx: f32 throughout, the blocks and cur in rows of n_embd, at most 32 states and 4 queries, a
+// softmax without mask or ALiBi; GGML_VK_DISABLE_DEPTH_MIX turns it off
+static bool ggml_vk_can_fuse_depth_mix(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_DEPTH_MIX") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const int last = node_idx + (int) depth_mix_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, depth_mix_pattern, { last }) || !ggml_check_edges(cgraph, node_idx, depth_mix_edges)) {
+        return false;
+    }
+    const ggml_tensor * rms    = cgraph->nodes[node_idx];
+    const ggml_tensor * concat = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scores = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * sm     = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * out    = cgraph->nodes[last];
+    const ggml_tensor * cur    = rms->src[0];
+    const ggml_tensor * blocks = concat->src[0];
+    const ggml_tensor * query  = scores->src[1];
+    for (int i = node_idx; i <= last; ++i) {
+        if (cgraph->nodes[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t n_embd = cur->ne[0], n_tokens = cur->ne[2];
+    if (ggml_get_op_params_i32(concat, 0) != 1 || sm->src[1] != nullptr || ggml_get_op_params_f32(sm, 1) != 0.0f) {
+        return false;
+    }
+    if (cur->type != GGML_TYPE_F32 || cur->nb[0] != sizeof(float) || cur->ne[1] != 1 || cur->ne[3] != 1 ||
+        blocks->type != GGML_TYPE_F32 || blocks->nb[0] != sizeof(float) || blocks->ne[0] != n_embd || blocks->ne[2] != n_tokens || blocks->ne[3] != 1 ||
+        blocks->ne[1] + 1 > 32 ||
+        query->type != GGML_TYPE_F32 || query->nb[0] != sizeof(float) || query->ne[0] != n_embd || query->ne[1] > 4 || query->ne[3] != 1 ||
+        (query->ne[2] != 1 && query->ne[2] != n_tokens)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(out) || out->ne[0] != n_embd || out->ne[1] != query->ne[1] || out->ne[2] != n_tokens) {
+        return false;
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -16003,11 +16084,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_mm_post = false;
         ctx->fused_clip_rows = false;
+        ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = 0;
-            if (ggml_vk_can_fuse_clip_rows(cgraph, i, true) || ggml_vk_can_fuse_clip_rows(cgraph, i, false)) {
+            if (ggml_vk_can_fuse_depth_mix(cgraph, i)) {
+                ctx->num_additional_fused_ops = (int) depth_mix_pattern.size() - 1;
+                ctx->fused_depth_mix = true;
+                fusion_string = "DEPTH_MIX";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_clip_rows(cgraph, i, true) || ggml_vk_can_fuse_clip_rows(cgraph, i, false)) {
                 ctx->num_additional_fused_ops = cgraph->nodes[i]->op == GGML_OP_MUL ? (int) clip_rows_scale_pattern.size() - 1
                                                                                      : (int) clip_rows_pattern.size() - 1;
                 ctx->fused_clip_rows = true;
@@ -16285,6 +16372,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_mm_post = false;
                 ctx->fused_clip_rows = false;
+                ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -16564,7 +16652,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (ggml_vk_is_mm_unary_at(graph, first_unused) && keep_pattern(mm_unary_pattern)) {
             continue;
         }
-        if (keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern)) {
+        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern)) {
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -16632,6 +16720,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(snake_pattern, j) ||
                 (match_pattern(mm_scale_unary_pattern, j) && ggml_vk_is_mm_post_at(graph, j)) ||
                 (match_pattern(mm_unary_pattern, j) && ggml_vk_is_mm_unary_at(graph, j)) ||
+                match_pattern(depth_mix_pattern, j) ||
                 match_pattern(clip_rows_scale_pattern, j) || match_pattern(clip_rows_pattern, j) ||
                 match_pattern(ssm_conv_res_scale_pattern, j) ||
                 in_qsa_pattern(j) ||

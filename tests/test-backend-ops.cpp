@@ -8326,6 +8326,45 @@ struct test_clip_rows : public test_case {
     }
 };
 
+// Inkling 2's depth mix: attention over the earlier block outputs (normalized) and the current state, as
+// llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses one token's (DEPTH_MIX)
+struct test_depth_mix : public test_case {
+    const int64_t n_embd, n_blocks, n_query, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_blocks, n_query, n_tokens);
+    }
+
+    test_depth_mix(int64_t n_embd = 2304, int64_t n_blocks = 4, int64_t n_query = 3, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_blocks(n_blocks), n_query(n_query), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * blocks = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_blocks, n_tokens);
+        ggml_set_name(blocks, "blocks");
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_query);
+        ggml_set_name(query, "query");
+
+        ggml_tensor * states = ggml_rms_norm(ctx, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), 1e-6f);
+        states = ggml_concat(ctx, blocks, states, 1);
+        ggml_tensor * queries = n_tokens == 1 ? query :
+            ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_query, n_tokens));
+        ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf((float) n_embd), 0.0f);
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MUL_MAT -> tanh or sigmoid, no SCALE between (Inkling 2's loop controllers and attention gate)
 struct test_mul_mat_unary : public test_case {
     const ggml_type type;
@@ -13638,6 +13677,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int64_t n_embd : { 64, 2304 }) {
+        for (int64_t n_blocks : { 1, 4, 8 }) {
+            for (int64_t n_query : { 1, 3 }) {
+                test_cases.emplace_back(new test_depth_mix(n_embd, n_blocks, n_query, 1));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_depth_mix(2304, 4, 3, 5));   // a prompt's: repeated queries, not fused
 
     for (bool with_bias : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,
