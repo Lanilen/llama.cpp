@@ -13,8 +13,9 @@ What the fork adds for it:
   five fusions ([Inkling 2's small ops](moe-hot-spare.md#inkling-2s-small-ops)).
 - **The hot spare cache keeps one resident set per physical layer,** so an expert cached for one pass serves the
   other two ([Looped models](moe-hot-spare.md#looped-models)).
-- **An expert predictor trained for it,** on 161 traces ([its results](moe-predictor.md#inkling-2-mini)), on Hugging
-  Face as [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor).
+- **An expert predictor trained for it,** on 718 traces ([its results](moe-predictor.md#inkling-2-mini)), on Hugging
+  Face as [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor),
+  for requests through the chat template.
 - **Upstream's loop fix** (#32704, taken ahead of the next merge), without which the later passes run NVFP4 experts
   without their scales.
 
@@ -49,9 +50,15 @@ in the setup below against 27–28.5) at a cost in quality: perplexity 6.30 agai
 
 **Without upstream's loop fix** the UD files give wrong output: perplexity 95.8 against 6.22 on a 768-token text.
 
-**The predictor:** `inkling2-pred-v3.moepred` and its start file `inkling2-start-v3.moepred` from
+**The predictor:** `inkling2-pred-v5.moepred` and its start file `inkling2-start-v5.moepred` from
 [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor). It was
 trained on the routing of ggml-org's Q8_0 and serves the UD files as well.
+
+**It is made for the chat template:** llama-server's chat endpoint, or `llama-cli` in conversation mode. On raw
+completion (`llama-completion -no-cnv`, or the server's `/completion` with a plain prompt) it makes the cache 2–3%
+slower than without it: a continued document keeps its prompt's topic, so there is no new turn to predict, and the
+cache's own recent counts already hold its experts ([Raw completion](moe-predictor.md#raw-completion)). Leave out
+`--moe-cache-predictor` and `--moe-cache-predictor-start` there.
 
 ## A 6–12 GB NVIDIA GPU: 14600KF + RTX 4070 Ti
 
@@ -64,7 +71,7 @@ GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 LLAMA_GRAPH_CACHE=8 \
 llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   -ngl 99 -ot _exps=CPU --no-op-offload -t 6 -c 16384 -b 512 -ub 512 \
   --moe-cache-mode hot-spare --moe-cache-mib 3500 --moe-cache-resize --moe-cache-batch 16384 \
-  --moe-cache-predictor inkling2-pred-v3.moepred --moe-cache-predictor-start inkling2-start-v3.moepred \
+  --moe-cache-predictor inkling2-pred-v5.moepred --moe-cache-predictor-start inkling2-start-v5.moepred \
   --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8
 ```
 
@@ -78,7 +85,7 @@ included; two passes of chat requests, 256 tokens each).
 | `-t 6` | the performance cores. More threads put work on the efficiency cores, and every expert op waits for the slowest thread (below) |
 | `-b 512 -ub 512`, `--moe-cache-batch 16384` | prompts keep the hot spare: the cache is released for a batch larger than `--moe-cache-batch`, judged on the whole batch the server hands over |
 | `--moe-cache-mib 3500` | the hot spare's size (below) |
-| the predictor | 66.0% of the selections served against 62.7% without it |
+| the predictor | 66.0% of the selections served against 62.7% without it (version 3) |
 | `GOMP_SPINCOUNT`, `GGML_CPU_MMID_FLAT`, `LLAMA_GRAPH_CACHE` | the CPU's threads keep spinning between the expert ops, the CPU's expert rows are cut in one list, a graph is kept per batch length ([FORK.md](../FORK.md#setups) has them for the other setups) |
 
 **The cache size.** Everything but the cache takes about 4 GB with this file, so the cache can be the free VRAM less
@@ -105,7 +112,7 @@ GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 GGML_CPU_MMID_GLU=1 GGML_CPU_MMID
   GGML_VK_FLOPS_PER_SUBMIT=25000000 LLAMA_GRAPH_CACHE=8 \
 llama-server -m Inkling-2-Mini-Q8_0.gguf -dev Vulkan3 -ngl 99 -ot _exps=CPU -t 12 -np 1 \
   --moe-cache-mode hot-spare --moe-cache-mib 5000 --moe-cache-resize \
-  --moe-cache-predictor inkling2-pred-v3.moepred --moe-cache-predictor-start inkling2-start-v3.moepred \
+  --moe-cache-predictor inkling2-pred-v5.moepred --moe-cache-predictor-start inkling2-start-v5.moepred \
   --moe-cache-predictor-device Vulkan3 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8
 ```
 
@@ -120,9 +127,10 @@ without `--no-op-offload`.
 | ggml-org's Q8_0 | 6.4 tok/s, prompt 25 tok/s | 12.9 tok/s, prompt 31 tok/s | 66.7% |
 | Q4_K_M from the Q8_0 | 7.3 tok/s, prompt 26 tok/s | 15.0 tok/s, prompt 45 tok/s | 80.3% |
 
-**With the predictor,** chat requests through llama-server: it serves 5–9 points more of the selections at an
-answer's start and on a conversation's second turn, and generates 2–3% faster
-([the table](moe-predictor.md#live-against-the-plain-hot-spare)).
+**With the predictor,** chat requests through llama-server: it serves 7–10 points more of the selections at an
+answer's start and on a conversation's second turn, and generates 3.2% faster with the Q8_0 and 2.6% with the Q4_K_M
+([the table](moe-predictor.md#live-against-the-plain-hot-spare)). On the document above, without the chat template, it
+serves fewer (61.8% against 66.7% at Q8_0) and a token takes 80.1 ms against 77.5: leave it out for raw completion.
 
 **The last two fusions** (the router in TOPK_MOE, the depth mix) shorten a token by 2.3%: 77.6 → 75.9 ms with the
 Q8_0, 66.6 → 65.0 ms with the Q4_K_M.

@@ -216,13 +216,15 @@ place of 44.1%. The tuning script's search on that layout ends at a balance of 1
 set, with the predictor worth 8.8% at its stage. That layout isn't one of the setups below yet ([its
 results](docs/moe-predictor.md#glm-53-flash)).
 
-**A file for Inkling 2 Mini,** a looped model (layers 6–17 run three passes a token), was trained on 161 traces of the
-Q8_0's routing: chat sessions the model wrote and 80 sessions of raw text, recorded with the model whole on one R9700.
-It ranks the 24 physical layers, and the cache counts a looped layer's prediction once per pass. On held-out answers,
-at the 25 experts a layer that 5000 MiB holds of the Q8_0, it serves 62.4% of the next 128 tokens' selections from an
-answer's start, against 54.5% for the decayed scores. Live on one RX 480 it serves 5–9 points more at an answer's
-start and on a conversation's second turn, and generates 2–3% faster: there a miss costs little against the GPU's chain
-of small ops ([its results](docs/moe-predictor.md#inkling-2-mini)).
+**A file for Inkling 2 Mini,** a looped model (layers 6–17 run three passes a token), was trained on 718 traces of the
+Q8_0's routing: chat sessions the model wrote and 480 sessions of raw text, recorded with the model whole on the
+R9700s. It ranks the 24 physical layers, and the cache counts a looped layer's prediction once per pass. On held-out
+answers, at the 25 experts a layer that 5000 MiB holds of the Q8_0, it serves 62.8% of the next 128 tokens' selections
+from an answer's start, against 54.1% for the decayed scores. Live on one RX 480, in chat, it serves 7–10 points more
+at an answer's start and on a conversation's second turn, and generates 2.6–3.2% faster: there a miss costs little
+against the GPU's chain of small ops. It is made for the chat template: on raw completion, a text continued without
+it, the cache is 2–3% slower with the predictor than without, so it is left out there
+([its results](docs/moe-predictor.md#inkling-2-mini)).
 
 ### The CPU's experts
 
@@ -489,11 +491,13 @@ GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 LLAMA_GRAPH_CACHE=8 \
 llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   -ngl 99 -ot _exps=CPU --no-op-offload -t 6 -c 16384 -b 512 -ub 512 \
   --moe-cache-mode hot-spare --moe-cache-mib 3500 --moe-cache-resize --moe-cache-batch 16384 \
-  --moe-cache-predictor inkling2-pred-v3.moepred --moe-cache-predictor-start inkling2-start-v3.moepred \
+  --moe-cache-predictor inkling2-pred-v5.moepred --moe-cache-predictor-start inkling2-start-v5.moepred \
   --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8
 ```
 
-27–28.5 tokens a second generating and 65–70 on a 1.3k-token prompt, in 8.3 GB of VRAM. `--no-op-offload` is needed
+27–28.5 tokens a second generating and 65–70 on a 1.3k-token prompt, in 8.3 GB of VRAM (measured with the predictor's
+version 3; version 5 has the same size and cost). The predictor is for chat requests: for raw completion, leave out
+the two `--moe-cache-predictor` files. `--no-op-offload` is needed
 on NVIDIA, `-t 6` is the CPU's performance cores, and the cache size follows the free VRAM. The guide,
 [docs/inkling2-mini.md](docs/inkling2-mini.md), has why each setting, the sizes for 6 and 8 GB cards, the quants, and
 the RX 480 and R9700 measurements.
