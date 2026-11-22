@@ -481,6 +481,9 @@ Three measurements outside Flash-Next, for models that fit a card:
   of a strided view that Vulkan refused, so 96 SCALEs a token ran on the CPU (194 splits); the rest is three fusions
   for the model's small ops: a row clip (+13%), its conv's residual and scale (+3.6%), and a tanh or sigmoid after a
   mat-vec (+2.5%). Guide [docs/moe-hot-spare.md](docs/moe-hot-spare.md#inkling-2s-small-ops).
+  With its experts in system memory on a GPU of 12 GB or less, run the hot spare with `--no-op-offload` and
+  `--moe-cache-resize`: without them, prompts ask for a compute buffer of 8.5-10 GB, which NVIDIA's driver refuses
+  ([Looped models](docs/moe-hot-spare.md#looped-models)).
 
 ## Tuning a machine
 
