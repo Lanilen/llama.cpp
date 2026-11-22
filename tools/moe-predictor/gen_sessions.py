@@ -6,6 +6,10 @@ for llama-moe-trace --trace-conversation (Python standard library only).
   python gen_sessions.py --plans session-prompts.json --out gen [--url 127.0.0.1:8080] [--prefix sess-]
                          [--max-tokens 700] [--minutes M]
 
+With --raw each plan is one text, sent to /completion without the chat template (a document to continue, or a bare
+prompt, as llama-completion -no-cnv runs it), and the session is written with "raw": true for llama-moe-trace (raw_plans.py
+makes such plans).
+
 Each turn is sent with the whole history, so the server reuses its cached prompt. The sampling is the server's (run it
 with the settings the model is used with, e.g. --temp 1.0 --top-p 0.95 --top-k 20 for Flash-Next): the traces should
 follow the answers the model really writes. Sessions already written (under any prefix) are skipped, so the run can be
@@ -21,6 +25,7 @@ ap.add_argument("--prefix", default="sess-")
 ap.add_argument("--max-tokens", type=int, default=700)
 ap.add_argument("--chat-template-kwargs", default="", help="a JSON object sent with every request and kept in the session's "
                 "file, where llama-moe-trace reads it back, e.g. '{\"reasoning_effort\": \"low\"}' for a model that thinks")
+ap.add_argument("--raw", action="store_true", help="each plan is one text continued through /completion, no chat template")
 ap.add_argument("--minutes", type=float, default=0, help="stop starting new sessions after this long (0: no limit)")
 args = ap.parse_args()
 plans = json.load(open(args.plans))
@@ -37,7 +42,13 @@ for i, turns in enumerate(plans):
         break
     msgs, timings, t0 = [], [], time.time()
     try:
-        for turn in turns:
+        for turn in (turns[:1] if args.raw else []):
+            req = urllib.request.Request(f"{url}/completion", data=json.dumps({"prompt": turn, "n_predict": args.max_tokens}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=3600).read())
+            msgs += [{"role": "user", "content": turn}, {"role": "assistant", "content": r.get("content") or ""}]
+            timings.append(r.get("timings", {}))
+        for turn in ([] if args.raw else turns):
             msgs.append({"role": "user", "content": turn})
             req = urllib.request.Request(f"{url}/v1/chat/completions",
                                          data=json.dumps({"messages": msgs, "max_tokens": args.max_tokens,
@@ -56,7 +67,8 @@ for i, turns in enumerate(plans):
             sys.exit("3 sessions failed in a row, stopping")
         continue
     fails = 0
-    json.dump({"messages": msgs, "timings": timings, **({"chat_template_kwargs": kwargs} if kwargs else {})},
+    json.dump({"messages": msgs, "timings": timings, **({"raw": True} if args.raw else {}),
+               **({"chat_template_kwargs": kwargs} if kwargs and not args.raw else {})},
               open(os.path.join(args.out, f"{args.prefix}{i:03d}.json"), "w"))
     n = sum(t.get("predicted_n", 0) for t in timings)
     s = sum(t.get("predicted_ms", 0) for t in timings) / 1000
