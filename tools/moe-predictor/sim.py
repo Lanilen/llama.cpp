@@ -5,10 +5,13 @@ uploaded again after every large prompt anyway, so that fill costs nothing extra
 predictor scores the experts and up to budget*every swaps are made, best gain first (gain = score of the expert
 brought in minus score of the expert it replaces, in the priority score), at most what each layer can usefully take.
 Hits are counted on every token from the probe on. Swaps land immediately (the live cache: within a token or two).
+pooled: the S x L slots are shared by all layers, as the cache's are: the fill and each swap take the best experts of any
+layer (the scores must then be expected selections, comparable across layers: a looped layer's distribution times its
+passes, see common.RUNS).
 """
 import torch
 
-def replay(ids, S, scores_at, budget, every, t_end, layer_of=None):
+def replay(ids, S, scores_at, budget, every, t_end, layer_of=None, pooled=False):
     """ids: [T, S, K] long (one answer on the GPU), layer_of: [S] the row of the scores of each column (default: the
     identity; a looped layer's passes share a row and its residents); scores_at(t) -> ([L, E] priority scores with t tokens known,
     full): full makes that refresh unlimited (the refill); t = 0 is the initial fill; budget: swaps per token over all
@@ -16,7 +19,10 @@ def replay(ids, S, scores_at, budget, every, t_end, layer_of=None):
     sc, _ = scores_at(0)
     NL, NE = sc.shape
     res = torch.zeros(NL, NE, dtype=torch.bool, device=ids.device)
-    res.scatter_(1, sc.topk(S, dim=1).indices, True)
+    if pooled:
+        res.view(-1)[sc.reshape(-1).topk(S * NL).indices] = True
+    else:
+        res.scatter_(1, sc.topk(S, dim=1).indices, True)
     hits = uses = swaps = 0
     bank = 0.0
     lay = (torch.arange(NL, device=ids.device) if layer_of is None else layer_of.to(ids.device)).view(-1, 1)
@@ -25,7 +31,19 @@ def replay(ids, S, scores_at, budget, every, t_end, layer_of=None):
             bank = min(bank + budget * every, 8 * budget * every + 1)
             sc, full = scores_at(t0)
             n = NL * S if full else int(bank)
-            if n > 0:
+            if n > 0 and pooled:
+                inn = torch.where(res, torch.full_like(sc, -float("inf")), sc).reshape(-1)
+                out = torch.where(res, sc, torch.full_like(sc, float("inf"))).reshape(-1)
+                m = min(n, S * NL, NL * NE - S * NL)
+                vi, ii = inn.topk(m)                             # best outsiders of any layer, best first
+                vo, io = (-out).topk(m)                          # worst residents of any layer, worst first
+                k = min(n, int(((vi + vo) > 0).sum()))
+                if k > 0:
+                    res.view(-1)[ii[:k]] = True
+                    res.view(-1)[io[:k]] = False
+                    bank = bank if full else bank - k
+                    swaps += k
+            elif n > 0:
                 inn = torch.where(res, torch.full_like(sc, -float("inf")), sc)
                 out = torch.where(res, sc, torch.full_like(sc, float("inf")))
                 m = min(n, S, NE - S)

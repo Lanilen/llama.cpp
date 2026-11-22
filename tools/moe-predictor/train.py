@@ -42,6 +42,8 @@ ap.add_argument("--switch-weight", type=float, default=0.0, help="weight samples
 ap.add_argument("--by-source", action="store_true", help="hit rates of the model and the live rule per source of the held-out traces")
 ap.add_argument("--source-input", action="store_true", help="also the answer's source as a one-hot input to the MLP (an "
                 "oracle selector: how much would knowing the kind of conversation add?)")
+ap.add_argument("--layer-weight", choices=("runs", "equal"), default="runs", help="the loss's weight of each layer: the "
+                "layers that run its experts (a looped layer's passes, else 1), or 1 for all (before 11-22)")
 ap.add_argument("--sim", default="", help="swap budgets per token for replays of the held-out answers, e.g. 1.7,8.4")
 args = ap.parse_args()
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,6 +80,7 @@ def load(names):
     return D
 
 LAYER = torch.tensor(LAYER_OF, device=dev).view(1, NS, 1) * NE   # each column's row (a looped layer's passes share one)
+RW = torch.tensor(RUNS, device=dev)                               # [NL] the layers that run each row (common.RUNS)
 SRCS = []   # with --source-input: the sources, in the order of their one-hot input
 
 def src_of(D, a):
@@ -238,7 +241,9 @@ if __name__ == "__main__":
             for H in HS:
                 tgt = target(TR, a, t, H)
                 q = tgt / tgt.sum(-1, keepdim=True).clamp(min=1)
-                ce = -(q * F.log_softmax(model(logp, hid, bucket, H, src_of(TR, a)), -1)).sum(-1).mean(-1)     # [B]
+                ce = -(q * F.log_softmax(model(logp, hid, bucket, H, src_of(TR, a)), -1)).sum(-1)            # [B, NL]
+                lw = RW if args.layer_weight == "runs" else torch.ones_like(RW)
+                ce = (ce * lw).sum(-1) / lw.sum()                                                                   # [B]
                 if args.switch_weight:
                     live = maps[:, 0] / maps[:, 0].sum(-1, keepdim=True).clamp(min=1e-9)
                     tv = 0.5 * (q - live).abs().sum(-1).mean(-1)                               # 0..1 per sample
@@ -271,11 +276,15 @@ if __name__ == "__main__":
                     for r, f in rules.items():
                         m = maps[:, f] if p > 0 or r == "live" else maps[:, 0]
                         sc[r] = m + tie
-                    for name, x in sc.items():
+                    # one pool of S x NL slots, as the cache: the model's distributions times the layers that run them
+                    # (the counts of the rules and the oracle add the passes up already)
+                    pool = {"live": sc["live"], "model": F.softmax(sc["model"], -1) * RW.view(1, NL, 1), "oracle": tgt}
+                    for name, x in list(sc.items()) + [(n + "/p", v) for n, v in pool.items()]:
                         for sn, S in SLOTS.items():
                             k = (H, p, name, sn)
                             r0 = res.setdefault(k, [0.0, 0.0])
-                            r0[0] += float(topk_hits(x, tgt, S)); r0[1] += float(tgt.sum())
+                            hits = topk_hits(x, tgt, S) if not name.endswith("/p") else topk_hits(x.reshape(len(a), -1), tgt.reshape(len(a), -1), S * NL)
+                            r0[0] += float(hits); r0[1] += float(tgt.sum())
                             if args.by_source and sn == "q4" and name in ("live", "model", "oracle"):
                                 for j in range(len(a)):
                                     kk = (H, p, name, TE["src"][int(a[j])])
@@ -289,9 +298,9 @@ if __name__ == "__main__":
                 if (128, p, "oracle", src) in res:
                     cells.append(f"{p}: " + "/".join(f"{100 * res[(128, p, c, src)][0] / res[(128, p, c, src)][1]:.0f}" for c in ("live", "model", "oracle")))
             print(f"  {src:16s} " + "  ".join(cells))
-    cols = ["live", "gen", "gen32", "model", "oracle"]
+    cols = ["live", "gen", "gen32", "model", "oracle", "live/p", "model/p", "oracle/p"]
     for sn, S in SLOTS.items():
-        print(f"=== {sn}: {S} per layer, held-out hit rates, model {'counts' if not args.no_counts else ''}"
+        print(f"=== {sn}: {S} per layer (/p: {S * NL} shared by all layers, as the cache), held-out hit rates, model {'counts' if not args.no_counts else ''}"
               f"{'+' if not (args.no_counts or args.no_hidden) else ''}{'hidden' if not args.no_hidden else ''}")
         print(f"{'H':>5s} {'probe':>6s} {'tokens':>8s} " + " ".join(f"{c:>7s}" for c in cols))
         for H in HS:
@@ -328,7 +337,7 @@ if __name__ == "__main__":
                 logp, maps = features(TE, aa, tt, prior)
                 hid = hidden(TE, aa, tt) if not args.no_hidden else None
                 b = torch.tensor([bidx[min(BUCKETS, key=lambda x: abs(x - t))] for t in grid], device=dev)
-                p = {H: F.softmax(model(logp, hid, b, H, src_of(TE, aa)), -1) for H in HS}
+                p = {H: F.softmax(model(logp, hid, b, H, src_of(TE, aa)), -1) * RW.view(1, NL, 1) for H in HS}
                 live = maps[:, 0] + tie
                 gen = maps[:, MAPS.index("answer")] + tie
                 mix = 0.5 * p[HS[0]] + 0.5 * p[HS[-1]]
@@ -340,11 +349,12 @@ if __name__ == "__main__":
                     at = lambda t, s=s, full=full: (full[t // 16], True) if full is not None and t == 64 else (s[t // 16], False)
                     for sn, S in SLOTS.items():
                         for bud in budgets:
-                            r = replay(ids, S, at, bud, 16, L, LAYER.view(-1) // NE)
-                            x = tot.setdefault((sn, bud, kind), [0, 0, 0])
-                            x[0] += r[0]; x[1] += r[1]; x[2] += r[2]
+                            for pooled in (False, True):
+                                r = replay(ids, S, at, bud, 16, L, LAYER.view(-1) // NE, pooled)
+                                x = tot.setdefault((sn + ("/p" if pooled else ""), bud, kind), [0, 0, 0])
+                                x[0] += r[0]; x[1] += r[1]; x[2] += r[2]
         print(f"replays: {time.time() - t_start:.0f} s")
-        for sn in SLOTS:
+        for sn in [s + x for s in SLOTS for x in ("", "/p")]:
             for bud in budgets:
                 print(f"replay {sn} budget {bud:5.1f} swaps/tok: " + " | ".join(
                     f"{k} {100 * tot[(sn, bud, k)][0] / tot[(sn, bud, k)][1]:5.1f}% ({tot[(sn, bud, k)][2] / (tot[(sn, bud, k)][1] / NS / K):4.1f}/tok)"
