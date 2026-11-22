@@ -211,6 +211,14 @@ The scheduler's offload of host experts for a large batch copies the experts the
 to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
 passes find every expert they select.
 
+**With little VRAM, use `--moe-cache-resize`.** Those whole copies are large: with Inkling 2 Mini's experts in host memory
+(`-ngl 99 -ot _exps=CPU`), a prompt in ubatches of the default size asks for a compute buffer of about 8.5 GB with the
+test Q4_K_M (`-c 2048`, measured on the 14600KF + RTX 4070 Ti, in both cache modes), apparently because the core
+layers' copies stay alive through all three passes. A GPU with less free memory fails to create the context. With
+`--moe-cache-resize` (hot spare mode, which this fork recommends anyway) prompts fit beside the cache: one RX 480 runs
+Inkling that way. `--moe-cache-mode lru`, or a hot spare without resize, needs small ubatches instead (`-ub 16` fits
+on the 4070 Ti). A hot spare without resize also crashes after that failed allocation instead of exiting with the error.
+
 ### Reads from the GPUs
 
 Every split that runs on the CPU first reads its inputs from the GPUs. The prefetch reads the ones an earlier split
