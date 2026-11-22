@@ -838,6 +838,11 @@ physical layers:
   its row, so a core layer's target is the selections of its three passes.
 - The files name the physical layers (`layers` 0 to 23), and the cache ignores a file whose layers include a later
   pass's slot.
+- The predictor gives each physical layer a distribution over its experts, and the cache multiplies a layer's by the
+  number of passes that run it: the experts of all layers compete for one pool of slots, and a core layer's passes
+  select three times as often as a layer that runs once, as the decayed scores count them without a predictor. Scaled
+  alike, the core layers got about the slots of the others: with the true counts of the next 128 tokens in place of a
+  prediction, 4.3 points of hits fewer with 25 slots a layer on average and 2.5 fewer with 43, on the Inkling traces.
 - The hidden layers are slots: `LLAMA_MOE_TRACE_HIDDEN=8,16` reads layers 8 and 16 in the first pass.
 
 `tools/moe-predictor/selftest.py --loop` runs the whole pipeline on made-up traces of a looped model.

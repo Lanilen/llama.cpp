@@ -113,6 +113,7 @@ struct llama_moe_cache_counters {
     bool    has_predictor = false;
     bool    has_start     = false;
     size_t  n_pred        = 0; // predictions
+    std::vector<float> pred_sum;    // [n_layer] the last prediction's expected selections of each layer (0: no prediction)
     size_t  n_start       = 0; // answers' starts ranked by a prediction
     size_t  n_start_all   = 0; // the swaps the predictions asked for at them
     size_t  n_start_made  = 0; // the ones made there (--moe-cache-predictor-answer-cap, -answer-gain)
