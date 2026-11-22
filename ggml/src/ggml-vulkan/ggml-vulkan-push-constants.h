@@ -557,6 +557,7 @@ struct vk_op_topk_moe_push_constants {
     uint32_t with_norm;
     float output_scale;
     float output_bias;
+    float norm_bias; // added to the weights' sum before the clamp (topk_moe_sigmoid_norm_bias_eps), else 0
 };
 
 struct vk_op_add_id_push_constants {
