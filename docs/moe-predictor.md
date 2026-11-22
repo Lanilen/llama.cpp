@@ -51,6 +51,8 @@ was measured to do are in [Available predictors](#available-predictors) and, in 
     - [Offline scores](#offline-scores-1)
     - [The passes in the pool](#the-passes-in-the-pool)
     - [Live, against the plain hot spare](#live-against-the-plain-hot-spare)
+    - [Raw completion](#raw-completion)
+    - [What more traces added](#what-more-traces-added)
     - [Its start predictor](#its-start-predictor-1)
     - [Still to measure](#still-to-measure-1)
 - [The model](#the-model)
@@ -73,7 +75,7 @@ A predictor belongs to one model: its layers, its experts and its router. These 
 |---|---|---|---|---|
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `flashnext-pred-v3.moepred`, and an optional start file, `flashnext-start-v3.moepred` | 1,181 traces of UD-Q4_K_XL's routing, 21.0M tokens | Hugging Face: [Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) | [Qwen3.8-Flash-Next](#qwen38-flash-next) |
 | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `glm53-pred-v1.moepred` | 190 traces of UD-Q3_K_XL's routing, 2.9M tokens | Hugging Face: [Lanilen/GLM-5.3-Flash-Expert-Predictor](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor) | [GLM-5.3-Flash](#glm-53-flash) |
-| [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `inkling2-pred-v3.moepred`, and a start file, `inkling2-start-v3.moepred` | 161 traces of ggml-org's Q8_0's routing, 0.39M tokens | Hugging Face: [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor) | [Inkling 2 Mini](#inkling-2-mini) |
+| [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `inkling2-pred-v5.moepred`, and a start file, `inkling2-start-v5.moepred` | 718 traces of ggml-org's Q8_0's routing, 2.03M tokens | Hugging Face: [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor) | [Inkling 2 Mini](#inkling-2-mini) |
 
 **Qwen3.8-Flash-Next** (`qwen4exp`: 48 MoE layers, 512 experts, 10 used per token).
 - **Version 3,** the third file for this model. Most of this document's measurements are of it or of the file before
@@ -96,12 +98,15 @@ A predictor belongs to one model: its layers, its experts and its router. These 
 
 **Inkling 2 Mini** (`inkling2_loop`: 24 MoE layers of 128 experts, 8 used per token; layers 6–17 run three passes a
 token, so a token makes 48 layers' worth of selections from 24 layers' experts).
-- **Version 3.** The predictor ranks the 24 physical layers, and the cache counts a looped layer's prediction once per
-  pass ([A looped model](#another-model)). Versions 1 and 2 were trained on chat sessions alone; 3 adds raw text.
-- **Quants:** traced on ggml-org's Q8_0. Measured live on Unsloth's UD-Q4_K_XL (the mainline layout) and on a Q4_K_M
-  requantized from the Q8_0.
+- **Version 5.** The predictor ranks the 24 physical layers, and the cache counts a looped layer's prediction once per
+  pass ([A looped model](#another-model)). Versions 1 and 2 were trained on chat sessions alone, 3 added raw text, 4
+  more chat sessions and 5 more raw text.
+- **Quants:** traced on ggml-org's Q8_0. Measured live on a Q4_K_M requantized from the Q8_0, and version 3 on
+  Unsloth's UD-Q4_K_XL (the mainline layout).
 - **In use:** the 14600KF + RTX 4070 Ti setup of [docs/inkling2-mini.md](https://github.com/Lanilen/llama.cpp/blob/polaris/docs/inkling2-mini.md),
   and one RX 480.
+- **Chat only:** it is made for requests through the chat template. On raw completion it makes the cache slower, so
+  leave it out there ([Raw completion](#raw-completion)).
 - **With its start file:** every live measurement below ran with both files.
 
 A published repository holds the file, the test vectors for `llama-moe-predictor-check` and a card with the command
@@ -212,14 +217,14 @@ machine, use [`moe-hot-spare-tune.py`](../tools/moe-trace/README.md#tuning-a-mac
 
 ### At a glance
 
-| | Qwen3.8-Flash-Next, version 3 | GLM-5.3-Flash, version 1 | Inkling 2 Mini, version 3 |
+| | Qwen3.8-Flash-Next, version 3 | GLM-5.3-Flash, version 1 | Inkling 2 Mini, version 5 |
 |---|---|---|---|
-| traces behind it | 1,181 (34,603 answers) | 190 (4,882 answers) | 161 (547 answers) |
+| traces behind it | 1,181 (34,603 answers) | 190 (4,882 answers) | 718 (2,879 answers) |
 | experts per layer the cache holds | 164 of 512 (32%), UD-Q4_K_XL | 53 of 288 (18%), UD-Q3_K_XL | 25 of 128 (20%), Q8_0 in 5000 MiB |
-| **offline,** at an answer's start: decayed scores → predictor | 75.8% → **86.7%** | 44.2% → **53.0%** | 54.5% → **62.4%** |
-| best possible in hindsight | 95.7% | 65.4% | 70.1% |
-| **live,** selections served by the cache | 74.5% → 80.5% | 44.1% → 51.6% | 55.8% → 61.0% (a chat request, cold) |
-| **live,** speed | −23.6% a verify step after a prompt, −5.1% in long answers | −10.6% a verify step over the test's seven requests | +2–3% generation (no drafts) |
+| **offline,** at an answer's start: decayed scores → predictor | 75.8% → **86.7%** | 44.2% → **53.0%** | 54.1% → **62.8%** |
+| best possible in hindsight | 95.7% | 65.4% | 70.2% |
+| **live,** selections served by the cache | 74.5% → 80.5% | 44.1% → 51.6% | 55.8% → 63.5% (a chat request, cold) |
+| **live,** speed | −23.6% a verify step after a prompt, −5.1% in long answers | −10.6% a verify step over the test's seven requests | +2.6–3.2% generation in chat (no drafts); −3% on raw completion |
 | measured on | 1920X + R9700, [rung 4 of the ladder](#the-predictor-against-the-decayed-scores) | 1920X + R9700x2, [its own test](#live-against-the-decayed-scores) | 1920X + one RX 480, [its own test](#live-against-the-plain-hot-spare) |
 
 The two live columns are different tests: other requests, and Flash-Next's answers start with the swaps a gain of 8
@@ -554,86 +559,124 @@ predictor stage, with 2 drafts and before the just-in-time uploads, by the balan
 
 ### Inkling 2 Mini
 
-The measurements of version 3 for Inkling 2 Mini. The file is on Hugging Face:
-[Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor).
+The measurements of version 5 for Inkling 2 Mini, unless a paragraph names another version. The file is on Hugging
+Face: [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor).
 
 - **The loop.** Layers 6–17 run three passes a token, each with its own attention and state but the same experts. The
   hot spare keeps one resident set per physical layer, and the predictor predicts the 24 physical layers: a looped
   layer's prediction counts three times in the cache's ranking, as its decayed scores do.
 - **The cache is small against the model:** at 5000 MiB, 25 experts of a layer's 128 with the Q8_0 and 43 with a
   4-bit quant, in one pool of slots that the looped layers draw more of.
+- **Made for the chat template.** Its gain is at the start of an answer, where a new turn needs other experts than the
+  last one. On raw completion it makes the cache slower ([Raw completion](#raw-completion)).
 
 #### Its data
 
-- **161 traces,** 389k tokens and 547 answers, recorded with the Q8_0 whole on one R9700 of the 1920X + R9700x2.
-- **79 sessions the model wrote itself,** on the corpus's first messages: 52 at `reasoning_effort` 0.1, 27 at its
-  default, which thinks longer. Two conversations of the corpus read as given.
-- **80 raw-text sessions** (`gen_sessions.py --raw`): 40 starts of documents to continue and 40 bare prompts, answered
-  through `/completion` without the chat template, 512 tokens each: 41k of the 286k answer tokens.
-- **Split:** every 5th trace of each source is held out, 91 answers; 453 train it.
-- **Training** took 39 s on one R9700 (6 epochs) and the start file 8 s more. The exported files agree with PyTorch to
-  1.3e-7 and 3.0e-7 on their 24 test vectors, at 0.62 and 0.48 ms a prediction on the CPU.
+- **718 traces,** 2.03M tokens and 2,879 answers, recorded with the Q8_0 whole on the R9700s of the 1920X + R9700x2.
+- **213 sessions the model wrote itself,** on the corpus's first messages, through the chat template: 149 at
+  `reasoning_effort` 0.1, 64 at its default, which thinks longer. 25 conversations of the corpus read as given.
+- **480 raw-text sessions** (`gen_sessions.py --raw`): 240 starts of documents to continue and 240 bare prompts,
+  answered through `/completion` without the chat template, 512 tokens each.
+- **Split:** every 5th trace of each source is held out, 306 answers; 2,573 train it. A source's split doesn't move
+  when traces of other sources are added, so the versions compare on the same held-out answers.
+- **Training** took 157 s on one R9700 (6 epochs) and the start file 19 s more. The exported files agree with PyTorch
+  to 3.0e-7 and 2.2e-7 on their 24 test vectors, at 0.56 and 0.43 ms a prediction on the CPU.
 
 #### Offline scores
 
-On the 91 held-out answers, the next 128 tokens' selections. *Per layer* gives every layer its 25 experts; *pooled*
+On the 306 held-out answers, the next 128 tokens' selections. *Per layer* gives every layer its 25 experts; *pooled*
 gives the layers 600 slots between them, as the cache does, so the looped layers hold more:
 
 | tokens into the answer | decayed scores, per layer | predictor, per layer | hindsight, per layer | decayed scores, pooled | predictor, pooled | hindsight, pooled |
 |---|---|---|---|---|---|---|
-| 0 (the answer's start) | 54.5% | **62.4%** | 70.1% | 60.1% | **67.3%** | 74.7% |
-| 64 | 60.3% | 61.8% | 70.3% | 65.7% | 67.0% | 74.9% |
-| 256 | 59.6% | 60.9% | 69.6% | 65.2% | 66.5% | 74.3% |
+| 0 (the answer's start) | 54.1% | **62.8%** | 70.2% | 59.8% | **67.7%** | 74.7% |
+| 64 | 60.2% | 62.1% | 69.9% | 65.5% | 67.4% | 74.5% |
+| 256 | 59.7% | 61.4% | 69.5% | 65.3% | 66.9% | 74.2% |
 
 - **The same shape as the other models':** furthest ahead at the answer's start, and the decayed scores catch up.
-- **At 43 experts a layer, pooled** (a 4-bit quant in 5000 MiB): 76.1% → 82.1% at the start, against 88.7% in
+- **At 43 experts a layer, pooled** (a 4-bit quant in 5000 MiB): 75.5% → 82.2% at the start, against 88.6% in
   hindsight.
-- **By source,** pooled at 43: chat 75–77% → 83% at the start; a raw document 81% → 81%, a bare prompt 72% → 73%.
-  Raw text has no turn to predict across: a document's continuation keeps the prompt's topic, so the decayed scores
-  already hold its experts. The raw traces add 1–2 points later in raw answers and change nothing on chat.
+- **By source,** at 43 experts a layer, pooled, at the start: chat 75–77% → 84–86%; a raw document 75–81% →
+  80–82%, a bare prompt 71–72% → 74–75%, against 86–90% in hindsight for both.
 
 #### The passes in the pool
 
 The cache ranks all layers' experts in one pool. The predictor gives each physical layer a distribution, which the
 cache multiplies by the passes that run the layer; scaled like a layer that runs once, the looped layers got about the
 slots of the others. With the true counts of the next 128 tokens in place of a prediction, that cost 4.3 points of
-hits at 25 experts a layer and 2.5 at 43. Live on one RX 480, a document to continue: 59.0% → 64.1% of the
-selections served (Q8_0) and 74.5% → 78.4% (Q4_K_M) once fixed.
+hits at 25 experts a layer and 2.5 at 43. Live on one RX 480, a document to continue: 59.0% → 64.1% of the selections
+served (Q8_0) and 74.5% → 78.4% (Q4_K_M) once fixed.
 
 #### Live, against the plain hot spare
 
 One RX 480 with the 1920X, a 5000 MiB hot spare with `--moe-cache-resize`, llama-server with the chat template,
 temperature 0, 256 tokens a request, both files on the RX 480. A request's hits come from the counters of servers run
-on longer and longer sequences of the same requests (the runs repeat exactly):
+on longer and longer sequences of the same requests:
 
 | request | Q8_0, plain | Q8_0, predictor | Q8_0, generation | Q4_K_M, plain | Q4_K_M, predictor | Q4_K_M, generation |
 |---|---|---|---|---|---|---|
-| cold | 55.8% | **61.0%** | 11.96 → 12.31 tok/s | 66.3% | **72.0%** | 14.05 → 14.42 |
-| after the same request once | 57.8% | **60.8%** | 12.02 → 12.27 | 69.1% | **72.3%** | 14.19 → 14.42 |
-| after a request on another topic | 57.3% | **60.8%** | 12.04 → 12.27 | 69.1% | **72.0%** | 14.19 → 14.42 |
-| the conversation's second turn | 53.3% | **61.8%** | 11.99 → 12.37 | 66.6% | **74.9%** | 14.31 → 14.51 |
+| cold | 55.8% | **63.5%** | 11.96 → 12.47 tok/s | 66.3% | **73.4%** | 14.05 → 14.41 |
+| after the same request once | 57.8% | **63.2%** | 12.02 → 12.37 | 69.1% | **74.1%** | 14.19 → 14.42 |
+| after a request on another topic | 57.3% | **63.6%** | 12.04 → 12.42 | 69.1% | **73.9%** | 14.19 → 14.41 |
+| the conversation's second turn | 53.3% | **63.0%** | 11.99 → 12.38 | 66.6% | **75.9%** | 14.31 → 14.54 |
 
+- **Over the nine answers** of these sequences, generation is 3.2% faster at Q8_0 (11.97 → 12.35 tok/s) and 2.6% at
+  Q4_K_M (14.07 → 14.43). The predictor changes the answers' text a little (GPU and CPU round differently), so the
+  speed is the measure: every answer is 256 tokens.
 - **The second turn is where it pays:** the plain cache holds the first answer's experts there, and the predictor
   ranks for the new turn.
-- **Speed moves less than hits** (+2–3%): on one RX 480 the token waits on the GPU's chain of small ops more than on
-  the CPU's experts. Above 67% hits a miss costs about 0.1 ms.
-- **Raw text, cold** (`llama-completion -no-cnv`, a document to continue): the plain cache is ahead, 66.7% against
-  63.9% at Q8_0. It starts empty and fills free slots with what the answer uses; the predictor restores a full
-  predicted set and then swaps within the budget.
+- **Speed moves less than hits:** on one RX 480 the token waits on the GPU's chain of small ops more than on the CPU's
+  experts. Above 67% hits a miss costs about 0.1 ms.
 - **UD-Q4_K_XL on the 14600KF + RTX 4070 Ti** (3500 MiB, [the setup](https://github.com/Lanilen/llama.cpp/blob/polaris/docs/inkling2-mini.md)):
-  66.0% of the selections served against 62.7% without the predictor, its traces having been of another file.
+  version 3 served 66.0% of the selections against 62.7% without a predictor, its traces having been of another file.
+
+#### Raw completion
+
+A document to continue without the chat template (`llama-completion -no-cnv`, 1,267 tokens of prompt then 255
+generated), on the same RX 480 and cache:
+
+| | plain hot spare | version 3 | version 4 | version 5 |
+|---|---|---|---|---|
+| Q8_0, selections served | **66.7%** | 63.9% | 62.7% | 61.8% |
+| Q8_0, time a token | **77.5 ms** | 79.3 ms | 79.8 ms | 80.1 ms |
+| Q4_K_M, selections served | **80.3%** | 78.8% | 77.5% | 76.7% |
+
+The Q8_0's text is the same in every arm; repeated runs of an arm differ by about 0.3 ms. The predictor costs 2–3% a
+token here, and 400 more raw-text traces didn't change that:
+
+- **No turn to predict across.** A continued document keeps its prompt's topic, so the decayed scores already hold the
+  experts the continuation needs. Offline the predictor is 1–5 points ahead on raw text at an answer's start, against
+  8–10 on chat.
+- **A full predicted set at the start.** Without a predictor a cold cache fills its free slots with what the text uses
+  as it goes; with one it loads the set it predicts, then changes it only within its upload budget.
+
+So it is a predictor for the chat template. For raw completion, run the hot spare without `--moe-cache-predictor`.
+
+#### What more traces added
+
+The three versions on the same 306 held-out answers and the same RX 480 requests:
+
+| | version 3 | version 4 | version 5 |
+|---|---|---|---|
+| traces (raw text among them) | 161 (80) | 318 (80) | 718 (480) |
+| offline, pooled at the start, 25 experts a layer | 66.2% | 67.5% | 67.7% |
+| live, chat, Q8_0 hits cold → second turn | 61.0% → 61.8% | 63.3% → 62.6% | 63.5% → 63.0% |
+| live, chat, generation over nine answers, Q8_0 / Q4_K_M | 12.25 / 14.38 tok/s | 12.35 / 14.40 | 12.35 / 14.43 |
+
+The chat sessions of version 4 added 1–2.5 points; the raw text of version 5 changed nothing offline or live, on chat
+or on raw text.
 
 #### Its start predictor
 
-Over the first 128 tokens of 88 held-out answers, 600 pooled slots: what the cache holds from the turn before serves
-52.3%, the decayed scores at the answer's start 60.1%, the text start 63.2%, against 66.9% at the end of the prompt.
-It was not measured live on its own.
+Over the first 128 tokens of 302 held-out answers, 600 pooled slots: what the cache holds from the turn before serves
+50.1%, the decayed scores at the answer's start 59.8%, the text start 64.0%, against 67.2% at the end of the prompt. It
+was not measured live on its own.
 
 #### Still to measure
 
 - **The start file alone,** live.
-- **More traces,** long ones especially: the recording stopped after three device losses on conversations past 37k
-  tokens.
+- **Longer conversations:** the recording stopped after three device losses on conversations past 37k tokens.
+- **Version 5 on the 14600KF + RTX 4070 Ti** with UD-Q4_K_XL.
 - **A just-in-time upload for a looped layer's later passes:** with the op offload off, a prompt's second and third
   passes compute their experts on the CPU.
 
