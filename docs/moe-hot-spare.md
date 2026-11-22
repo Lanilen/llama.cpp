@@ -211,16 +211,15 @@ The scheduler's offload of host experts for a large batch copies the experts the
 to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
 passes find every expert they select.
 
-**With little VRAM, use `--no-op-offload` and `--moe-cache-resize`.** Those whole copies are large: with Inkling 2
-Mini's experts in host memory (`-ngl 99 -ot _exps=CPU`), a prompt's ubatch of 512 asks for a compute buffer of about
-8.5 GB with the test Q4_K_M at `-c 2048` (9.9 GB at `-c 16384`), in both cache modes, apparently because the core
-layers' copies stay alive through all three passes. RADV lets such a buffer spill into system memory, so one RX 480
-ran it with `--moe-cache-resize`; on the RTX 4070 Ti (12 GB, NVIDIA's driver) the context fails, with or without
-resize. `--no-op-offload` leaves the large batches' experts where they are: the buffer is then 1.8 GB at `-c 16384`,
-and with `--moe-cache-resize` and `-b` equal to `-ub` (the release is decided on the whole batch the server hands
-over), prompts keep the hot spare and `--moe-cache-jit` uploads their experts instead. Without either, `lru` needs
-small ubatches (`-ub 16` fits on the 4070 Ti), and a hot spare without resize crashes after the failed allocation
-instead of exiting with the error.
+**Prompts, with the experts in host memory.** Those whole copies live until the last pass that runs them, so a looped
+layer's experts stay copied through all three: a prompt's ubatch of 512 asks for a compute buffer of about 8.5 GB
+(Inkling 2 Mini, a 4-bit quant, `-c 2048`). RADV lets such a buffer spill into system memory; NVIDIA's driver
+refuses it, with or without resize. `--no-op-offload` leaves a large batch's experts where they are, and the buffer is
+then 1.8 GB at `-c 16384`. The hot spare then runs prompts itself, given `--moe-cache-resize`, a large
+`--moe-cache-batch` and `-b` equal to `-ub`: resize decides on the whole batch the server hands over, so with the
+default `-b 2048` a long prompt would release the cache and leave its experts all to the CPU. `--moe-cache-mode lru`
+needs small ubatches instead (`-ub 16`). The setups are in
+[docs/inkling2-mini.md](https://github.com/Lanilen/llama.cpp/blob/polaris/docs/inkling2-mini.md).
 
 ### Reads from the GPUs
 
@@ -384,36 +383,31 @@ groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU'
 
 *Branch `moe-tuning`.*
 
-Inkling 2 Mini runs about 7000 dispatches a token, most of them tiny ops, and its SITU activation scales the gate and
-the up halves of the merged gate_up: views, which Vulkan's SCALE refused, so the scheduler ran those two scales a layer
-slot on the CPU and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary
-ops do, so the graph stays on the GPU. Three fusions take out about 1500 more dispatches a token:
+Inkling 2 Mini's layers are full of small ops: a depth mix over the earlier blocks before attention and before the
+experts, row clips of q, k and the relative-position query, short convolutions on k, v and the outputs, and in the
+looped layers controllers between passes. A generated token ran about 7,000 dispatches, and two of its ops left the
+GPU. Seven changes:
 
-- a mat-vec MUL_MAT followed directly by a tanh or a sigmoid (the loop controllers' gain and forget, the attention
-  gate), in the mat-vec's store as above;
-- the row clip to an L2 norm after an optional per-channel scale, MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP
-  and MUL (the q, k and r clips), in one shader (`clip_rows.comp`);
-- a short convolution with its residual and scale, SSM_CONV, RESHAPE, ADD and SCALE, as a mode of the conv shader.
+| change | what it does | switch |
+| --- | --- | --- |
+| SCALE through the strides | Inkling's SITU activation scales the gate and up halves of the merged gate_up, which are views. Vulkan's SCALE took only contiguous tensors, so the scheduler ran those scales on the CPU, 96 a token, and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary ops do | none |
+| the depth mix's blocks normalized once | in the graph: each block is normalized once and kept, not at every mix that reads it (120 mixes a token) | none |
+| MUL_MAT → tanh or sigmoid | the loop controllers' gain and forget and the attention gate, in the mat-vec's store ([above](#the-mat-vec-store)) | `GGML_VK_DISABLE_MM_POST=1` |
+| the row clip | MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP and MUL, a row clipped to an L2 norm after an optional per-channel scale, in one shader (`clip_rows.comp`) | `GGML_VK_DISABLE_CLIP_ROWS=1` |
+| the convolution's residual and scale | SSM_CONV, RESHAPE, ADD and SCALE, as a mode of the conv shader | `GGML_VK_DISABLE_CONV_RES=1` |
+| the router in TOPK_MOE | sigmoid, bias, top-k and the weights normalized by their sum in upstream's TOPK_MOE shader, 8 dispatches to 2: Inkling adds an epsilon to the sum (`expert_weights_norm_eps`, a SCALE where the pattern has a CLAMP), which the shader now takes; and MUL_MAT → sigmoid leaves a router's sigmoid to TOPK_MOE (GLM-5.3-Flash's router too) | none |
+| the depth mix of one token | RMS_NORM, CONCAT, TRANSPOSE + CONT, MUL_MAT, SOFT_MAX and MUL_MAT in one shader (`depth_mix.comp`, a workgroup a token: the current state's norm, every state's scores against each query, the softmax, the mix); for one token the graph also drops the query's REPEAT | `GGML_VK_DISABLE_DEPTH_MIX=1` |
 
-The graph itself normalizes the depth mix's blocks once instead of at each of its 120 mixes a token. On the
-1920X + R9700 the Q8_0 runs at 43.6 tokens a second instead of 21.3, prompts of 512 at 1437 instead of 380; the
-SCALE alone gives 37.2, the fusions the rest (the clip about 13%, the convolutions 3.6%, the mat-vec store 2.5%).
-Upstream's ROCm build gives 31.2. The clip sums in another order than the separate ops: the test Q4_K_M's perplexity
-is 4.0683 against 4.0697. `GGML_VK_DISABLE_CLIP_ROWS=1` and `GGML_VK_DISABLE_CONV_RES=1` turn their fusions off,
-`GGML_VK_DISABLE_MM_POST=1` the mat-vec store's.
-
-Two more take a generated token from 5311 dispatches to 4310 (the test Q4_K_M with the hot spare, 14600KF +
-RTX 4070 Ti; on one RX 480 a token's small ops cost about 5 us each, and its 97 graphs 0.23 ms of host time each):
-
-- the router, sigmoid, bias, top-k and the weights normalized by their sum, as upstream's TOPK_MOE shader: Inkling 2
-  adds an epsilon to the sum (`expert_weights_norm_eps`, a SCALE where the pattern had a CLAMP), which the shader now
-  takes, and the MUL_MAT -> sigmoid fusion above leaves a router's sigmoid to TOPK_MOE, which fuses 11 ops to its 2
-  (GLM-5.3-Flash's router too, whose TOPK_MOE that fusion had taken since it landed);
-- the depth mix of a one-token ubatch, RMS_NORM, CONCAT, TRANSPOSE + CONT, MUL_MAT, SOFT_MAX and MUL_MAT, in one
-  shader (`depth_mix.comp`, one workgroup a token: the norm of the current state, its and the blocks' scores against
-  each query, the softmax and the mix); the graph drops the query's REPEAT for one token. Its sums run in another
-  order: the KL divergence of one-token logits from the CPU's is 0.00462 against 0.00485 unfused (0.00431 and 0.00445
-  without fp16, the RX 480's path). `GGML_VK_DISABLE_DEPTH_MIX=1` turns it off.
+**Measured:**
+- **Whole on the 1920X + R9700** (Q8_0, llama-bench), the first five: 43.6 tokens a second instead of 21.3, prompts of
+  512 at 1437 instead of 380. The SCALE alone gives 37.2; the clip about 13% more, the convolutions 3.6%, the mat-vec
+  store 2.5%. Upstream's ROCm build gives 31.2.
+- **The last two,** with the hot spare (a 4-bit quant, its experts in host memory): 5,311 dispatches a generated token
+  become 4,310 on the 14600KF + RTX 4070 Ti, and a token is 2.3% shorter on one RX 480 (Q8_0 77.6 → 75.9 ms, Q4_K_M
+  66.6 → 65.0 ms, the same text).
+- **Rounding:** the clip and the depth mix sum in another order than the separate ops. A 4-bit quant's perplexity is
+  4.0683 against 4.0697 with the clip; with the depth mix, the KL divergence of one-token logits from the CPU's is
+  0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path).
 
 ### Changes that apply without any option
 
