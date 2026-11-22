@@ -470,12 +470,17 @@ VRAM into system memory, and the cache then reads at a fraction of its speed.
 
 ### A model whole on one GPU
 
-Two measurements outside Flash-Next, for models that fit a card:
+Three measurements outside Flash-Next, for models that fit a card:
 - **On an RX 480,** upstream's `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` is worth setting: Qwen3.5-9B UD-Q4_K_XL, alone on the
   machine, generated at 25.9 tok/s against 24.8 (+4%, nine passes), with the same prompt speed and the same answers.
 - **On the R9700, Vulkan or ROCm:** with Qwen3-Coder-30B-A3B UD-Q4_K_XL whole on the card, Vulkan generates faster
   (185 against 116 tok/s) and ROCm reads prompts faster. With Flash-Next's experts on the CPU and no hot spare, the two
   generate at about the same speed (ROCm −1.8% to +4.2%), and ROCm reads prompts 72–90% faster.
+- **Inkling 2 Mini on the R9700** (Q8_0, whole on the card, llama-bench): upstream's Vulkan generates at 18.5 tok/s,
+  the fork at 43.6, upstream's ROCm at 31.2; prompts (pp512) at 390, 1437 and 1467 tok/s. Most of the gain is a SCALE
+  of a strided view that Vulkan refused, so 96 SCALEs a token ran on the CPU (194 splits); the rest is three fusions
+  for the model's small ops: a row clip (+13%), its conv's residual and scale (+3.6%), and a tanh or sigmoid after a
+  mat-vec (+2.5%). Guide [docs/moe-hot-spare.md](docs/moe-hot-spare.md#inkling-2s-small-ops).
 
 ## Tuning a machine
 
