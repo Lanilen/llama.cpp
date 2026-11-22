@@ -8338,6 +8338,12 @@ struct test_depth_mix : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    // as the other mat-mul tests: a prompt's (unfused) mix runs the backend's f32 mat-mul, whose matrix-core paths
+    // round more than the default allows (RDNA4 with a shader compiler that builds them: 1.2e-7)
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
     std::string vars() override {
         return VARS_TO_STR4(n_embd, n_blocks, n_query, n_tokens);
     }
