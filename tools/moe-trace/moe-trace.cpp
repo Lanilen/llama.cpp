@@ -231,68 +231,84 @@ int main(int argc, char ** argv) {
         }
         const json conv = json::parse(fconv);
         const json & msgs = conv.is_object() ? conv.at("messages") : conv;
-        std::vector<common_chat_msg> all;
-        if (!params.system_prompt.empty()) {
-            common_chat_msg msg;
-            msg.role    = "system";
-            msg.content = params.system_prompt;
-            all.push_back(msg);
-        }
-        bool has_reasoning = false;
-        for (const auto & m : msgs) {
-            common_chat_msg msg;
-            msg.role    = m.at("role").get<std::string>();
-            msg.content = m.at("content").get<std::string>();
-            // a model that thinks: its thinking is part of what it generated (gen_sessions.py keeps it)
-            if (m.contains("reasoning_content") && m.at("reasoning_content").is_string()) {
-                msg.reasoning_content = m.at("reasoning_content").get<std::string>();
-                has_reasoning = has_reasoning || !msg.reasoning_content.empty();
+        // a raw session (gen_sessions.py --raw): the prompt and the model's continuation as plain text, without the chat
+        // template, as llama-completion -no-cnv or the server's /completion run them
+        if (conv.is_object() && conv.value("raw", false)) {
+            for (const auto & m : msgs) {
+                const bool assistant = m.at("role").get<std::string>() == "assistant";
+                const auto part = common_tokenize(ctx, m.at("content").get<std::string>(), tokens.empty(), false);
+                const size_t start = tokens.size();
+                tokens.insert(tokens.end(), part.begin(), part.end());
+                segments.push_back({ start, tokens.size(), assistant ? "generated" : "prompt" });
+                if (assistant && start > 0) {
+                    hid_extra.insert((int) start - 1);
+                    hid_extra.insert((int) start);
+                }
             }
-            all.push_back(msg);
-        }
-        // the template's options as the server that wrote the conversation had them: --chat-template-kwargs, then the
-        // conversation's own "chat_template_kwargs" (what gen_sessions.py sent with every request, e.g. reasoning_effort);
-        // earlier answers keep their thinking where the template can (llama-server's default)
-        std::map<std::string, std::string> kwargs = params.default_template_kwargs;
-        if (conv.is_object() && conv.contains("chat_template_kwargs") && conv.at("chat_template_kwargs").is_object()) {
-            for (const auto & kv : conv.at("chat_template_kwargs").items()) {
-                kwargs[kv.key()] = kv.value().dump();
+        } else {
+            std::vector<common_chat_msg> all;
+            if (!params.system_prompt.empty()) {
+                common_chat_msg msg;
+                msg.role    = "system";
+                msg.content = params.system_prompt;
+                all.push_back(msg);
             }
-        }
-        if (has_reasoning && kwargs.find("preserve_reasoning") == kwargs.end()) {
-            kwargs["preserve_reasoning"] = "true";
-        }
-        auto render = [&](size_t n, bool add_generation_prompt) {
-            common_chat_templates_inputs inputs;
-            inputs.use_jinja = params.use_jinja;
-            inputs.chat_template_kwargs = kwargs;
-            inputs.messages.assign(all.begin(), all.begin() + n);
-            inputs.add_generation_prompt = add_generation_prompt;
-            return common_tokenize(ctx, common_chat_templates_apply(chat_templates.get(), inputs).prompt.str(), true, true);
-        };
-        tokens = render(all.size(), false);
+            bool has_reasoning = false;
+            for (const auto & m : msgs) {
+                common_chat_msg msg;
+                msg.role    = m.at("role").get<std::string>();
+                msg.content = m.at("content").get<std::string>();
+                // a model that thinks: its thinking is part of what it generated (gen_sessions.py keeps it)
+                if (m.contains("reasoning_content") && m.at("reasoning_content").is_string()) {
+                    msg.reasoning_content = m.at("reasoning_content").get<std::string>();
+                    has_reasoning = has_reasoning || !msg.reasoning_content.empty();
+                }
+                all.push_back(msg);
+            }
+            // the template's options as the server that wrote the conversation had them: --chat-template-kwargs, then the
+            // conversation's own "chat_template_kwargs" (what gen_sessions.py sent with every request, e.g. reasoning_effort);
+            // earlier answers keep their thinking where the template can (llama-server's default)
+            std::map<std::string, std::string> kwargs = params.default_template_kwargs;
+            if (conv.is_object() && conv.contains("chat_template_kwargs") && conv.at("chat_template_kwargs").is_object()) {
+                for (const auto & kv : conv.at("chat_template_kwargs").items()) {
+                    kwargs[kv.key()] = kv.value().dump();
+                }
+            }
+            if (has_reasoning && kwargs.find("preserve_reasoning") == kwargs.end()) {
+                kwargs["preserve_reasoning"] = "true";
+            }
+            auto render = [&](size_t n, bool add_generation_prompt) {
+                common_chat_templates_inputs inputs;
+                inputs.use_jinja = params.use_jinja;
+                inputs.chat_template_kwargs = kwargs;
+                inputs.messages.assign(all.begin(), all.begin() + n);
+                inputs.add_generation_prompt = add_generation_prompt;
+                return common_tokenize(ctx, common_chat_templates_apply(chat_templates.get(), inputs).prompt.str(), true, true);
+            };
+            tokens = render(all.size(), false);
 
-        // a message starts where the prompt before it ends, for an assistant message after the generation prompt
-        std::vector<size_t> starts;
-        for (size_t k = 0; k < all.size(); ++k) {
-            const bool assistant = all[k].role == "assistant";
-            if (k == 0 && !assistant) {
-                starts.push_back(0);
-                continue;
+            // a message starts where the prompt before it ends, for an assistant message after the generation prompt
+            std::vector<size_t> starts;
+            for (size_t k = 0; k < all.size(); ++k) {
+                const bool assistant = all[k].role == "assistant";
+                if (k == 0 && !assistant) {
+                    starts.push_back(0);
+                    continue;
+                }
+                const auto prefix = render(k, assistant);
+                if (prefix.size() > tokens.size() || !std::equal(prefix.begin(), prefix.end(), tokens.begin()) ||
+                        (!starts.empty() && prefix.size() < starts.back())) {
+                    LOG_WRN("%s: the template renders message %zu differently in the whole conversation, its segment is approximate\n", __func__, k);
+                }
+                starts.push_back(std::min(prefix.size(), tokens.size()));
             }
-            const auto prefix = render(k, assistant);
-            if (prefix.size() > tokens.size() || !std::equal(prefix.begin(), prefix.end(), tokens.begin()) ||
-                    (!starts.empty() && prefix.size() < starts.back())) {
-                LOG_WRN("%s: the template renders message %zu differently in the whole conversation, its segment is approximate\n", __func__, k);
-            }
-            starts.push_back(std::min(prefix.size(), tokens.size()));
-        }
-        for (size_t k = 0; k < all.size(); ++k) {
-            const size_t end = k + 1 < all.size() ? starts[k + 1] : tokens.size();
-            segments.push_back({ starts[k], std::max(end, starts[k]), all[k].role == "assistant" ? "generated" : "prompt" });
-            if (all[k].role == "assistant" && starts[k] > 0) {
-                hid_extra.insert((int) starts[k] - 1);
-                hid_extra.insert((int) starts[k]);
+            for (size_t k = 0; k < all.size(); ++k) {
+                const size_t end = k + 1 < all.size() ? starts[k + 1] : tokens.size();
+                segments.push_back({ starts[k], std::max(end, starts[k]), all[k].role == "assistant" ? "generated" : "prompt" });
+                if (all[k].role == "assistant" && starts[k] > 0) {
+                    hid_extra.insert((int) starts[k] - 1);
+                    hid_extra.insert((int) starts[k]);
+                }
             }
         }
     } else {

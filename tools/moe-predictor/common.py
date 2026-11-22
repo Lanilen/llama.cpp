@@ -20,6 +20,9 @@ NL, NE, K = MODEL["n_layer"], MODEL["n_expert"], MODEL["n_expert_used"]
 # later passes' slots pool on the physical layer they run
 LAYER_OF = MODEL.get("layer_of") or list(range(NL))
 NS = len(LAYER_OF)
+# the layers that run each row's experts: 1, or a looped layer's passes, which all select from its row; the cache
+# ranks the experts of all layers in one pool, so a row's expected selections are its distribution times this
+RUNS = np.bincount(np.asarray(LAYER_OF), minlength=NL).astype(np.float32)
 N_EMBD, HID_LAYERS = MODEL["n_embd"], MODEL["hidden_layers"]
 # the cache sizes to report hit rates at, in resident experts per layer: MOE_PRED_SLOTS=name=n,name=n (Flash-Next's
 # 7860 and 5543 slots on a 32 GB GPU with Q4_K_XL and Q6_K_XL: q4=164,q6=115); by default a third of the experts

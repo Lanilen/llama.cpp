@@ -627,6 +627,13 @@ Two kinds of conversation are worth tracing:
   - `--chat-template-kwargs '{"reasoning_effort": "low"}'` (any JSON object) goes with every request and into the
     session's file, and `llama-moe-trace` renders the session with it. Generate the sessions the ways the model will
     be used: with a model served both ways, some thinking and some not.
+  - `--raw` sends each plan's text to `/completion` without the chat template (as `llama-completion -no-cnv` runs
+    it) and marks the session `"raw": true`, which `llama-moe-trace` reads as plain text. `raw_plans.py` makes such
+    plans from the corpus: `--kind docs` (the start of an article, a story or a code answer, for the model to go on) or
+    `--kind prompts` (a bare request). Write each kind to its own `--out` directory: a session number written under
+    any prefix counts as done. A predictor trained on chat alone ranks raw text worse (Inkling 2 Mini on one RX 480,
+    a document to continue: 64.1% hits against the plain hot spare's 66.7%; through the chat template it wins:
+    61.2% against 55.8% cold, 61.8% against 53.3% on a second turn); `train.py --by-source` scores each source apart.
 - **Datasets read teacher-forced.** Real conversations from public datasets: the model reads the dataset's answers as
   if it had written them. They are cheaper (no generation: about 110 tokens/s traced with hidden rows on the
   1920X + R9700) and much more varied. `build_corpus.py` samples them through the Hugging Face datasets-server API (no
@@ -838,6 +845,11 @@ physical layers:
   its row, so a core layer's target is the selections of its three passes.
 - The files name the physical layers (`layers` 0 to 23), and the cache ignores a file whose layers include a later
   pass's slot.
+- The predictor gives each physical layer a distribution over its experts, and the cache multiplies a layer's by the
+  number of passes that run it: the experts of all layers compete for one pool of slots, and a core layer's passes
+  select three times as often as a layer that runs once, as the decayed scores count them without a predictor. Scaled
+  alike, the core layers got about the slots of the others: with the true counts of the next 128 tokens in place of a
+  prediction, 4.3 points of hits fewer with 25 slots a layer on average and 2.5 fewer with 43, on the Inkling traces.
 - The hidden layers are slots: `LLAMA_MOE_TRACE_HIDDEN=8,16` reads layers 8 and 16 in the first pass.
 
 `tools/moe-predictor/selftest.py --loop` runs the whole pipeline on made-up traces of a looped model.

@@ -24,11 +24,12 @@ ap.add_argument("--rank", type=int, default=128)
 ap.add_argument("--no-text", action="store_true")
 ap.add_argument("--no-hidden", action="store_true")
 ap.add_argument("--save", default="")
+ap.add_argument("--layer-weight", choices=("runs", "equal"), default="runs", help="as train.py's")
 args = ap.parse_args()
 ck = torch.load(args.end)
 argv = sys.argv
 sys.argv = [sys.argv[0], "--hid-last-only", "--rank", str(ck["rank"]), "--horizons", ",".join(map(str, ck["horizons"])),
-            "--probes", ",".join(map(str, ck["buckets"]))]
+            "--probes", ",".join(map(str, ck["buckets"])), "--layer-weight", args.layer_weight]
 import train as T
 from common import split, names, NL, NE, K, Trace, SLOTS, MODEL, N_EMBD, HID_LAYERS
 sys.argv = argv
@@ -98,7 +99,8 @@ for ep in range(args.epochs):
         for H in HS:
             tgt = T.target(TR, a, z0, H)
             q = tgt / tgt.sum(-1, keepdim=True).clamp(min=1)
-            loss = loss - (q * F.log_softmax(model(logp, x, H), -1)).sum(-1).mean()
+            lw = T.RW if args.layer_weight == "runs" else torch.ones_like(T.RW)   # as train.py's --layer-weight
+            loss = loss - ((q * F.log_softmax(model(logp, x, H), -1)).sum(-1) * lw).sum(-1).mean() / lw.sum()
         opt.zero_grad(); loss.backward(); opt.step(); sched.step(); tl += float(loss.detach())
     print(f"epoch {ep}: loss {tl / ((len(perm) + 31) // 32):.4f} ({time.time() - t0:.0f} s)", flush=True)
     if not math.isfinite(tl / ((len(perm) + 31) // 32)):
@@ -119,11 +121,11 @@ with torch.no_grad():
             a = torch.from_numpy(a_te[i:i + 64]).to(dev); z0 = torch.zeros_like(a)
             tgt = T.target(TE, a, z0, H)
             logp, x = pre_inputs(TE, PTE, a)
-            pp = sum(F.softmax(model(logp, x, h), -1) for h in HS)
+            pp = sum(F.softmax(model(logp, x, h), -1) for h in HS) * T.RW.view(1, NL, 1)   # times the layers that run each row
             lp, maps = T.features(TE, a, z0, prior)
             hid = T.hidden(TE, a, z0)
             b = torch.full_like(a, bidx[0])
-            pe = sum(F.softmax(endm(lp, hid, b, h), -1) for h in ck["horizons"])
+            pe = sum(F.softmax(endm(lp, hid, b, h), -1) for h in ck["horizons"]) * T.RW.view(1, NL, 1)
             # shared slots, as the live cache: the S x L experts with the most expected uses
             def sset(p):
                 f = p.view(len(a), -1)
