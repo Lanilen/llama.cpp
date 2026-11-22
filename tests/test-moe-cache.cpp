@@ -928,6 +928,21 @@ static void scn_predictor(scenario_ctx & s, const predictor_variant variant) {
         } else if (variant == PRED_GAIN) {
             s.check(c.n_start_all > 0 && c.n_start_made == 0, "no swap brings 1000 more selections: %zu of %zu made", c.n_start_made, c.n_start_all);
         }
+        if (loop && variant == PRED_MAIN) {
+            // the passes of a looped layer all select from its prediction (a distribution per physical layer), so its
+            // experts expect that many times the selections of a layer that runs once: they rank in one pool
+            float once = 0.0f;
+            for (uint32_t il = 0; il < FIX_N_LAYER && once == 0.0f; il++) {
+                once = fixture_passes(s.fx.arch, il) == 1 && il < c.pred_sum.size() ? c.pred_sum[il] : 0.0f;
+            }
+            bool scaled = once > 0.0f;
+            std::string sums;
+            for (uint32_t il = 0; il < FIX_N_LAYER && il < c.pred_sum.size(); il++) {
+                scaled = scaled && std::fabs(c.pred_sum[il] - once*fixture_passes(s.fx.arch, il)) <= 1e-3f*once*FIX_LOOP_PASSES;
+                sums += string_format("%s%.2f", sums.empty() ? "" : ", ", c.pred_sum[il]);
+            }
+            s.check(scaled, "a looped layer expects %u times the selections of a layer that runs once: %s", FIX_LOOP_PASSES, sums.c_str());
+        }
     }
     std::remove(main.c_str());
     if (!start.empty()) {

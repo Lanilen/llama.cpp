@@ -2628,12 +2628,16 @@ struct llama_moe_cache::impl {
             if (l.ig < 0) {
                 continue;
             }
+            // the predictor's distribution is per physical layer; a looped layer's passes all select from it, so it
+            // expects that many times the selections: the experts of all layers rank in one pool, as the scores
+            // (which add up the passes) do without a predictor
+            const float runs = (float) std::max<ptrdiff_t>(1, std::count(alias.begin(), alias.end(), pl[ip]));
             for (size_t e = 0; e < l.pred.size(); ++e) {
                 float sum = 0.0f;
                 for (const auto & o : pred_out) {
                     sum += o[ip*n_expert + e];
                 }
-                l.pred[e] = scale*sum;
+                l.pred[e] = runs*scale*sum;
             }
         }
         pred_valid = true;
@@ -3720,6 +3724,12 @@ llama_moe_cache_counters llama_moe_cache::counters() const {
     res.has_predictor = p.predictor != nullptr;
     res.has_start     = p.predictor_start != nullptr;
     res.n_pred        = p.n_pred;
+    res.pred_sum.assign(p.layers.size(), 0.0f);
+    for (size_t il = 0; il < p.layers.size() && p.pred_valid; ++il) {
+        for (float x : p.layers[il].pred) {
+            res.pred_sum[il] += x;
+        }
+    }
     res.n_start       = p.n_start;
     res.n_start_all   = p.n_start_all;
     res.n_start_made  = p.n_start_made;

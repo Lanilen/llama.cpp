@@ -211,6 +211,17 @@ The scheduler's offload of host experts for a large batch copies the experts the
 to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
 passes find every expert they select.
 
+**With little VRAM, use `--no-op-offload` and `--moe-cache-resize`.** Those whole copies are large: with Inkling 2
+Mini's experts in host memory (`-ngl 99 -ot _exps=CPU`), a prompt's ubatch of 512 asks for a compute buffer of about
+8.5 GB with the test Q4_K_M at `-c 2048` (9.9 GB at `-c 16384`), in both cache modes, apparently because the core
+layers' copies stay alive through all three passes. RADV lets such a buffer spill into system memory, so one RX 480
+ran it with `--moe-cache-resize`; on the RTX 4070 Ti (12 GB, NVIDIA's driver) the context fails, with or without
+resize. `--no-op-offload` leaves the large batches' experts where they are: the buffer is then 1.8 GB at `-c 16384`,
+and with `--moe-cache-resize` and `-b` equal to `-ub` (the release is decided on the whole batch the server hands
+over), prompts keep the hot spare and `--moe-cache-jit` uploads their experts instead. Without either, `lru` needs
+small ubatches (`-ub 16` fits on the 4070 Ti), and a hot spare without resize crashes after the failed allocation
+instead of exiting with the error.
+
 ### Reads from the GPUs
 
 Every split that runs on the CPU first reads its inputs from the GPUs. The prefetch reads the ones an earlier split
@@ -391,6 +402,19 @@ Upstream's ROCm build gives 31.2. The clip sums in another order than the separa
 is 4.0683 against 4.0697. `GGML_VK_DISABLE_CLIP_ROWS=1` and `GGML_VK_DISABLE_CONV_RES=1` turn their fusions off,
 `GGML_VK_DISABLE_MM_POST=1` the mat-vec store's.
 
+Two more take a generated token from 5311 dispatches to 4310 (the test Q4_K_M with the hot spare, 14600KF +
+RTX 4070 Ti; on one RX 480 a token's small ops cost about 5 us each, and its 97 graphs 0.23 ms of host time each):
+
+- the router, sigmoid, bias, top-k and the weights normalized by their sum, as upstream's TOPK_MOE shader: Inkling 2
+  adds an epsilon to the sum (`expert_weights_norm_eps`, a SCALE where the pattern had a CLAMP), which the shader now
+  takes, and the MUL_MAT -> sigmoid fusion above leaves a router's sigmoid to TOPK_MOE, which fuses 11 ops to its 2
+  (GLM-5.3-Flash's router too, whose TOPK_MOE that fusion had taken since it landed);
+- the depth mix of a one-token ubatch, RMS_NORM, CONCAT, TRANSPOSE + CONT, MUL_MAT, SOFT_MAX and MUL_MAT, in one
+  shader (`depth_mix.comp`, one workgroup a token: the norm of the current state, its and the blocks' scores against
+  each query, the softmax and the mix); the graph drops the query's REPEAT for one token. Its sums run in another
+  order: the KL divergence of one-token logits from the CPU's is 0.00462 against 0.00485 unfused (0.00431 and 0.00445
+  without fp16, the RX 480's path). `GGML_VK_DISABLE_DEPTH_MIX=1` turns it off.
+
 ### Changes that apply without any option
 
 These change behaviour for every model and GPU, with or without the cache:
@@ -418,6 +442,8 @@ sparse-attention shaders and the RDNA4 kernels of other branches): a verify step
 | Vulkan: a mat-vec MUL_MAT followed by SCALE and SiLU or sigmoid runs as one dispatch ([The mat-vec store](#the-mat-vec-store)) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1` |
 | Vulkan: SCALE of a view runs on the GPU ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | none |
 | Vulkan: MUL_MAT followed by tanh or sigmoid, the row clip, and SSM_CONV with its residual and scale run as one dispatch each ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1`, `GGML_VK_DISABLE_CLIP_ROWS=1`, `GGML_VK_DISABLE_CONV_RES=1` |
+| Vulkan: TOPK_MOE takes a sigmoid router whose weights' sum adds an epsilon, and a router's sigmoid goes to TOPK_MOE before MUL_MAT -> sigmoid ([Inkling 2's small ops](#inkling-2s-small-ops)) | Vulkan GPUs, sigmoid routers (Inkling 2, GLM-5.3-Flash) | none |
+| Vulkan: Inkling 2's depth mix of one token runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_DEPTH_MIX=1` |
 | Inkling 2: the depth mix's blocks are normalized once ([Inkling 2's small ops](#inkling-2s-small-ops)) | `inkling2`, `inkling2_loop` | none |
 | Flash-Next's MTP draft: the rows without an output stop after the attention ([The draft's catch-up](#the-drafts-catch-up)) | `qwen4exp` draft heads | `LLAMA_MTP_FFN_ALL=1` |
 
@@ -987,6 +1013,7 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
 | `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid or MUL_MAT → tanh/sigmoid in the mat-vec's store |
 | `GGML_VK_DISABLE_CLIP_ROWS=1` | Vulkan: no fused row clip ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_DEPTH_MIX=1` | Vulkan: no fused depth mix ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONV_RES=1` | Vulkan: no fused SSM_CONV → ADD(residual) → SCALE |
 
 **Diagnostics**

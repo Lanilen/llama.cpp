@@ -253,6 +253,22 @@ struct vk_op_clip_rows_push_constants {
     float clamp_hi;
 };
 
+struct vk_op_depth_mix_push_constants {
+    uint32_t n_embd; uint32_t n_blocks; uint32_t n_query; uint32_t n_tokens;
+    uint32_t nbb1; uint32_t nbb2;
+    uint32_t nbc2;
+    uint32_t nbq1; uint32_t nbq2; uint32_t nq2;
+    uint32_t nbd1; uint32_t nbd2;
+
+    uint32_t b_offset;
+    uint32_t c_offset;
+    uint32_t q_offset;
+    uint32_t d_offset;
+
+    float eps;
+    float scale;
+};
+
 struct vk_op_dsv4_hc_post_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -557,6 +573,7 @@ struct vk_op_topk_moe_push_constants {
     uint32_t with_norm;
     float output_scale;
     float output_bias;
+    float norm_bias; // added to the weights' sum before the clamp (topk_moe_sigmoid_norm_bias_eps), else 0
 };
 
 struct vk_op_add_id_push_constants {
