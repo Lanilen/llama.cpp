@@ -47,6 +47,7 @@ llama.cpp with its defaults to the fork's setup, on one request set per machine:
 - [Setups](#setups)
   - [1920X + R9700](#1920x--r9700)
   - [1920X + RX480x2](#1920x--rx480x2)
+  - [14600KF + RTX 4070 Ti: Inkling 2 Mini](#14600kf--rtx-4070-ti-inkling-2-mini)
   - [A model whole on one GPU](#a-model-whole-on-one-gpu)
 - [Tuning a machine](#tuning-a-machine)
 - [The ladder](#the-ladder)
@@ -177,8 +178,9 @@ slots (`LLAMA_MOE_CACHE_JIT_SLOTS`) can serve large batches.
 
 *Branch `moe-predictor`, guide [docs/moe-predictor.md](docs/moe-predictor.md), with
 [the predictors that exist](docs/moe-predictor.md#available-predictors) and the results of each; the trained files on
-Hugging Face, for [Flash-Next](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) and for
-[GLM-5.3-Flash](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor).*
+Hugging Face, for [Flash-Next](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor), for
+[GLM-5.3-Flash](https://huggingface.co/Lanilen/GLM-5.3-Flash-Expert-Predictor) and for
+[Inkling 2 Mini](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor).*
 
 The cache's scores look back. The predictor is a small learned model (a ~35 MB file of its own) that ranks each layer's
 experts by how often the router will pick them over the next tokens. It reads the same counts plus the input of two
@@ -213,6 +215,14 @@ is 10.6% shorter (198.0 → 177.1 ms over seven requests, every one ahead) and t
 place of 44.1%. The tuning script's search on that layout ends at a balance of 12.19 tok/s against 10.11 for nothing
 set, with the predictor worth 8.8% at its stage. That layout isn't one of the setups below yet ([its
 results](docs/moe-predictor.md#glm-53-flash)).
+
+**A file for Inkling 2 Mini,** a looped model (layers 6–17 run three passes a token), was trained on 161 traces of the
+Q8_0's routing: chat sessions the model wrote and 80 sessions of raw text, recorded with the model whole on one R9700.
+It ranks the 24 physical layers, and the cache counts a looped layer's prediction once per pass. On held-out answers,
+at the 25 experts a layer that 5000 MiB holds of the Q8_0, it serves 62.4% of the next 128 tokens' selections from an
+answer's start, against 54.5% for the decayed scores. Live on one RX 480 it serves 5–9 points more at an answer's
+start and on a conversation's second turn, and generates 2–3% faster: there a miss costs little against the GPU's chain
+of small ops ([its results](docs/moe-predictor.md#inkling-2-mini)).
 
 ### The CPU's experts
 
@@ -328,12 +338,13 @@ cmake --build build-vk -j
 
 ## Setups
 
-Both run Flash-Next with the predictor trained for it (`flashnext-pred-v3.moepred` from
+The first two run Flash-Next with the predictor trained for it (`flashnext-pred-v3.moepred` from
 [Lanilen/Qwen3.8-Flash-Next-Expert-Predictor](https://huggingface.co/Lanilen/Qwen3.8-Flash-Next-Expert-Predictor) on
 Hugging Face) and a hot set saved on the same kind of work (`--moe-cache-save`, then `--moe-cache-hot`). Each is the
 top rung of its [ladder](#the-ladder). The cache, draft and CPU settings come from the tuning script
 ([Tuning a machine](#tuning-a-machine)); the others were set by hand and measured against it.
-[The guide](docs/moe-hot-spare.md#sizing-the-cache) has how to size the cache for other GPUs.
+[The guide](docs/moe-hot-spare.md#sizing-the-cache) has how to size the cache for other GPUs. The third runs Inkling 2
+Mini on a 12 GB NVIDIA GPU, with the cache and thread settings searched by hand.
 
 ### 1920X + R9700
 
@@ -468,6 +479,25 @@ echo 1 | sudo tee $C/pp_dpm_mclk
 Keep the cards awake while a model is loaded, as with the R9700: when an RX 480 runtime-suspends, the driver moves its
 VRAM into system memory, and the cache then reads at a fraction of its speed.
 
+### 14600KF + RTX 4070 Ti: Inkling 2 Mini
+
+Unsloth's UD-Q4_K_XL (the mainline layout) at 16k context, its experts in system memory, with
+[the predictor trained for it](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor):
+
+```bash
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 LLAMA_GRAPH_CACHE=8 \
+llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  -ngl 99 -ot _exps=CPU --no-op-offload -t 6 -c 16384 -b 512 -ub 512 \
+  --moe-cache-mode hot-spare --moe-cache-mib 3500 --moe-cache-resize --moe-cache-batch 16384 \
+  --moe-cache-predictor inkling2-pred-v3.moepred --moe-cache-predictor-start inkling2-start-v3.moepred \
+  --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8
+```
+
+27–28.5 tokens a second generating and 65–70 on a 1.3k-token prompt, in 8.3 GB of VRAM. `--no-op-offload` is needed
+on NVIDIA, `-t 6` is the CPU's performance cores, and the cache size follows the free VRAM. The guide,
+[docs/inkling2-mini.md](docs/inkling2-mini.md), has why each setting, the sizes for 6 and 8 GB cards, the quants, and
+the RX 480 and R9700 measurements.
+
 ### A model whole on one GPU
 
 Three measurements outside Flash-Next, for models that fit a card:
@@ -478,12 +508,8 @@ Three measurements outside Flash-Next, for models that fit a card:
   generate at about the same speed (ROCm −1.8% to +4.2%), and ROCm reads prompts 72–90% faster.
 - **Inkling 2 Mini on the R9700** (Q8_0, whole on the card, llama-bench): upstream's Vulkan generates at 18.5 tok/s,
   the fork at 43.6, upstream's ROCm at 31.2; prompts (pp512) at 390, 1437 and 1467 tok/s. Most of the gain is a SCALE
-  of a strided view that Vulkan refused, so 96 SCALEs a token ran on the CPU (194 splits); the rest is three fusions
-  for the model's small ops: a row clip (+13%), its conv's residual and scale (+3.6%), and a tanh or sigmoid after a
-  mat-vec (+2.5%). Guide [docs/moe-hot-spare.md](docs/moe-hot-spare.md#inkling-2s-small-ops).
-  With its experts in system memory on a GPU of 12 GB or less, run the hot spare with `--no-op-offload` and
-  `--moe-cache-resize`: without them, prompts ask for a compute buffer of 8.5-10 GB, which NVIDIA's driver refuses
-  ([Looped models](docs/moe-hot-spare.md#looped-models)).
+  of a strided view that Vulkan refused, so 96 SCALEs a token ran on the CPU; the rest is fusions of the model's small
+  ops ([docs/inkling2-mini.md](docs/inkling2-mini.md#whole-on-one-gpu-1920x--r9700)).
 
 ## Tuning a machine
 
@@ -712,7 +738,9 @@ What it shows, in the order IQ4_XS on the RX 480s, then Q4 and Q6 on the R9700:
 ## The fork and upstream
 
 The fork follows upstream by merges, never rebases; every branch is at upstream `46eb1742d` (2026-11-21), past
-upstream's `v1.0.0`. The rule for a conflict: where upstream has its own version of something the fork built and it
+upstream's `v1.0.0`, with one later upstream commit taken ahead of the next merge: the loop fix for Inkling 2 Mini
+(#32704, `690b87d88`, cherry-picked onto `moe-hot-spare` with its hash), without which Unsloth's mainline files give
+wrong output. The rule for a conflict: where upstream has its own version of something the fork built and it
 performs about as well in general, upstream's version stays and ours goes; ours stays only where it measures better on
 the real workload.
 

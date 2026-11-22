@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DOCS = ["FORK.md", "README.md", "docs/moe-*.md", "docs/vk-*.md", "tools/moe-trace/README.md", "tools/moe-predictor/README.md"]
+DOCS = ["FORK.md", "README.md", "docs/moe-*.md", "docs/vk-*.md", "docs/inkling2-mini.md", "tools/moe-trace/README.md", "tools/moe-predictor/README.md"]
 CODE_EXT = (".cpp", ".h", ".hpp", ".c", ".py", ".sh", ".cmake", ".comp", ".glsl", ".txt", ".m", ".cu", ".cuh", ".yml", ".toml")
 # the sources whose variables should be documented somewhere
 OWN = ["src/llama-moe-cache.cpp", "src/llama-moe-predictor.cpp", "src/llama-context.cpp", "src/llama-graph.cpp", "common/speculative.cpp",
