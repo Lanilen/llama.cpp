@@ -129,16 +129,25 @@ Q8_0, 66.6 → 65.0 ms with the Q4_K_M.
 
 ## Whole on one GPU: 1920X + R9700
 
-The Q8_0 (27.8 GB) fits a Radeon AI PRO R9700 (32 GB) whole and needs no cache. llama-bench:
+Inkling fits a Radeon AI PRO R9700 (32 GB) whole, so it needs no cache. llama-bench on one R9700, two passes each, the
+fork against upstream llama.cpp at `e300919cc` (2026-11-22), with Vulkan and with ROCm 7.2.4:
 
-| build | generation | prompts of 512 |
-| --- | --- | --- |
-| upstream llama.cpp, Vulkan | 18.5 tok/s | 390 tok/s |
-| upstream llama.cpp, ROCm 7.2.4 | 31.2 tok/s | 1467 tok/s |
-| the fork, Vulkan | 43.6 tok/s | 1437 tok/s |
+| file | build | generation | at depth 2048 | prompts of 512 | at depth 2048 |
+| --- | --- | --- | --- | --- | --- |
+| UD-Q4_K_XL | **the fork** | **48.0–48.2 tok/s** | **47.5–47.8** | 1263–1267 tok/s | **1007–1042** |
+| UD-Q4_K_XL | upstream, Vulkan | 37.1–37.3 | 37.2–37.4 | 1195–1204 | 965–970 |
+| UD-Q4_K_XL | upstream, ROCm | 33.7 | 35.1 | **1278** | 656–657 |
+| Q8_0 | **the fork** | **46.2** | **45.7–45.8** | 1422–1451 | **1101–1105** |
+| Q8_0 | upstream, Vulkan | 36.2 | 36.2 | 1308–1313 | 1043–1045 |
+| Q8_0 | upstream, ROCm | 31.2 | 32.2 | **1453–1458** | 701 |
 
-Upstream's Vulkan is slow here because two scales a layer pass ran on the CPU; the fork's SCALE fix alone gives 37.2
-tokens a second, the fusions the rest ([Inkling 2's small ops](moe-hot-spare.md#inkling-2s-small-ops)).
+- **Generation:** the fork is 28–30% faster than upstream's Vulkan and 43–48% faster than ROCm, from the fusions of
+  the model's small ops ([Inkling 2's small ops](moe-hot-spare.md#inkling-2s-small-ops)).
+- **Prompts:** at 512 tokens ROCm and the fork are within 1–3%; at a depth of 2048 the fork is 57–60% ahead of ROCm.
+- **UD-Q4_K_XL against the Q8_0:** 4% faster at generation, because its dense weights are 8-bit too.
+- **Upstream's own fix for the SCALE of a view** (#32735, after the fork's base) took its Vulkan from 18.5 to 36.2
+  tokens a second on the Q8_0. Before it, two scales a layer pass ran on the CPU, as they did in the fork until its own
+  fix.
 
 ## What a token waits on
 
@@ -170,7 +179,6 @@ Profiled on one RX 480 with the plain hot spare:
 
 ## Still to measure
 
-- **UD-Q4_K_XL on the RX 480 and the R9700.** The RX 480 numbers above are of ggml-org's Q8_0 and the requantized
-  Q4_K_M.
+- **UD-Q4_K_XL on the RX 480.** The RX 480 numbers above are of ggml-org's Q8_0 and the requantized Q4_K_M.
 - **Larger caches on 12 GB cards** on a quiet machine.
 - **A just-in-time upload for a looped layer's later passes in prompts,** where the misses are on the critical path.

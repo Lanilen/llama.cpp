@@ -506,10 +506,10 @@ Three measurements outside Flash-Next, for models that fit a card:
 - **On the R9700, Vulkan or ROCm:** with Qwen3-Coder-30B-A3B UD-Q4_K_XL whole on the card, Vulkan generates faster
   (185 against 116 tok/s) and ROCm reads prompts faster. With Flash-Next's experts on the CPU and no hot spare, the two
   generate at about the same speed (ROCm −1.8% to +4.2%), and ROCm reads prompts 72–90% faster.
-- **Inkling 2 Mini on the R9700** (Q8_0, whole on the card, llama-bench): upstream's Vulkan generates at 18.5 tok/s,
-  the fork at 43.6, upstream's ROCm at 31.2; prompts (pp512) at 390, 1437 and 1467 tok/s. Most of the gain is a SCALE
-  of a strided view that Vulkan refused, so 96 SCALEs a token ran on the CPU; the rest is fusions of the model's small
-  ops ([docs/inkling2-mini.md](docs/inkling2-mini.md#whole-on-one-gpu-1920x--r9700)).
+- **Inkling 2 Mini on the R9700,** whole on the card (llama-bench): with Unsloth's UD-Q4_K_XL the fork generates at
+  48.0 tok/s, upstream's Vulkan at 37.2 and its ROCm at 33.7; prompts of 512 at 1265, 1200 and 1278 tok/s, and at a
+  depth of 2048 at 1007–1042, 965–970 and 656. The Q8_0 alike: 46.2, 36.2 and 31.2 tok/s. The fork's lead is the
+  fusions of the model's small ops ([docs/inkling2-mini.md](docs/inkling2-mini.md#whole-on-one-gpu-1920x--r9700)).
 
 ## Tuning a machine
 
