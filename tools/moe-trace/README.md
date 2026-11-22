@@ -19,6 +19,7 @@ For the [expert predictor](../../docs/moe-predictor.md) a trace also needs:
 
 - `--trace-conversation conversation.json`: a whole conversation (`{"messages": [...]}`) read as one sequence, its prompt
   and answer segments marked in `trace.json` (`segments`), with every token (`tokens`);
+  with `"raw": true` (`gen_sessions.py --raw`) the messages are plain text one after another, no chat template;
 - `LLAMA_MOE_TRACE_HIDDEN=16,32`: the inputs of those layers (float16), every `LLAMA_MOE_TRACE_HIDDEN_STRIDE`-th token
   (default 16) and around each answer's start, in `trace.hid.npy` `[rows, layers, n_embd]`, their positions in
   `trace.json` (`hidden`).

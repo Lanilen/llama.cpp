@@ -279,25 +279,29 @@ if __name__ == "__main__":
                     # one pool of S x NL slots, as the cache: the model's distributions times the layers that run them
                     # (the counts of the rules and the oracle add the passes up already)
                     pool = {"live": sc["live"], "model": F.softmax(sc["model"], -1) * RW.view(1, NL, 1), "oracle": tgt}
+                    def hits_of(name, x, tgt, S):
+                        if not name.endswith("/p"):
+                            return topk_hits(x, tgt, S)
+                        return topk_hits(x.reshape(len(x), -1), tgt.reshape(len(x), -1), S * NL)
                     for name, x in list(sc.items()) + [(n + "/p", v) for n, v in pool.items()]:
                         for sn, S in SLOTS.items():
                             k = (H, p, name, sn)
                             r0 = res.setdefault(k, [0.0, 0.0])
-                            hits = topk_hits(x, tgt, S) if not name.endswith("/p") else topk_hits(x.reshape(len(a), -1), tgt.reshape(len(a), -1), S * NL)
-                            r0[0] += float(hits); r0[1] += float(tgt.sum())
-                            if args.by_source and sn == "q4" and name in ("live", "model", "oracle"):
+                            r0[0] += float(hits_of(name, x, tgt, S)); r0[1] += float(tgt.sum())
+                            if args.by_source and sn == "q4" and name in ("live", "model", "oracle", "live/p", "model/p", "oracle/p"):
                                 for j in range(len(a)):
                                     kk = (H, p, name, TE["src"][int(a[j])])
                                     r1 = res.setdefault(kk, [0.0, 0.0])
-                                    r1[0] += float(topk_hits(x[j:j + 1], tgt[j:j + 1], S)); r1[1] += float(tgt[j].sum())
+                                    r1[0] += float(hits_of(name, x[j:j + 1], tgt[j:j + 1], S)); r1[1] += float(tgt[j].sum())
     if args.by_source:
-        print("=== q4 by source, H 128: live / model / oracle at probes " + ", ".join(map(str, EPROBES)))
-        for src in sorted(set(TE["src"])):
-            cells = []
-            for p in EPROBES:
-                if (128, p, "oracle", src) in res:
-                    cells.append(f"{p}: " + "/".join(f"{100 * res[(128, p, c, src)][0] / res[(128, p, c, src)][1]:.0f}" for c in ("live", "model", "oracle")))
-            print(f"  {src:16s} " + "  ".join(cells))
+        for suf, what in (("", "per layer"), ("/p", "shared by all layers, as the cache")):
+            print(f"=== q4 by source, H 128, slots {what}: live / model / oracle at probes " + ", ".join(map(str, EPROBES)))
+            for src in sorted(set(TE["src"])):
+                cells = []
+                for p in EPROBES:
+                    if (128, p, "oracle" + suf, src) in res:
+                        cells.append(f"{p}: " + "/".join(f"{100 * res[(128, p, c + suf, src)][0] / res[(128, p, c + suf, src)][1]:.0f}" for c in ("live", "model", "oracle")))
+                print(f"  {src:16s} " + "  ".join(cells))
     cols = ["live", "gen", "gen32", "model", "oracle", "live/p", "model/p", "oracle/p"]
     for sn, S in SLOTS.items():
         print(f"=== {sn}: {S} per layer (/p: {S * NL} shared by all layers, as the cache), held-out hit rates, model {'counts' if not args.no_counts else ''}"
