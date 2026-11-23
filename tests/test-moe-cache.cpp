@@ -177,6 +177,13 @@ static void fixture_tensor_data(struct ggml_tensor * tensor, void * userdata) {
         ggml_backend_tensor_set(tensor, zero.data(), 0, ggml_nbytes(tensor));
         return;
     }
+    // the loader creates a per-tensor "<weight>.scale" for many weights, and the graph applies every one it finds: a real
+    // file carries only the ones its model was trained with, so here they are 1 (the per-expert scales stay random)
+    if (tensor->type == GGML_TYPE_F32 && ggml_nelements(tensor) == 1 && strstr(tensor->name, ".scale") != nullptr) {
+        const float one = 1.0f;
+        ggml_backend_tensor_set(tensor, &one, 0, sizeof(one));
+        return;
+    }
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16) {
         set_tensor_data(tensor, userdata);
         return;
