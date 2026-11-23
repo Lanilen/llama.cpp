@@ -3706,6 +3706,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[0][1][i], "rms_norm_mul_f32" + suffix, RMS_SHADER(rms_norm_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[1][0][i], "rms_norm_bf16" + suffix, RMS_SHADER(rms_norm_bf16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[1][1][i], "rms_norm_mul_bf16" + suffix, RMS_SHADER(rms_norm_bf16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
+        ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_concat_f32[i], "rms_norm_concat_f32" + suffix, RMS_SHADER(rms_norm_concat_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         for (uint32_t pm : {0, 1}) {
             const std::string name = pm ? "rms_norm_mul_add_mul" : "rms_norm_mul_add";
             ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_add[0][0][pm][i], name + "_f32" + suffix, RMS_SHADER(rms_norm_mul_add_f32), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, pm, block_size, rms_unroll}, 1, true, rms_subgroups);
@@ -12149,6 +12150,28 @@ static void ggml_vk_rms_norm_finish(ggml_backend_vk_context * ctx, const ggml_te
     }
 }
 
+// a fused CONCAT + RMS_NORM (concat_rms_norm_pattern at node_idx): the norm of each row of [a; b], one workgroup a row
+static void ggml_vk_concat_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    ggml_tensor       * dst    = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * a      = concat->src[0];
+    const ggml_tensor * b      = concat->src[1];
+    VK_LOG_DEBUG("ggml_vk_concat_rms_norm(" << a << ", " << b << ", " << dst << ")");
+
+    vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(a, b, dst, ggml_get_op_params_f32(dst, 0), 0);
+    init_pushconst_tensor_offsets(ctx, pc, a, b, nullptr, nullptr, dst);
+
+    vk_pipeline pipeline = ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_concat_f32, a->ne[0]);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, b, true), d_buf, d_buf }, pc, {
+            2u,
+            std::min((uint32_t) dst->ne[2], ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            std::min((uint32_t) dst->ne[3], ctx->device->properties.limits.maxComputeWorkGroupCount[2]),
+        });
+}
+
 void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
@@ -13796,7 +13819,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        if (ctx->fused_concat_rms_norm) {
+            ggml_vk_concat_rms_norm(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_UPSCALE:
@@ -15171,6 +15198,35 @@ static bool ggml_vk_can_fuse_clip_rows(const struct ggml_cgraph * cgraph, int no
     return true;
 }
 
+// concat_rms_norm_pattern at node_idx: f32, a CONCAT along dim 1 of two single rows of the same length, each with
+// contiguous elements, and its norm contiguous; GGML_VK_DISABLE_CONCAT_RMS_NORM turns it off
+static bool ggml_vk_can_fuse_concat_rms_norm(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_CONCAT_RMS_NORM") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, concat_rms_norm_pattern, { node_idx + 1 })) {
+        return false;
+    }
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    const ggml_tensor * rms    = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * a      = concat->src[0];
+    const ggml_tensor * b      = concat->src[1];
+    if (rms->src[0] != concat || ggml_get_op_params_i32(concat, 0) != 1) {
+        return false;
+    }
+    for (const ggml_tensor * t : { a, b, concat, rms }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
+            return false;
+        }
+    }
+    if (a->ne[1] != 1 || b->ne[1] != 1 || a->ne[0] != b->ne[0] || a->ne[2] != b->ne[2] || a->ne[3] != b->ne[3] ||
+        !ggml_is_contiguous(rms) || !ggml_are_same_shape(rms, concat)) {
+        return false;
+    }
+    return true;
+}
+
 // ctrl_blend_pattern at node_idx: f32 throughout, every operand of dst's 2D shape with contiguous rows (no broadcast);
 // GGML_VK_DISABLE_CTRL_BLEND turns it off
 static bool ggml_vk_can_fuse_ctrl_blend(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16168,6 +16224,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mm_post = false;
         ctx->fused_clip_rows = false;
         ctx->fused_ctrl_blend = false;
+        ctx->fused_concat_rms_norm = false;
         ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -16183,6 +16240,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                                                                      : (int) clip_rows_pattern.size() - 1;
                 ctx->fused_clip_rows = true;
                 fusion_string = "CLIP_ROWS";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_concat_rms_norm(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_concat_rms_norm = true;
+                fusion_string = "CONCAT_RMS_NORM";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_ctrl_blend(cgraph, i)) {
                 ctx->num_additional_fused_ops = (int) ctrl_blend_pattern.size() - 1;
@@ -16464,6 +16526,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mm_post = false;
                 ctx->fused_clip_rows = false;
                 ctx->fused_ctrl_blend = false;
+                ctx->fused_concat_rms_norm = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -16744,7 +16807,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (ggml_vk_is_mm_unary_at(graph, first_unused) && keep_pattern(mm_unary_pattern)) {
             continue;
         }
-        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern)) {
+        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern)) {
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -16823,7 +16886,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 (match_pattern(mm_unary_pattern, j) && ggml_vk_is_mm_unary_at(graph, j)) ||
                 match_pattern(depth_mix_pattern, j) ||
                 match_pattern(clip_rows_scale_pattern, j) || match_pattern(clip_rows_pattern, j) ||
-                match_pattern(ssm_conv_res_scale_pattern, j) || in_ctrl_blend_pattern(j) ||
+                match_pattern(ssm_conv_res_scale_pattern, j) || in_ctrl_blend_pattern(j) || match_pattern(concat_rms_norm_pattern, j) ||
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||

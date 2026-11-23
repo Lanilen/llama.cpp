@@ -633,6 +633,9 @@ static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
     { 6, 0, 5 }, // clamp->src[0]    == div
     { 7, 1, 6 }, // mul->src[1]      == clamp
 };
+// rms_norm(concat(a, b, 1)) of one row each: Inkling 2's loop controller input
+static constexpr std::initializer_list<ggml_op> concat_rms_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM };
+
 // (cur - forget*cur) + gain*message: Inkling 2's loop controller blend; the edges as {dst, src slot, src}
 static constexpr std::initializer_list<ggml_op> ctrl_blend_pattern { GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD };
 static constexpr std::initializer_list<std::array<int, 3>> ctrl_blend_edges {
@@ -979,6 +982,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     // [src/dst 0=fp32,1=bf16][mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm[2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_concat_f32;
     // [src/dst 0=fp32,1=bf16][residual 0=fp32,1=bf16][post mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add[2][2][2];
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -1489,6 +1493,7 @@ struct ggml_backend_vk_context {
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
     bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
+    bool fused_concat_rms_norm {}; // CONCAT RMS_NORM: Inkling 2's controller input, the norm of [cur; message]
     bool fused_ctrl_blend {};   // MUL SUB MUL ADD: Inkling 2's loop controller blend, (cur - forget*cur) + gain*message
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 

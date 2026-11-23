@@ -8424,6 +8424,45 @@ struct test_clip_rows : public test_case {
     }
 };
 
+// Inkling 2's loop controller input, the norm of each row of [cur; message] (CONCAT along dim 1, then RMS_NORM), as
+// llama_model_inkling2::graph::control builds it; the Vulkan backend fuses it (CONCAT_RMS_NORM)
+struct test_concat_rms_norm : public test_case {
+    const int64_t n_embd, n_tokens;
+    const bool msg_view;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_RMS_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, msg_view);
+    }
+
+    test_concat_rms_norm(int64_t n_embd = 2304, int64_t n_tokens = 1, bool msg_view = true)
+        : n_embd(n_embd), n_tokens(n_tokens), msg_view(msg_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * message;
+        if (msg_view) {
+            // one of the loop's message rows, [n_embd, 4, n_tokens]
+            ggml_tensor * messages = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+            ggml_set_name(messages, "messages");
+            message = ggml_view_3d(ctx, messages, n_embd, 1, n_tokens, messages->nb[1], messages->nb[2], 2*messages->nb[1]);
+        } else {
+            message = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+            ggml_set_name(message, "message");
+        }
+        ggml_tensor * out = ggml_rms_norm(ctx, ggml_concat(ctx, cur, message, 1), 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling 2's loop controller blend, (cur - forget*cur) + gain*message, as llama_model_inkling2::graph::control builds
 // it: the message a strided view of the loop's message rows; the Vulkan backend fuses it (CTRL_BLEND)
 struct test_ctrl_blend : public test_case {
@@ -13837,6 +13876,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        for (bool msg_view : { true, false }) {
+            test_cases.emplace_back(new test_concat_rms_norm(2304, n_tokens, msg_view));
+        }
+    }
+    test_cases.emplace_back(new test_concat_rms_norm(100, 7, true));
     for (int64_t n_tokens : { 1, 3, 512 }) {
         for (int ctrl : { 0, 3 }) {
             test_cases.emplace_back(new test_ctrl_blend(2304, n_tokens, ctrl));

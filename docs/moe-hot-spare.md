@@ -388,7 +388,7 @@ groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU'
 Inkling 2 Mini's layers are full of small ops: a depth mix over the earlier blocks before attention and before the
 experts, row clips of q, k and the relative-position query, short convolutions on k, v and the outputs, and in the
 looped layers controllers between passes. A generated token ran about 7,000 dispatches, and two of its ops left the
-GPU. Nine changes:
+GPU. Ten changes:
 
 | change | what it does | switch |
 | --- | --- | --- |
@@ -401,6 +401,7 @@ GPU. Nine changes:
 | the depth mix of one token | RMS_NORM, CONCAT, TRANSPOSE + CONT, MUL_MAT, SOFT_MAX and MUL_MAT in one shader (`depth_mix.comp`, a workgroup a token: the current state's norm, every state's scores against each query, the softmax, the mix); for one token the graph also drops the query's REPEAT | `GGML_VK_DISABLE_DEPTH_MIX=1` |
 | copies and fills a token does not need | in the graph: no CONT of a view that is already one contiguous row (the loop's messages, the mixed Q, K and V inputs), a SWA layer's one mixed input copied once and not three times, the zero sinks filled once a graph, the relative-bias table padded once for each weight (the passes of a looped layer share it), and each attention mask cast to F32 once a graph in batches of up to 16 tokens. After [fast-inkling-mac](https://github.com/newideas99/Fast-Inkling-Mac-Uncensored)'s graph trims (its `patches/0002`) | none |
 | the loop controllers' blend | `cur - forget*cur + gain*message`, MUL, SUB, MUL and ADD, in one elementwise shader (`ctrl_blend.comp`), each step rounded as the separate ops round it. The graph puts the operands first so that the four follow one another, and the Vulkan graph's reordering keeps them together. After [fast-inkling-mac](https://github.com/newideas99/Fast-Inkling-Mac-Uncensored)'s INKLING_CTRL | `GGML_VK_DISABLE_CTRL_BLEND=1` |
+| the loop controllers' input | the norm of `[cur; message]`, CONCAT along dim 1 and RMS_NORM, as a mode of the norm's own shader that reads each row from its source (`rms_norm.comp`, `RMS_NORM_CONCAT_FUSION`): the same block sizes and reduction, so the pair rounds as before, to the bit. After fast-inkling-mac's CTRL_IN | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` |
 
 **Measured:**
 - **Whole on the 1920X + R9700** (Q8_0, llama-bench), the first five: 43.6 tokens a second instead of 21.3, prompts of
@@ -413,7 +414,7 @@ GPU. Nine changes:
   generated token become 4,225, and the GPU's time a token 23.24 ms → 22.55 ms. The answers' speed is within the
   runs' spread there, where the CPU's experts take most of a token.
 - **The controllers' blend,** the same setup: 4,225 dispatches a generated token become 3,937 (96 blends a token, four
-  dispatches each to one), the GPU's time a token about 0.9 ms less. The shader is exact against the CPU's separate ops; in the model, the logits
+  dispatches each to one), the GPU's time a token about 0.9 ms less; with the input's norm, 3,841. The shader is exact against the CPU's separate ops and the same to the bit as the separate Vulkan ops; in the model, the logits
   move a little (a median of 0.39 at 256 one-token positions, the same top token at every one), half of what turning
   the Vulkan graph's reordering off does to the same build (0.79).
 - **Rounding:** the clip and the depth mix sum in another order than the separate ops. A 4-bit quant's perplexity is
@@ -453,6 +454,7 @@ sparse-attention shaders and the RDNA4 kernels of other branches): a verify step
 | Vulkan: TOPK_MOE takes a sigmoid router whose weights' sum adds an epsilon, and a router's sigmoid goes to TOPK_MOE before MUL_MAT -> sigmoid ([Inkling 2's small ops](#inkling-2s-small-ops)) | Vulkan GPUs, sigmoid routers (Inkling 2, GLM-5.3-Flash) | none |
 | Vulkan: Inkling 2's depth mix of one token runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_DEPTH_MIX=1` |
 | Vulkan: Inkling 2's loop controller blend runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CTRL_BLEND=1` |
+| Vulkan: a CONCAT along dim 1 of two single rows followed by RMS_NORM runs as one dispatch (Inkling 2's loop controller input, [Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` |
 | Inkling 2: the depth mix's blocks are normalized once ([Inkling 2's small ops](#inkling-2s-small-ops)) | `inkling2`, `inkling2_loop` | none |
 | Flash-Next's MTP draft: the rows without an output stop after the attention ([The draft's catch-up](#the-drafts-catch-up)) | `qwen4exp` draft heads | `LLAMA_MTP_FFN_ALL=1` |
 
@@ -1024,6 +1026,7 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `GGML_VK_DISABLE_CLIP_ROWS=1` | Vulkan: no fused row clip ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_DEPTH_MIX=1` | Vulkan: no fused depth mix ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CTRL_BLEND=1` | Vulkan: no fused blend of Inkling 2's loop controllers ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` | Vulkan: no fused norm of Inkling 2's loop controller input ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONV_RES=1` | Vulkan: no fused SSM_CONV → ADD(residual) → SCALE |
 
 **Diagnostics**
