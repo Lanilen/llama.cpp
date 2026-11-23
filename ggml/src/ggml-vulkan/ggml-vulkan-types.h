@@ -633,6 +633,11 @@ static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
     { 6, 0, 5 }, // clamp->src[0]    == div
     { 7, 1, 6 }, // mul->src[1]      == clamp
 };
+// Inkling 2's mask with its relative-position bias, as inkling2.cpp and build_attn (llm_graph_input_mem_hybrid_iswa_rel)
+// build it: the table less the sink, gathered by distance bin into [n_kv, n_q, n_head, n_stream], added to the mask, F16
+static constexpr std::initializer_list<ggml_op> bias_mask_pattern { GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
+    GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
+
 // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn builds it (LLM_FFN_SITU)
 static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
     GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
@@ -1109,6 +1114,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_res_scale_f32;
     vk_pipeline pipeline_conv_split_f32[2];   // [without, with] the dynamic taps (conv_split.comp)
     vk_pipeline pipeline_situ_f32;            // Inkling 2's SITU activation (situ.comp)
+    vk_pipeline pipeline_bias_mask_f32_f16;   // Inkling 2's mask with its relative-position bias (bias_mask.comp)
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1516,6 +1522,7 @@ struct ggml_backend_vk_context {
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
     bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
+    bool fused_bias_mask {};       // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY: Inkling 2's biased F16 mask
     bool fused_situ {};            // SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation
     bool fused_conv_split {};      // CONCAT VIEW VIEW CPY SSM_CONV ...: Inkling 2's conv from its two inputs with its state store
     bool fused_concat_rms_norm {}; // CONCAT RMS_NORM: Inkling 2's controller input, the norm of [cur; message]

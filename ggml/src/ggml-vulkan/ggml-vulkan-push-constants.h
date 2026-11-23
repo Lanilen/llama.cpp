@@ -857,6 +857,15 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t res_nb1; float res_scale;   // APPLY_RES_SCALE: the residual's row stride (bytes) and the scale
 };
 
+struct vk_op_bias_mask_push_constants {
+    uint32_t n_kv, n_q, n_head, n_stream;
+    uint32_t t_nb1, t_nb2, t_off;
+    uint32_t s_nb1, s_nb2, s_off;
+    uint32_t r_nb1, r_off;
+    uint32_t m_nb1, m_nb3, m_off;
+    uint32_t d_off;
+};
+
 struct vk_op_situ_push_constants {
     uint32_t ne0, ne1, ne2;
     uint32_t g_nb1, g_nb2, g_off;

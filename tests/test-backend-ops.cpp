@@ -8424,6 +8424,66 @@ struct test_clip_rows : public test_case {
     }
 };
 
+// Inkling 2's attention mask with its relative-position bias, as inkling2.cpp and build_attn (the relative-position
+// input) build it: the table less the sinks, gathered by each cell's distance bin into [n_kv, n_q, n_head], added to
+// the mask and cast to F16; the Vulkan backend fuses it (BIAS_MASK)
+struct test_bias_mask : public test_case {
+    const int64_t n_bins, n_head, n_kv, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "BIAS_MASK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_bins, n_head, n_kv, n_tokens);
+    }
+
+    test_bias_mask(int64_t n_bins = 1025, int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 1)
+        : n_bins(n_bins), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % n_bins;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_bins, n_head, n_tokens);
+        ggml_set_name(table, "table");
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_set_name(sinks, "sinks");
+        ggml_tensor * bins = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_set_name(bins, "bins");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens, 1, 1);
+        ggml_set_name(mask, "mask");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, mask);
+        }
+        table = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, n_head, n_tokens));
+        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+        ggml_tensor * kq_b = ggml_get_rows(ctx, table, bins);
+        kq_b = ggml_reshape_4d(ctx, kq_b, n_head, n_kv, n_tokens, 1);
+        kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));
+        ggml_tensor * out = ggml_cast(ctx, ggml_add(ctx, kq_b, mask), GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling 2's SITU activation of the experts, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn
 // builds it from the halves of the merged gate_up; the Vulkan backend fuses it (SITU)
 struct test_situ : public test_case {
@@ -13982,6 +14042,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int64_t n_tokens : { 1, 3 }) {
+        for (int64_t n_kv : { 256, 1536 }) {
+            test_cases.emplace_back(new test_bias_mask(1025, 24, n_kv, n_tokens));
+        }
+    }
+    test_cases.emplace_back(new test_bias_mask(17, 3, 100, 5));
     for (int64_t n_tokens : { 1, 3, 512 }) {
         test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
     }

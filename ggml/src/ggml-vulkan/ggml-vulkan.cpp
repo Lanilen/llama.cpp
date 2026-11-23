@@ -4314,6 +4314,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_scale_f32, "ssm_conv_res_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_bias_mask_f32_f16, "bias_mask_f32_f16", bias_mask_f32_f16_len, bias_mask_f32_f16_data, "main", 5, sizeof(vk_op_bias_mask_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[0], "conv_split_f32", conv_split_f32_len, conv_split_f32_data, "main", 5, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[1], "conv_split_dyn_f32", conv_split_dyn_f32_len, conv_split_dyn_f32_data, "main", 6, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
@@ -8284,6 +8285,63 @@ static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
 }
 
 static void ggml_vk_conv_split(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx);
+
+// bias_mask_pattern at node_idx: f32 table, sinks and mask, int32 bins, an F16 mask out; the two permutes the graph's
+// (1, 0, 2, 3) and (2, 0, 1, 3); GGML_VK_DISABLE_BIAS_MASK turns it off
+static bool ggml_vk_can_fuse_bias_mask(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_BIAS_MASK") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const int last = node_idx + (int) bias_mask_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, bias_mask_pattern, { last })) {
+        return false;
+    }
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * sub = n[0], * p1 = n[1], * c1 = n[2], * gr = n[3], * rs = n[4], * p2 = n[5], * c2 = n[6], * add = n[7], * cpy = n[8];
+    const ggml_tensor * table = sub->src[0], * sinks = sub->src[1], * bins = gr->src[1], * mask = add->src[1];
+    if (p1->src[0] != sub || c1->src[0] != p1 || gr->src[0] != c1 || rs->src[0] != gr || p2->src[0] != rs || c2->src[0] != p2 ||
+        add->src[0] != c2 || cpy->src[0] != add) {
+        return false;
+    }
+    // (1, 0, 2, 3): [n_bins, n_head, n_tokens] -> [n_head, n_bins, n_tokens]; (2, 0, 1, 3): [n_head, n_kv, n_q, n_s] -> [n_kv, n_q, n_head, n_s]
+    if (p1->nb[0] != sub->nb[1] || p1->nb[1] != sub->nb[0] || p1->nb[2] != sub->nb[2] ||
+        p2->nb[0] != rs->nb[1] || p2->nb[1] != rs->nb[2] || p2->nb[2] != rs->nb[0] || p2->nb[3] != rs->nb[3]) {
+        return false;
+    }
+    const int64_t n_head = sub->ne[1], n_tokens = sub->ne[2], n_kv = c2->ne[0], n_q = c2->ne[1], n_s = c2->ne[3];
+    if (table->type != GGML_TYPE_F32 || sinks->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 || bins->type != GGML_TYPE_I32 ||
+        cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy) || !ggml_are_same_shape(cpy, add) ||
+        table->nb[0] != sizeof(float) || sinks->ne[0] != 1 || sinks->ne[1] != n_head || sinks->ne[2] != n_tokens ||
+        bins->ne[0] != n_kv || bins->ne[1] != n_tokens || bins->nb[0] != sizeof(int32_t) ||
+        c2->ne[2] != n_head || n_q*n_s != n_tokens || table->ne[3] != 1 ||
+        mask->ne[0] != n_kv || mask->ne[1] != n_q || mask->ne[2] != 1 || mask->ne[3] != n_s || mask->nb[0] != sizeof(float)) {
+        return false;
+    }
+    return true;
+}
+
+// a fused biased mask (bias_mask_pattern at node_idx)
+static void ggml_vk_bias_mask(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * table = n[0]->src[0], * sinks = n[0]->src[1], * bins = n[3]->src[1], * mask = n[7]->src[1], * c2 = n[6];
+    ggml_tensor * dst = cgraph->nodes[node_idx + 8];
+    vk_pipeline pipeline = ctx->device->pipeline_bias_mask_f32_f16;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t fs = sizeof(float);
+    vk_op_bias_mask_push_constants pc = {
+        (uint32_t) c2->ne[0], (uint32_t) c2->ne[1], (uint32_t) c2->ne[2], (uint32_t) c2->ne[3],
+        (uint32_t) (table->nb[1]/fs), (uint32_t) (table->nb[2]/fs), get_misalign_bytes(ctx, table)/fs,
+        (uint32_t) (sinks->nb[1]/fs), (uint32_t) (sinks->nb[2]/fs), get_misalign_bytes(ctx, sinks)/fs,
+        (uint32_t) (bins->nb[1]/sizeof(int32_t)), get_misalign_bytes(ctx, bins)/(uint32_t) sizeof(int32_t),
+        (uint32_t) (mask->nb[1]/fs), (uint32_t) (mask->nb[3]/fs), get_misalign_bytes(ctx, mask)/fs,
+        get_misalign_bytes(ctx, dst)/(uint32_t) sizeof(ggml_fp16_t),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, table, true), ggml_vk_tensor_subbuffer(ctx, sinks, true), ggml_vk_tensor_subbuffer(ctx, bins, true),
+          ggml_vk_tensor_subbuffer(ctx, mask, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        { (uint32_t) c2->ne[0], (uint32_t) c2->ne[1], (uint32_t) (c2->ne[2]*c2->ne[3]) });
+}
 
 // situ_pattern at node_idx: f32, gate and up of one shape (views with contiguous rows), the SCALEs without bias;
 // GGML_VK_DISABLE_SITU turns it off
@@ -13877,7 +13935,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_out_prod(ctx, compute_ctx, src0, src1, node);
         break;
     case GGML_OP_SUB:
-        ggml_vk_sub(ctx, compute_ctx, src0, src1, node);
+        if (ctx->fused_bias_mask) {
+            ggml_vk_bias_mask(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_sub(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_MUL:
@@ -16454,6 +16516,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_concat_rms_norm = false;
         ctx->fused_conv_split = false;
         ctx->fused_situ = false;
+        ctx->fused_bias_mask = false;
         ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -16470,6 +16533,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_clip_rows = true;
                 fusion_string = "CLIP_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_bias_mask(cgraph, i)) {
+                ctx->num_additional_fused_ops = (int) bias_mask_pattern.size() - 1;
+                ctx->fused_bias_mask = true;
+                fusion_string = "BIAS_MASK";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // the cast's CPY names its own output as a source: that alias, and only it, is allowed
+                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
             } else if (ggml_vk_can_fuse_situ(cgraph, i)) {
                 ctx->num_additional_fused_ops = (int) situ_pattern.size() - 1;
                 ctx->fused_situ = true;
@@ -16775,6 +16845,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_concat_rms_norm = false;
                 ctx->fused_conv_split = false;
                 ctx->fused_situ = false;
+                ctx->fused_bias_mask = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -17056,7 +17127,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern) ||
-            keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern) || keep_pattern(situ_pattern)) {
+            keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern) || keep_pattern(situ_pattern) || keep_pattern(bias_mask_pattern)) {
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -17088,7 +17159,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // the node before them (the windows, taps and state view; the up half and the gate's sigmoid), so neither pass
         // may pull one out
         auto const &in_conv_split_pattern = [&](int n) -> bool {
-            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern }) {
+            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern }) {
                 for (int o = 0; o < (int) pat->size(); ++o) {
                     if (n - o >= 0 && match_pattern(*pat, n - o)) {
                         return true;
