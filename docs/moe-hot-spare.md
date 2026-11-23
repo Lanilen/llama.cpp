@@ -209,7 +209,9 @@ reuse:
 
 The scheduler's offload of host experts for a large batch copies the experts the batch selects, and copies each weight
 to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
-passes find every expert they select.
+passes find every expert they select. Upstream copies every expert tensor of `inkling2_loop` whole
+([#32807](https://github.com/ggml-org/llama.cpp/pull/32807)); the fork keeps that to the tensors the loop shares, so the layers
+that run once copy only their selected experts, through `LLAMA_OFFLOAD_FAST`'s staging memory when it is on.
 
 **Prompts, with the experts in host memory.** Those whole copies live until the last pass that runs them, so a looped
 layer's experts stay copied through all three: a prompt's ubatch of 512 asks for a compute buffer of about 8.5 GB
@@ -390,7 +392,7 @@ GPU. Seven changes:
 
 | change | what it does | switch |
 | --- | --- | --- |
-| SCALE through the strides | Inkling's SITU activation scales the gate and up halves of the merged gate_up, which are views. Vulkan's SCALE took only contiguous tensors, so the scheduler ran those scales on the CPU, 96 a token, and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary ops do | none |
+| SCALE through the strides | Inkling's SITU activation scales the gate and up halves of the merged gate_up, which are views. Vulkan's SCALE took only contiguous tensors, so the scheduler ran those scales on the CPU, 96 a token, and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary ops do. Upstream made the same change on its own ([#32735](https://github.com/ggml-org/llama.cpp/pull/32735)), and its version is the one in the fork now | none |
 | the depth mix's blocks normalized once | in the graph: each block is normalized once and kept, not at every mix that reads it (120 mixes a token) | none |
 | MUL_MAT → tanh or sigmoid | the loop controllers' gain and forget and the attention gate, in the mat-vec's store ([above](#the-mat-vec-store)) | `GGML_VK_DISABLE_MM_POST=1` |
 | the row clip | MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP and MUL, a row clipped to an L2 norm after an optional per-channel scale, in one shader (`clip_rows.comp`) | `GGML_VK_DISABLE_CLIP_ROWS=1` |
@@ -421,7 +423,7 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: fused f32 adds don't need `shaderRoundingModeRTEFloat16` ([Fused adds](#fused-adds-on-gpus-without-fp16)) | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
 | Vulkan: a graph within one submit's node limit is submitted once ([Vulkan submits](#vulkan-submits-ggml_vk_flops_per_submit)) | all Vulkan GPUs | none; `GGML_VK_FLOPS_PER_SUBMIT=N` sets a size for every graph |
 | draft-mtp: the two transfers of target rows a pass are queued on the compute queue ([Speculative decoding with MTP](#speculative-decoding-with-mtp)) | models with an MTP draft on a GPU | none; `LLAMA_MTP_DEV_ROWS=0` keeps the rows on the host |
-| The offload of host experts copies an expert tensor that several layers run whole, not only the batch's selected experts ([Looped models](#looped-models)) | looped models (`inkling2_loop`) with experts in host memory | none |
+| Upstream's whole copy of `inkling2_loop`'s host experts ([#32807](https://github.com/ggml-org/llama.cpp/pull/32807)) is kept to the expert tensors that several layers run; the layers that run once copy only the batch's selected experts ([Looped models](#looped-models)) | looped models (`inkling2_loop`) with experts in host memory | none |
 
 **On the ladder** (rung 2, the whole fork's build with upstream's flags and no cache, which also has the
 sparse-attention shaders and the RDNA4 kernels of other branches): a verify step 10.7% shorter than upstream's on the
