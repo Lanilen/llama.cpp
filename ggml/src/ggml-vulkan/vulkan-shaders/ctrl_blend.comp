@@ -1,0 +1,42 @@
+#version 450
+
+// Inkling 2's loop controller blend of a message into a layer input:
+//
+//   dst = (cur - forget*cur) + gain*message
+//
+// the graph's MUL, SUB, MUL and ADD in one pass, each product and sum rounded as the separate ops round them (precise:
+// no contraction into an fma). Every operand is [ne0, ne1] with its own row stride; the message is a strided view of
+// the loop's message rows.
+// After fast-inkling-mac's INKLING_CTRL (https://github.com/newideas99/Fast-Inkling-Mac-Uncensored, patches/0002, MIT).
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne0; uint ne1;
+    uint nbf; uint nbc; uint nbg; uint nbm; uint nbd;   // row strides, in elements
+    uint of; uint oc; uint og; uint om; uint od;        // offsets, in elements
+} p;
+
+layout(binding = 0) readonly buffer F {float data_f[];};
+layout(binding = 1) readonly buffer C {float data_c[];};
+layout(binding = 2) readonly buffer G {float data_g[];};
+layout(binding = 3) readonly buffer M {float data_m[];};
+layout(binding = 4) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x;
+    const uint i1 = gl_GlobalInvocationID.y;
+    if (i0 >= p.ne0 || i1 >= p.ne1) {
+        return;
+    }
+
+    const float c = data_c[p.oc + i1*p.nbc + i0];
+
+    precise float fc   = data_f[p.of + i1*p.nbf + i0] * c;
+    precise float kept = c - fc;
+    precise float gm   = data_g[p.og + i1*p.nbg + i0] * data_m[p.om + i1*p.nbm + i0];
+    precise float r    = kept + gm;
+
+    data_d[p.od + i1*p.nbd + i0] = r;
+}

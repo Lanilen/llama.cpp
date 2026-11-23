@@ -1082,6 +1082,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("clip_rows_f32", "clip_rows.comp", {});
+    string_to_spv("ctrl_blend_f32", "ctrl_blend.comp", {});
     string_to_spv("depth_mix_f32", "depth_mix.comp", {});
     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});

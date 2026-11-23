@@ -4106,6 +4106,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_clip_rows_f32, "clip_rows_f32", clip_rows_f32_len, clip_rows_f32_data, "main", 3, sizeof(vk_op_clip_rows_push_constants), {1, 1, 1}, { 128 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ctrl_blend_f32, "ctrl_blend_f32", ctrl_blend_f32_len, ctrl_blend_f32_data, "main", 5, sizeof(vk_op_ctrl_blend_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_depth_mix_f32, "depth_mix_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, { 256 }, 1);
 
     const uint32_t top_k_mask_wg = std::min({256u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
@@ -8268,6 +8269,37 @@ static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
         elements = { nr, 1, 1 };
     }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, s_buf, d_buf }, pc, elements);
+}
+
+// a fused loop controller blend (ctrl_blend_pattern starting at node_idx): (cur - forget*cur) + gain*message
+static void ggml_vk_ctrl_blend(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * fc  = cgraph->nodes[node_idx];
+    const ggml_tensor * gm  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * f   = fc->src[0];
+    const ggml_tensor * c   = fc->src[1];
+    const ggml_tensor * g   = gm->src[0];
+    const ggml_tensor * m   = gm->src[1];
+    ggml_tensor       * dst = cgraph->nodes[node_idx + 3];
+    VK_LOG_DEBUG("ggml_vk_ctrl_blend(" << f << ", " << c << ", " << g << ", " << m << ", " << dst << ")");
+
+    vk_pipeline pipeline = ctx->device->pipeline_ctrl_blend_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer f_buf = ggml_vk_tensor_subbuffer(ctx, f, true);
+    const vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, c, true);
+    const vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx, g, true);
+    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, m, true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    const uint32_t fs = (uint32_t) sizeof(float);
+    vk_op_ctrl_blend_push_constants pc = {
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        ggml_vk_nb_elem(f, 1), ggml_vk_nb_elem(c, 1), ggml_vk_nb_elem(g, 1), ggml_vk_nb_elem(m, 1), ggml_vk_nb_elem(dst, 1),
+        get_misalign_bytes(ctx, f) / fs, get_misalign_bytes(ctx, c) / fs, get_misalign_bytes(ctx, g) / fs,
+        get_misalign_bytes(ctx, m) / fs, get_misalign_bytes(ctx, dst) / fs,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { f_buf, c_buf, g_buf, m_buf, d_buf }, pc,
+                              { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], 1 });
 }
 
 // a fused depth mix (depth_mix_pattern starting at node_idx), one workgroup a token
@@ -13746,6 +13778,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_MUL:
         if (ctx->fused_clip_rows) {
             ggml_vk_clip_rows(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_ctrl_blend) {
+            ggml_vk_ctrl_blend(ctx, compute_ctx, cgraph, node_idx);
         } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
@@ -15137,6 +15171,33 @@ static bool ggml_vk_can_fuse_clip_rows(const struct ggml_cgraph * cgraph, int no
     return true;
 }
 
+// ctrl_blend_pattern at node_idx: f32 throughout, every operand of dst's 2D shape with contiguous rows (no broadcast);
+// GGML_VK_DISABLE_CTRL_BLEND turns it off
+static bool ggml_vk_can_fuse_ctrl_blend(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_CTRL_BLEND") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const int last = node_idx + (int) ctrl_blend_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ctrl_blend_pattern, { last }) || !ggml_check_edges(cgraph, node_idx, ctrl_blend_edges)) {
+        return false;
+    }
+    const ggml_tensor * fc  = cgraph->nodes[node_idx];
+    const ggml_tensor * sub = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * gm  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * out = cgraph->nodes[last];
+    if (sub->src[0] != fc->src[1]) {
+        return false;
+    }
+    const ggml_tensor * operands[] = { fc->src[0], fc->src[1], gm->src[0], gm->src[1], fc, sub, gm, out };
+    for (const ggml_tensor * t : operands) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || !ggml_are_same_shape(t, out) || t->ne[2] != 1 || t->ne[3] != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // depth_mix_pattern at node_idx: f32 throughout, the blocks and cur in rows of n_embd, at most 32 states and 4 queries, a
 // softmax without mask or ALiBi; GGML_VK_DISABLE_DEPTH_MIX turns it off
 static bool ggml_vk_can_fuse_depth_mix(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16106,6 +16167,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_mm_post = false;
         ctx->fused_clip_rows = false;
+        ctx->fused_ctrl_blend = false;
         ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -16122,6 +16184,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_clip_rows = true;
                 fusion_string = "CLIP_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_ctrl_blend(cgraph, i)) {
+                ctx->num_additional_fused_ops = (int) ctrl_blend_pattern.size() - 1;
+                ctx->fused_ctrl_blend = true;
+                fusion_string = "CTRL_BLEND";
+                // each element of dst reads the same element of every operand: dst may alias one of them (the
+                // allocator reuses cur's or a product's memory for the sum)
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if ((num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i))) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
@@ -16394,6 +16463,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_mm_post = false;
                 ctx->fused_clip_rows = false;
+                ctx->fused_ctrl_blend = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -16674,7 +16744,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (ggml_vk_is_mm_unary_at(graph, first_unused) && keep_pattern(mm_unary_pattern)) {
             continue;
         }
-        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern)) {
+        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern)) {
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -16733,6 +16803,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
+            // the same for the controller blend: gain*message does not depend on the SUB before it
+            auto const &in_ctrl_blend_pattern = [&](int n) -> bool {
+                for (int o = 0; o < (int) ctrl_blend_pattern.size(); ++o) {
+                    if (n - o >= 0 && match_pattern(ctrl_blend_pattern, n - o)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             if (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias_eps, j) ||
@@ -16744,7 +16823,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 (match_pattern(mm_unary_pattern, j) && ggml_vk_is_mm_unary_at(graph, j)) ||
                 match_pattern(depth_mix_pattern, j) ||
                 match_pattern(clip_rows_scale_pattern, j) || match_pattern(clip_rows_pattern, j) ||
-                match_pattern(ssm_conv_res_scale_pattern, j) ||
+                match_pattern(ssm_conv_res_scale_pattern, j) || in_ctrl_blend_pattern(j) ||
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||

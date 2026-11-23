@@ -633,6 +633,13 @@ static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
     { 6, 0, 5 }, // clamp->src[0]    == div
     { 7, 1, 6 }, // mul->src[1]      == clamp
 };
+// (cur - forget*cur) + gain*message: Inkling 2's loop controller blend; the edges as {dst, src slot, src}
+static constexpr std::initializer_list<ggml_op> ctrl_blend_pattern { GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<std::array<int, 3>> ctrl_blend_edges {
+    { 1, 1, 0 }, // sub->src[1] == forget*cur
+    { 3, 0, 1 }, // add->src[0] == cur - forget*cur
+    { 3, 1, 2 }, // add->src[1] == gain*message
+};
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
 static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
@@ -1041,6 +1048,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_clip_rows_f32;
+    vk_pipeline pipeline_ctrl_blend_f32;
     vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1481,6 +1489,7 @@ struct ggml_backend_vk_context {
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
     bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
+    bool fused_ctrl_blend {};   // MUL SUB MUL ADD: Inkling 2's loop controller blend, (cur - forget*cur) + gain*message
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

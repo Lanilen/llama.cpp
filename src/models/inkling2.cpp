@@ -291,6 +291,13 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
     ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
 
+    // the operands first, so that the blend's MUL, SUB, MUL and ADD follow one another (the Vulkan backend fuses them,
+    // CTRL_BLEND)
+    ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_expand(gf, forget);
+    ggml_build_forward_expand(gf, message);
+    ggml_build_forward_expand(gf, cur);
+
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
 
