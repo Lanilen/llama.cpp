@@ -419,15 +419,17 @@ GPU. Ten changes:
 - **Rounding:** the clip and the depth mix sum in another order than the separate ops. A 4-bit quant's perplexity is
   4.0683 against 4.0697 with the clip; with the depth mix, the KL divergence of one-token logits from the CPU's is
   0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path).
-- **Rounding that follows the graph's order:** in a one-token graph, an ADD followed by the RMS_NORM of its one row
-  writes partial sums that the norm reduces (upstream's ADD + RMS_NORM fusion), in another order than the norm alone.
-  Any change that decides whether an ADD comes right before a norm changes that order: a fusion that takes the ADD in
-  (the blend before the attention's norm), a node shared or dropped (the copies and fills), or the graph's reordering.
-  The difference is an ulp at the first layer it reaches, but an expert near the router's cut can then flip, so
-  Inkling's logits move visibly: at 256 one-token positions a median of 0.4 to 0.8, about one top token of 256 (0.79
-  for switching the reordering off on the same build). With `GGML_VK_DISABLE_ADD_RMS_FUSION=1` the norm always
-  reduces alone, and the blend and the input's norm give the same logits as the separate ops, to the bit; so do the
-  copies and fills with the fusions off.
+- **Rounding that follows the graph's order:** in a one-token graph, upstream fuses an ADD into the RMS_NORM of its
+  one row that follows it: the ADD writes partial sums that the norm reduces, in another order than upstream's norm
+  alone. A fusion that takes such an ADD in (the blend before the attention's norm), a node shared or dropped (the
+  copies and fills) or the graph's reordering decides which norms those are. An ulp at the first norm can flip an
+  expert near the router's cut, and Inkling's logits then moved visibly (at 256 one-token positions a median of 0.4,
+  about one top token of 256). The fork's one-row norm now sums in the partials' order
+  ([docs/moe-testing.md](moe-testing.md#the-one-row-norms-order)): with it, the blend and the input's norm give the
+  same logits as the separate ops, to the bit, and so does every change that only moves which ADD comes before a norm.
+  What still moves the logits is a change to which ops fuse at all, the Vulkan graph's reordering for one (3 top
+  tokens of 256 with it off). `GGML_VK_DISABLE_ADD_RMS_FUSION=1` turns the partials off, for comparisons with
+  `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` (upstream's norm).
 
 ### Changes that apply without any option
 
@@ -458,6 +460,7 @@ sparse-attention shaders and the RDNA4 kernels of other branches): a verify step
 | Vulkan: MUL_MAT followed by tanh or sigmoid, the row clip, and SSM_CONV with its residual and scale run as one dispatch each ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1`, `GGML_VK_DISABLE_CLIP_ROWS=1`, `GGML_VK_DISABLE_CONV_RES=1` |
 | Vulkan: TOPK_MOE takes a sigmoid router whose weights' sum adds an epsilon, and a router's sigmoid goes to TOPK_MOE before MUL_MAT -> sigmoid ([Inkling 2's small ops](#inkling-2s-small-ops)) | Vulkan GPUs, sigmoid routers (Inkling 2, GLM-5.3-Flash) | none |
 | Vulkan: Inkling 2's depth mix of one token runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_DEPTH_MIX=1` |
+| Vulkan: a one-row f32 RMS_NORM sums in the order of upstream's ADD + RMS_NORM partials (`rms_norm_ordered.comp`), so its bits do not depend on whether an ADD right before it hands it partial sums ([Inkling 2's small ops](#inkling-2s-small-ops), [docs/moe-testing.md](moe-testing.md#the-one-row-norms-order)) | Vulkan GPUs with subgroup arithmetic, not Intel's (those with the partials path) | `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` keeps upstream's plain norm |
 | Vulkan: Inkling 2's loop controller blend runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CTRL_BLEND=1` |
 | Vulkan: a CONCAT along dim 1 of two single rows followed by RMS_NORM runs as one dispatch (Inkling 2's loop controller input, [Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` |
 | Inkling 2: the depth mix's blocks are normalized once ([Inkling 2's small ops](#inkling-2s-small-ops)) | `inkling2`, `inkling2_loop` | none |
@@ -1032,6 +1035,7 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `GGML_VK_DISABLE_DEPTH_MIX=1` | Vulkan: no fused depth mix ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CTRL_BLEND=1` | Vulkan: no fused blend of Inkling 2's loop controllers ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` | Vulkan: no fused norm of Inkling 2's loop controller input ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` | Vulkan: upstream's plain norm for one row, not the one in the ADD partials' order ([docs/moe-testing.md](moe-testing.md#the-one-row-norms-order)) |
 | `GGML_VK_DISABLE_ADD_RMS_FUSION=1` | Vulkan: no partial sums from an ADD for the one-row RMS_NORM after it, so that a new fusion can be compared with the graph before it to the bit ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONV_RES=1` | Vulkan: no fused SSM_CONV → ADD(residual) → SCALE |
 

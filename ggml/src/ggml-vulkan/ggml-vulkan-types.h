@@ -990,6 +990,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
     vk_pipeline pipeline_rms_norm_partials_f32;
+    // one-row norms in the order of the ADD's partials (rms_norm_ordered.comp): [without, with] the weight's MUL, and
+    // MUL + ADD [without, with] the post multiply
+    vk_pipeline pipeline_rms_norm_ordered_f32[2];
+    vk_pipeline pipeline_rms_norm_mul_add_ordered_f32[2];
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;

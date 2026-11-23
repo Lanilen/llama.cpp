@@ -3719,6 +3719,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_set_rows_f32_f32, "rms_norm_set_rows_f32_f32", RMS_SHADER(rms_norm_set_rows_f32_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, rms_set_rows_block_size, rms_unroll}, 1, true, rms_subgroups);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_set_rows_f32_f16, "rms_norm_set_rows_f32_f16", RMS_SHADER(rms_norm_set_rows_f32_f16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, rms_set_rows_block_size, rms_unroll}, 1, true, rms_subgroups);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+    // created as every pipeline (compiled when first requested, which only a device with the partials path does)
+    for (uint32_t m : {0, 1}) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_ordered_f32[m], m ? "rms_norm_mul_ordered_f32" : "rms_norm_ordered_f32", rms_norm_ordered_f32_len, rms_norm_ordered_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, m}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_ordered_f32[m], m ? "rms_norm_mul_add_mul_ordered_f32" : "rms_norm_mul_add_ordered_f32", rms_norm_mul_add_ordered_f32_len, rms_norm_mul_add_ordered_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, m}, 1, true);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
 
     if (sizeof(vk_op_rms_norm_mul_rope_push_constants) <= device->properties.limits.maxPushConstantsSize) {
@@ -9918,6 +9923,16 @@ static vk_conv_shapes ggml_vk_conv3d_select_shape(ggml_backend_vk_context * ctx,
     return CONV_SHAPE_256x128;
 }
 
+// a one-row f32 norm on a device with upstream's ADD + RMS_NORM partials reduces in the partials' order
+// (rms_norm_ordered.comp), so that its bits do not depend on whether an ADD right before it hands it partial sums;
+// GGML_VK_DISABLE_ORDERED_RMS_NORM=1 keeps upstream's plain norm
+static bool ggml_vk_use_ordered_rms_norm(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_ORDERED_RMS_NORM") != nullptr;
+    return !disabled && ctx->device->add_rms_fusion && !ctx->do_add_rms_partials && ctx->device->subgroup_size >= 8 &&
+           ggml_nrows(src0) == 1 && src0->ne[0] <= 512*64 && src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) &&
+           dst->type == GGML_TYPE_F32;
+}
+
 static vk_pipeline ggml_vk_rms_norm_pipeline(const std::array<vk_pipeline, 3> & pipelines, int64_t ncols) {
     if (pipelines[0] && ncols <= 128) {
         return pipelines[0];
@@ -10197,6 +10212,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+            }
+            if (ggml_vk_use_ordered_rms_norm(ctx, src0, dst)) {
+                return ctx->device->pipeline_rms_norm_ordered_f32[ctx->fused_rms_norm_mode == RMS_NORM_MUL];
             }
             return ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm[0][ctx->fused_rms_norm_mode == RMS_NORM_MUL], src0->ne[0]);
         }
@@ -12227,7 +12245,9 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         } else {
             const bool src0_bf16 = src0->type == GGML_TYPE_BF16;
             const bool residual_bf16 = residual->type == GGML_TYPE_BF16;
-            pipeline = ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_mul_add[src0_bf16][residual_bf16][do_post_multiply], src0->ne[0]);
+            pipeline = ggml_vk_use_ordered_rms_norm(ctx, src0, dst) && residual->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 ?
+                ctx->device->pipeline_rms_norm_mul_add_ordered_f32[do_post_multiply] :
+                ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_mul_add[src0_bf16][residual_bf16][do_post_multiply], src0->ne[0]);
         }
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         if (ctx->do_add_rms_partials) {
