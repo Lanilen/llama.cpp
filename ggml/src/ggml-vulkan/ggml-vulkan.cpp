@@ -17122,6 +17122,30 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
+    // The nodes a match of the fork's guarded patterns could cover (their ops alone), once a call: the guards below
+    // (in_conv_split_pattern, in_ctrl_blend_pattern) then cost one lookup at a node no match covers. Tried at every
+    // candidate node and offset by hand they were most of this function's time, which runs for every graph (Flash-Next
+    // on the 1920X + R9700: +3-4% a verify step with no match in its graphs). A match needs these ops, so the guards'
+    // answers are unchanged.
+    auto const &op_cover = [&](std::initializer_list<const std::initializer_list<ggml_op> *> pats) {
+        std::vector<bool> cover(graph->n_nodes, false);
+        for (const auto * pat : pats) {
+            const int len = (int) pat->size();
+            for (int s = 0; s + len <= graph->n_nodes; ++s) {
+                int k = 0;
+                while (k < len && graph->nodes[s + k]->op == pat->begin()[k]) {
+                    ++k;
+                }
+                if (k == len) {
+                    std::fill(cover.begin() + s, cover.begin() + s + len, true);
+                }
+            }
+        }
+        return cover;
+    };
+    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern });
+    const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_pattern });
+
     int first_unused = 0;
 
     // scheduled or zero-compute nodes in [lo, hi)
@@ -17256,6 +17280,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // the node before them (the windows, taps and state view; the up half and the gate's sigmoid), so neither pass
         // may pull one out
         auto const &in_conv_split_pattern = [&](int n) -> bool {
+            if (!conv_cover[n]) {
+                return false;
+            }
             for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern }) {
                 for (int o = 0; o < (int) pat->size(); ++o) {
                     if (n - o >= 0 && match_pattern(*pat, n - o)) {
@@ -17299,6 +17326,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             };
             // the same for the controller blend: gain*message does not depend on the SUB before it
             auto const &in_ctrl_blend_pattern = [&](int n) -> bool {
+                if (!blend_cover[n]) {
+                    return false;
+                }
                 for (int o = 0; o < (int) ctrl_blend_pattern.size(); ++o) {
                     if (n - o >= 0 && match_pattern(ctrl_blend_pattern, n - o)) {
                         return true;
