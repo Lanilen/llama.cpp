@@ -1,0 +1,59 @@
+#version 450
+
+// Inkling 2's SITU activation of the experts, in one pass (the fork's SITU fusion; fork file):
+//
+//   act = beta*tanh(gate/beta) * sigmoid(gate)       SCALE, TANH, SCALE, SIGMOID, MUL
+//   up' = lb*tanh(up/lb)                             SCALE, TANH, SCALE (when lb > 0)
+//   dst = act * up'                                  MUL
+//
+// each written as its own shader writes it (scale.comp's x*p1 + p2, unary.comp's tanh and sigmoid), so the result is
+// the same to the bit. gate and up are the two halves of the merged gate_up, strided views.
+// After fast-inkling-mac's INKLING_SITU (https://github.com/newideas99/Fast-Inkling-Mac-Uncensored, patches/0002, MIT).
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne0; uint ne1; uint ne2;
+    uint g_nb1; uint g_nb2; uint g_off;   // in elements
+    uint u_nb1; uint u_nb2; uint u_off;
+    uint d_nb1; uint d_nb2; uint d_off;
+    float inv_beta; float beta; float inv_lb; float lb;
+    float bias;                           // the SCALEs' bias (0), at run time as in scale.comp
+    uint has_lb;
+} p;
+
+layout(binding = 0) readonly buffer G {float data_g[];};
+layout(binding = 1) readonly buffer U {float data_u[];};
+layout(binding = 2) writeonly buffer D {float data_d[];};
+
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x;
+    const uint i1 = gl_GlobalInvocationID.y;
+    const uint i2 = gl_GlobalInvocationID.z;
+    if (i0 >= p.ne0 || i1 >= p.ne1 || i2 >= p.ne2) {
+        return;
+    }
+
+    const float g = data_g[p.g_off + i2*p.g_nb2 + i1*p.g_nb1 + i0];
+    float u       = data_u[p.u_off + i2*p.u_nb2 + i1*p.u_nb1 + i0];
+
+    float t   = g * p.inv_beta + p.bias;
+    t         = op_tanh(t);
+    t         = t * p.beta + p.bias;
+    float act = t * op_sigmoid(g);
+    if (p.has_lb != 0) {
+        u = u * p.inv_lb + p.bias;
+        u = op_tanh(u);
+        u = u * p.lb + p.bias;
+    }
+    data_d[p.d_off + i2*p.d_nb2 + i1*p.d_nb1 + i0] = act * u;
+}

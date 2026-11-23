@@ -8424,6 +8424,44 @@ struct test_clip_rows : public test_case {
     }
 };
 
+// Inkling 2's SITU activation of the experts, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn
+// builds it from the halves of the merged gate_up; the Vulkan backend fuses it (SITU)
+struct test_situ : public test_case {
+    const int64_t n_ff, n_used, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ff, n_used, n_tokens);
+    }
+
+    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1)
+        : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_tokens);
+        ggml_set_name(gate_up, "gate_up");
+        ggml_tensor * x  = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, x);
+            ggml_build_forward_expand(gf, up);
+        }
+        const float beta = 6.0f, lb = 9.0f;
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, x, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, x));
+        up = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling 2's short convolution as llama_model_inkling2::graph::convolve builds it: x = [past; cur], its last columns
 // stored to the recurrent state, the conv, [the dynamic taps lag by lag,] the residual and the scale; the Vulkan backend
 // fuses one token's into one dispatch (SSM_CONV_SPLIT, SSM_CONV_SPLIT_DYN)
@@ -13944,6 +13982,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
+    }
+    test_cases.emplace_back(new test_situ(100, 3, 7));
     for (int64_t n_tokens : { 1, 3 }) {
         for (int64_t n_heads : { 0, 8 }) {
             test_cases.emplace_back(new test_conv_split(1024, n_tokens, n_heads));

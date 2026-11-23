@@ -4314,6 +4314,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_scale_f32, "ssm_conv_res_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[0], "conv_split_f32", conv_split_f32_len, conv_split_f32_data, "main", 5, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[1], "conv_split_dyn_f32", conv_split_dyn_f32_len, conv_split_dyn_f32_data, "main", 6, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
 
@@ -8283,6 +8284,60 @@ static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
 }
 
 static void ggml_vk_conv_split(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx);
+
+// situ_pattern at node_idx: f32, gate and up of one shape (views with contiguous rows), the SCALEs without bias;
+// GGML_VK_DISABLE_SITU turns it off
+static bool ggml_vk_can_fuse_situ(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_SITU") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const int last = node_idx + (int) situ_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, situ_pattern, { last })) {
+        return false;
+    }
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * s1 = n[0], * t1 = n[1], * s2 = n[2], * sg = n[3], * act = n[4], * s3 = n[5], * t2 = n[6], * s4 = n[7], * out = n[8];
+    const ggml_tensor * gate = s1->src[0], * up = s3->src[0];
+    if (ggml_get_unary_op(t1) != GGML_UNARY_OP_TANH || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(t2) != GGML_UNARY_OP_TANH ||
+        t1->src[0] != s1 || s2->src[0] != t1 || sg->src[0] != gate || act->src[0] != s2 || act->src[1] != sg ||
+        t2->src[0] != s3 || s4->src[0] != t2 || out->src[0] != act || out->src[1] != s4) {
+        return false;
+    }
+    for (const ggml_tensor * s : { s1, s2, s3, s4 }) {
+        if (ggml_get_op_params_f32(s, 1) != 0.0f) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { gate, up, out }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || !ggml_are_same_shape(t, out) || t->ne[3] != 1) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(out);
+}
+
+// a fused SITU activation (situ_pattern at node_idx)
+static void ggml_vk_situ(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * gate = n[0]->src[0], * up = n[5]->src[0];
+    ggml_tensor * dst = cgraph->nodes[node_idx + 8];
+    vk_pipeline pipeline = ctx->device->pipeline_situ_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t fs = sizeof(float);
+    vk_op_situ_push_constants pc = {
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) (gate->nb[1]/fs), (uint32_t) (gate->nb[2]/fs), get_misalign_bytes(ctx, gate)/fs,
+        (uint32_t) (up->nb[1]/fs), (uint32_t) (up->nb[2]/fs), get_misalign_bytes(ctx, up)/fs,
+        (uint32_t) (dst->nb[1]/fs), (uint32_t) (dst->nb[2]/fs), get_misalign_bytes(ctx, dst)/fs,
+        ggml_get_op_params_f32(n[0], 0), ggml_get_op_params_f32(n[2], 0), ggml_get_op_params_f32(n[5], 0), ggml_get_op_params_f32(n[7], 0),
+        ggml_get_op_params_f32(n[0], 1), 1u,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, gate, true), ggml_vk_tensor_subbuffer(ctx, up, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] });
+}
 
 // a fused loop controller blend (ctrl_blend_pattern starting at node_idx): (cur - forget*cur) + gain*message
 static void ggml_vk_ctrl_blend(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -13872,7 +13927,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SCALE:
-        if (ctx->fused_hc_post_gate) {
+        if (ctx->fused_situ) {
+            ggml_vk_situ(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_hc_post_gate) {
             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
         } else {
@@ -16396,6 +16453,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ctrl_blend = false;
         ctx->fused_concat_rms_norm = false;
         ctx->fused_conv_split = false;
+        ctx->fused_situ = false;
         ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -16412,6 +16470,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_clip_rows = true;
                 fusion_string = "CLIP_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_situ(cgraph, i)) {
+                ctx->num_additional_fused_ops = (int) situ_pattern.size() - 1;
+                ctx->fused_situ = true;
+                fusion_string = "SITU";
+                // elementwise: each element of dst reads the same element of gate and up
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if (ggml_vk_can_fuse_conv_split(ctx, cgraph, i, true) || ggml_vk_can_fuse_conv_split(ctx, cgraph, i, false)) {
                 const bool dyn = cgraph->nodes[i + 5]->op == GGML_OP_RESHAPE && i + 6 < cgraph->n_nodes &&
                                  cgraph->nodes[i + 6]->op == GGML_OP_TRANSPOSE && ggml_vk_can_fuse_conv_split(ctx, cgraph, i, true);
@@ -16710,6 +16774,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ctrl_blend = false;
                 ctx->fused_concat_rms_norm = false;
                 ctx->fused_conv_split = false;
+                ctx->fused_situ = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -16991,7 +17056,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern) ||
-            keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern)) {
+            keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern) || keep_pattern(situ_pattern)) {
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -17019,10 +17084,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
-        // the conv from its inputs (conv_split_pattern): its windows, taps and state view do not depend on the node
-        // before them, so neither pass may pull one out
+        // the conv from its inputs (conv_split_pattern) and the SITU activation: some of their nodes do not depend on
+        // the node before them (the windows, taps and state view; the up half and the gate's sigmoid), so neither pass
+        // may pull one out
         auto const &in_conv_split_pattern = [&](int n) -> bool {
-            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern }) {
+            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern }) {
                 for (int o = 0; o < (int) pat->size(); ++o) {
                     if (n - o >= 0 && match_pattern(*pat, n - o)) {
                         return true;
