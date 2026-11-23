@@ -209,7 +209,9 @@ reuse:
 
 The scheduler's offload of host experts for a large batch copies the experts the batch selects, and copies each weight
 to a device once per graph, at its first use. An expert tensor that several layers run is copied whole, so its later
-passes find every expert they select.
+passes find every expert they select. Upstream copies every expert tensor of `inkling2_loop` whole
+([#32807](https://github.com/ggml-org/llama.cpp/pull/32807)); the fork keeps that to the tensors the loop shares, so the layers
+that run once copy only their selected experts, through `LLAMA_OFFLOAD_FAST`'s staging memory when it is on.
 
 **Prompts, with the experts in host memory.** Those whole copies live until the last pass that runs them, so a looped
 layer's experts stay copied through all three: a prompt's ubatch of 512 asks for a compute buffer of about 8.5 GB
@@ -421,7 +423,7 @@ These change behaviour for every model and GPU, with or without the cache:
 | Vulkan: fused f32 adds don't need `shaderRoundingModeRTEFloat16` ([Fused adds](#fused-adds-on-gpus-without-fp16)) | Vulkan GPUs without that mode | `GGML_VK_DISABLE_MULTI_ADD=1` |
 | Vulkan: a graph within one submit's node limit is submitted once ([Vulkan submits](#vulkan-submits-ggml_vk_flops_per_submit)) | all Vulkan GPUs | none; `GGML_VK_FLOPS_PER_SUBMIT=N` sets a size for every graph |
 | draft-mtp: the two transfers of target rows a pass are queued on the compute queue ([Speculative decoding with MTP](#speculative-decoding-with-mtp)) | models with an MTP draft on a GPU | none; `LLAMA_MTP_DEV_ROWS=0` keeps the rows on the host |
-| The offload of host experts copies an expert tensor that several layers run whole, not only the batch's selected experts ([Looped models](#looped-models)) | looped models (`inkling2_loop`) with experts in host memory | none |
+| Upstream's whole copy of `inkling2_loop`'s host experts ([#32807](https://github.com/ggml-org/llama.cpp/pull/32807)) is kept to the expert tensors that several layers run; the layers that run once copy only the batch's selected experts ([Looped models](#looped-models)) | looped models (`inkling2_loop`) with experts in host memory | none |
 
 **On the ladder** (rung 2, the whole fork's build with upstream's flags and no cache, which also has the
 sparse-attention shaders and the RDNA4 kernels of other branches): a verify step 10.7% shorter than upstream's on the
