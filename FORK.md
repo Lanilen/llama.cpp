@@ -266,6 +266,10 @@ apply to any such model, with or without the cache:
 - **MUL_MAT_ID skips unused slots** (id -1), which both cache branches rely on.
 - **Fused f32 adds without fp16 rounding modes**, so GPUs such as the RX 480 get them.
 - **A fused MUL_MAT → SCALE → SiLU/sigmoid** in the mat-vec's store: Flash-Next's hyper-connection products, 97 a pass.
+- **A one-row RMS_NORM summed in the order of upstream's ADD + RMS_NORM partials:** upstream's norm gave other last
+  bits with and without an ADD right before it, so a change that only moved which ADD comes before a norm moved a MoE
+  model's answers at temperature 0. `tests/test-vulkan-norm-order` checks it on every card;
+  `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` keeps upstream's norm ([docs/moe-testing.md](docs/moe-testing.md#the-one-row-norms-order)).
 - **A fixed submit size** (`GGML_VK_FLOPS_PER_SUBMIT=N`): upstream submits a graph under 1 GFLOP once, and a layer's
   graph recorded as one submit keeps the GPU idle while it is recorded. The size that suits depends on the GPU: 100M
   on the R9700, 25M on the RX 480s.
@@ -501,6 +505,13 @@ the two `--moe-cache-predictor` files. `--no-op-offload` is needed
 on NVIDIA, `-t 6` is the CPU's performance cores, and the cache size follows the free VRAM. The guide,
 [docs/inkling2-mini.md](docs/inkling2-mini.md), has why each setting, the sizes for 6 and 8 GB cards, the quants, and
 the RX 480 and R9700 measurements.
+
+**Its small ops on the GPU:** in this setup a generated token runs 2,652 Vulkan dispatches, 4,541 before the fusions
+of 2026-11-23: the loop controllers' blend and input norm, the short convolutions read from their two inputs with
+their state store and taps, the experts' SITU activation, the attention's biased mask, and copies a token does not
+need. Each gives the same logits as the separate ops, to the bit. Several follow
+[fast-inkling-mac](https://github.com/newideas99/Fast-Inkling-Mac-Uncensored), a Metal engine for the same model
+([the table](docs/moe-hot-spare.md#inkling-2s-small-ops)).
 
 ### A model whole on one GPU
 
