@@ -20,7 +20,7 @@ the canary mode; the branch with every part also the documents' check and the sp
 
 | line | what runs | a failure means |
 |---|---|---|
-| `caches` | `ctest -L moe`: the scenarios below on two tiny models | the cache computes something else, loses track of its experts, or a switch stopped working: run the scenario by itself |
+| `caches` | `ctest -L moe`: the scenarios below on the tiny models, and `test-vulkan-norm-order` | the cache computes something else, loses track of its experts, or a switch stopped working: run the scenario by itself. For `test-vulkan-norm-order`, see [The one-row norm's order](#the-one-row-norms-order) |
 | `ops-fork` | `test-backend-ops` for MUL_MAT, MUL_MAT_ID, TOP_K, TOP_K_MASK, LIGHTNING_INDEXER (`--quick`; without it `ops-all` runs every op) | a kernel differs from the CPU's result: the log names the case |
 | `ops-no-fp16` | the same ops with `GGML_VK_DISABLE_F16=1`, the path of an RX 480 | the fp32 variants broke |
 | `ops-sparse` | TOP_K_MASK and LIGHTNING_INDEXER without fp16, no case unsupported | an op fell back to the CPU on a GPU without fp16: the splits of every token grow |
@@ -95,6 +95,26 @@ loader's refusal. Every other case passes in both builds.
 
 Not reached on a machine without an AMD GPU: the int8 kernels (RDNA3 and RDNA4 only) and RDNA4's MUL_MAT_ID tile.
 They stay with `test-backend-ops` on the lab's cards.
+
+## The one-row norm's order
+
+On Vulkan, upstream fuses an ADD into the RMS_NORM of its one row that follows it (one token): the ADD writes partial
+sums of the squares, and the norm reduces them (`add.comp`, `rms_norm_partials.comp`). A norm without that ADD
+summed in another order, so which ADDs come right before a norm (a fusion, a node shared or dropped, the graph's
+reordering) changed a norm's last bit, and in a MoE model that can flip an expert near the router's cut: answers at
+temperature 0 changed with code that changes no value. The fork's one-row norm (`rms_norm_ordered.comp`) sums in the
+partials' order, so it gives the same bits either way.
+
+`tests/test-vulkan-norm-order.cpp` checks it: each norm form the partials path has (plain, times a weight, plus a
+residual, times a scale) at eight row lengths, right after an ADD in one graph and alone in another, compared byte
+for byte. A failure means upstream changed its partial sums or its norm: mirror the change in
+`rms_norm_ordered.comp`, or set `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` to run upstream's plain norm (the test then
+skips). With `TEST_NORM_ORDER_FORCE=1` as well, the test runs against upstream's norm and shows the cases where its
+two orders differ (on the 14600KF + RTX 4070 Ti, the 4096-column rows: 4 of 32 cases), which is how to see that the
+check still bites.
+
+On the real model the same holds end to end: with the ordered norm, the drift tool's canary gives the same logits to
+the bit with a fusion on and off ([docs/moe-hot-spare.md](moe-hot-spare.md#inkling-2s-small-ops)).
 
 ## The lab canary
 

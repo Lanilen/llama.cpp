@@ -77,6 +77,15 @@ void rms_norm(uint num_iters) {
 
             uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
             uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
+#if RMS_NORM_CONCAT_FUSION
+            // the rows of CONCAT(A, B) along dim 1 (A and B one row each): row 0 is A's, row 1 is B's, each read at its
+            // own strides; everything else is the plain norm's, so the pair rounds as CONCAT then RMS_NORM does
+            const bool from_b = row != 0;
+            a_offset = from_b ? samp*p.nb13 + channel*p.nb12 + get_boffset() : samp*stride_sample + channel*stride_channel + get_aoffset();
+#define LOAD_X(i) (from_b ? FLOAT_TYPE(data_b[a_offset + (i)]) : FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + (i)])))
+#else
+#define LOAD_X(i) FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + (i)]))
+#endif
 #if RMS_NORM_ROPE_FUSION
             // Per-row offset in shared memory
             uint32_t d_offset = 0;
@@ -96,7 +105,7 @@ void rms_norm(uint num_iters) {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 FLOAT_TYPE xi = FLOAT_TYPE(0);
                 if (col < ncols) {
-                    xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+                    xi = LOAD_X(col);
                 }
                 sum += xi * xi;
             }
@@ -182,10 +191,11 @@ void rms_norm(uint num_iters) {
                     if (col >= ncols) {
                         continue;
                     }
-                    data_d[d_offset + col] = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])));
+                    data_d[d_offset + col] = FLOAT_TO_D(scale * LOAD_X(col));
                 }
             }
 #endif
+#undef LOAD_X
 #if RMS_NORM_ROPE_FUSION
             barrier();
             rope_params rp = p.rope;

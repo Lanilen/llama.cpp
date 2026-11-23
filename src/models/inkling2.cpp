@@ -193,6 +193,30 @@ ggml_tensor * llama_model_inkling2::graph::mix_blocks(const std::vector<ggml_ten
     return normed;
 }
 
+// one token's views of a row set are single rows, already contiguous: a copy only where the view is not
+ggml_tensor * llama_model_inkling2::graph::cont(ggml_tensor * cur) {
+    return ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+}
+
+// the relative-bias table with its zero row for the distant cells, padded once a graph for each weight: the passes of a
+// looped layer share it
+ggml_tensor * llama_model_inkling2::graph::rel_bias_padded(ggml_tensor * weight) {
+    auto it = rel_bias_pads.find(weight);
+    if (it == rel_bias_pads.end()) {
+        it = rel_bias_pads.emplace(weight, ggml_pad(ctx0, weight, 0, 1, 0, 0)).first;
+    }
+    return it->second;
+}
+
+// the zero sinks the attention takes (the sink logits are in the bias), filled once a graph
+ggml_tensor * llama_model_inkling2::graph::zero_sinks(int64_t n_head) {
+    auto it = zero_sinks_by_head.find(n_head);
+    if (it == zero_sinks_by_head.end()) {
+        it = zero_sinks_by_head.emplace(n_head, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f)).first;
+    }
+    return it->second;
+}
+
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     // the states from the last block to the first, then cur
     ggml_tensor * states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
@@ -225,6 +249,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    // the operands first, so that the window, the state store and the convolution follow one another (the Vulkan
+    // backend fuses them into one dispatch, SSM_CONV_SPLIT)
+    const int64_t n_heads   = dynamic ? dynamic->ne[0]/n_conv : 1;
+    const int64_t n_head_ch = n_channels/n_heads;
+    if (dynamic) {
+        dynamic = ggml_reshape_4d(ctx0, dynamic, n_conv, n_heads, n_seq_tokens, n_seqs);
+        ggml_build_forward_expand(gf, dynamic);
+    }
+    ggml_build_forward_expand(gf, cur);
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -232,28 +266,34 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
-    ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
-    out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    ggml_tensor * res = nullptr;
+    if (!dynamic) {
+        ggml_tensor * out = ggml_reshape_2d(ctx0, ggml_ssm_conv(ctx0, x, weight), n_channels, n_tokens);
+        res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(n_conv + 1));
+    } else {
+        // input-dependent taps, one a head and lag: out += x[t + n_conv - 1 - lag] * tap[lag], lag by lag, the sum kept
+        // as [channels of a head, heads, tokens, seqs] and every lag's window a view of one transposed copy, so the
+        // chain is a fixed run of nodes; the values and their order are those of a window copied for each lag
+        ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
+        out = ggml_reshape_4d(ctx0, out, n_head_ch, n_heads, n_seq_tokens, n_seqs);
 
-    if (dynamic) {
-        const int64_t n_heads = dynamic->ne[0]/n_conv;
-
-        dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
+        // [n_channels, n_conv - 1 + n_seq_tokens, n_seqs]: the window of every lag as rows
+        ggml_tensor * xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));
 
         for (int64_t lag = 0; lag < n_conv; ++lag) {
-            ggml_tensor * tap    = ggml_view_3d(ctx0, dynamic, 1, n_heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag*dynamic->nb[0]);
-            ggml_tensor * window = ggml_view_3d(ctx0, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (n_conv - 1 - lag)*x->nb[0]);
+            ggml_tensor * window = ggml_view_4d(ctx0, xt, n_head_ch, n_heads, n_seq_tokens, n_seqs,
+                    n_head_ch*xt->nb[0], xt->nb[1], xt->nb[2], (n_conv - 1 - lag)*xt->nb[1]);
+            ggml_tensor * tap = ggml_view_4d(ctx0, dynamic, 1, n_heads, n_seq_tokens, n_seqs,
+                    dynamic->nb[1], dynamic->nb[2], dynamic->nb[3], lag*dynamic->nb[0]);
 
-            window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
-            window = ggml_reshape_3d(ctx0, window, n_channels/n_heads, n_heads, n_tokens);
-
-            ggml_tensor * term = ggml_reshape_2d(ctx0, ggml_mul(ctx0, window, tap), n_channels, n_tokens);
-
-            out = ggml_add(ctx0, out, term);
+            out = ggml_add(ctx0, out, ggml_mul(ctx0, window, tap));
         }
-    }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+        out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+        res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(2*n_conv + 1));
+    }
+    ggml_build_forward_expand(gf, res);
+    return res;
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
@@ -266,6 +306,13 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
     ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+
+    // the operands first, so that the blend's MUL, SUB, MUL and ADD follow one another (the Vulkan backend fuses them,
+    // CTRL_BLEND)
+    ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_expand(gf, forget);
+    ggml_build_forward_expand(gf, message);
+    ggml_build_forward_expand(gf, cur);
 
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
@@ -307,7 +354,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return cont(ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -331,7 +378,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = is_swa && j > 0 ? inputs[0] : cont(ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
         }
     }
 
@@ -387,7 +434,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias_padded(layer.attn_rel_bias), Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
@@ -398,7 +445,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
         cb(kq_b, "kq_b", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        sinks = zero_sinks(n_head);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,

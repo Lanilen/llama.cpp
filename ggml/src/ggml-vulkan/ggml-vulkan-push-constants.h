@@ -253,6 +253,12 @@ struct vk_op_clip_rows_push_constants {
     float clamp_hi;
 };
 
+struct vk_op_ctrl_blend_push_constants {
+    uint32_t ne0; uint32_t ne1;
+    uint32_t nbf; uint32_t nbc; uint32_t nbg; uint32_t nbm; uint32_t nbd;
+    uint32_t of; uint32_t oc; uint32_t og; uint32_t om; uint32_t od;
+};
+
 struct vk_op_depth_mix_push_constants {
     uint32_t n_embd; uint32_t n_blocks; uint32_t n_query; uint32_t n_tokens;
     uint32_t nbb1; uint32_t nbb2;
@@ -849,6 +855,36 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
     uint32_t res_nb1; float res_scale;   // APPLY_RES_SCALE: the residual's row stride (bytes) and the scale
+};
+
+struct vk_op_bias_mask_push_constants {
+    uint32_t n_kv, n_q, n_head, n_stream;
+    uint32_t t_nb1, t_nb2, t_off;
+    uint32_t s_nb1, s_nb2, s_off;
+    uint32_t r_nb1, r_off;
+    uint32_t m_nb1, m_nb3, m_off;
+    uint32_t d_off;
+};
+
+struct vk_op_situ_push_constants {
+    uint32_t ne0, ne1, ne2;
+    uint32_t g_nb1, g_nb2, g_off;
+    uint32_t u_nb1, u_nb2, u_off;
+    uint32_t d_nb1, d_nb2, d_off;
+    float inv_beta, beta, inv_lb, lb;
+    float bias;
+    uint32_t has_lb;
+};
+
+struct vk_op_conv_split_push_constants {
+    uint32_t nc, n_ch, n_t, n_s;
+    uint32_t past_nb1, past_nb2, past_off;
+    uint32_t w_nb1;
+    uint32_t cur_nb1, cur_off;
+    uint32_t dst_nb1, dst_off;
+    uint32_t st_nb1, st_off;
+    uint32_t dyn_nb1, dyn_nb2, dyn_nb3, dyn_off, head_ch;
+    float scale;
 };
 
 struct vk_op_conv2d_push_constants {

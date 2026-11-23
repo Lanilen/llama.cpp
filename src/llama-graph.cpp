@@ -2682,6 +2682,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    // the views of gate and up first, so that the activation's ops follow one another (the Vulkan
+                    // backend fuses them, SITU)
+                    ggml_build_forward_expand(gf, x);
+                    ggml_build_forward_expand(gf, up);
+
                     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, x, 1.0f/beta)), beta);
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, x));
                     if (lb > 0.0f) {
@@ -4631,7 +4636,17 @@ ggml_tensor * llm_graph_context::build_attn(
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
     if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        // once a graph for each mask in a small batch, where the copy is small and the casts are most of the cost; a
+        // prompt's is cast at each layer, so that its buffer is reused and not held through the graph
+        if (n_tokens <= 16) {
+            ggml_tensor *& kq_mask_f32 = inp->kq_mask_f32[is_swa];
+            if (kq_mask_f32 == nullptr) {
+                kq_mask_f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+            }
+            kq_mask = kq_mask_f32;
+        } else {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     if (cparams.flash_attn) {

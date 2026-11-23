@@ -1,0 +1,50 @@
+#version 450
+
+// types.glsl as copy.comp has it, for the same F32 -> F16 conversion (16-bit storage, no fp16 arithmetic)
+#include "types.glsl"
+
+// Inkling 2's attention mask with its relative-position bias, a head at a time, in one pass (the fork's BIAS_MASK; fork
+// file): the graph's
+//
+//   sub   = table - sink              SUB         the bias of each distance bin and head, the sink logit taken off
+//   kq_b  = sub[bin(k, t), h, t]      PERMUTE, CONT, GET_ROWS, RESHAPE, PERMUTE, CONT   gathered by each cell's bin
+//   dst   = f16(kq_b + mask)          ADD, CPY    the mask, cast to F16 for flash attention
+//
+// each step rounded as the separate ops round it (the copies change nothing), so the mask is the same to the bit.
+// After fast-inkling-mac's mask work (https://github.com/newideas99/Fast-Inkling-Mac-Uncensored, patches/0002, MIT).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_kv; uint n_q; uint n_head; uint n_stream;   // dst [n_kv, n_q, n_head, n_stream], tokens t = s*n_q + q
+    uint t_nb1; uint t_nb2; uint t_off;                // the table [n_bins, n_head, n_tokens], in elements
+    uint s_nb1; uint s_nb2; uint s_off;                // the sinks [1, n_head, n_tokens]
+    uint r_nb1; uint r_off;                            // the bins [n_kv, n_tokens], int32
+    uint m_nb1; uint m_nb3; uint m_off;                // the mask [n_kv, n_q, 1, n_stream], f32
+    uint d_off;
+} p;
+
+layout(binding = 0) readonly buffer T {float data_t[];};
+layout(binding = 1) readonly buffer S {float data_s[];};
+layout(binding = 2) readonly buffer R {int data_r[];};
+layout(binding = 3) readonly buffer M {float data_m[];};
+layout(binding = 4) writeonly buffer D {float16_t data_d[];};
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    const uint q = gl_GlobalInvocationID.y;
+    const uint hs = gl_GlobalInvocationID.z;   // h + s*n_head
+    if (k >= p.n_kv || q >= p.n_q || hs >= p.n_head*p.n_stream) {
+        return;
+    }
+    const uint h = hs % p.n_head;
+    const uint s = hs / p.n_head;
+    const uint t = s*p.n_q + q;
+
+    const uint bin = uint(data_r[p.r_off + t*p.r_nb1 + k]);
+    precise float b = data_t[p.t_off + t*p.t_nb2 + h*p.t_nb1 + bin] - data_s[p.s_off + t*p.s_nb2 + h*p.s_nb1];
+    precise float v = b + data_m[p.m_off + s*p.m_nb3 + q*p.m_nb1 + k];
+
+    data_d[p.d_off + ((s*p.n_head + h)*p.n_q + q)*p.n_kv + k] = float16_t(v);
+}

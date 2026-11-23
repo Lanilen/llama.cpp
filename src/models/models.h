@@ -2524,6 +2524,12 @@ struct llama_model_inkling2 : public llama_model_base {
         // for each list of blocks: a list that grows by one block concats one row set onto the list before it
         ggml_tensor * mix_blocks(const std::vector<ggml_tensor *> & blocks);
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> mixed_blocks;
+        // one-token trims: no copy of a contiguous view, one padded bias table per weight, one zero sinks per head count
+        ggml_tensor * cont(ggml_tensor * cur);
+        ggml_tensor * rel_bias_padded(ggml_tensor * weight);
+        ggml_tensor * zero_sinks(int64_t n_head);
+        std::map<ggml_tensor *, ggml_tensor *> rel_bias_pads;
+        std::map<int64_t, ggml_tensor *> zero_sinks_by_head;
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
