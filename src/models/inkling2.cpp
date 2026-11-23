@@ -249,6 +249,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    // the operands first, so that the window, the state store and the convolution follow one another (the Vulkan
+    // backend fuses them into one dispatch, SSM_CONV_SPLIT)
+    const int64_t n_heads   = dynamic ? dynamic->ne[0]/n_conv : 1;
+    const int64_t n_head_ch = n_channels/n_heads;
+    if (dynamic) {
+        dynamic = ggml_reshape_4d(ctx0, dynamic, n_conv, n_heads, n_seq_tokens, n_seqs);
+        ggml_build_forward_expand(gf, dynamic);
+    }
+    ggml_build_forward_expand(gf, cur);
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -256,28 +266,34 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
-    ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
-    out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    ggml_tensor * res = nullptr;
+    if (!dynamic) {
+        ggml_tensor * out = ggml_reshape_2d(ctx0, ggml_ssm_conv(ctx0, x, weight), n_channels, n_tokens);
+        res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(n_conv + 1));
+    } else {
+        // input-dependent taps, one a head and lag: out += x[t + n_conv - 1 - lag] * tap[lag], lag by lag, the sum kept
+        // as [channels of a head, heads, tokens, seqs] and every lag's window a view of one transposed copy, so the
+        // chain is a fixed run of nodes; the values and their order are those of a window copied for each lag
+        ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
+        out = ggml_reshape_4d(ctx0, out, n_head_ch, n_heads, n_seq_tokens, n_seqs);
 
-    if (dynamic) {
-        const int64_t n_heads = dynamic->ne[0]/n_conv;
-
-        dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
+        // [n_channels, n_conv - 1 + n_seq_tokens, n_seqs]: the window of every lag as rows
+        ggml_tensor * xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));
 
         for (int64_t lag = 0; lag < n_conv; ++lag) {
-            ggml_tensor * tap    = ggml_view_3d(ctx0, dynamic, 1, n_heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag*dynamic->nb[0]);
-            ggml_tensor * window = ggml_view_3d(ctx0, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (n_conv - 1 - lag)*x->nb[0]);
+            ggml_tensor * window = ggml_view_4d(ctx0, xt, n_head_ch, n_heads, n_seq_tokens, n_seqs,
+                    n_head_ch*xt->nb[0], xt->nb[1], xt->nb[2], (n_conv - 1 - lag)*xt->nb[1]);
+            ggml_tensor * tap = ggml_view_4d(ctx0, dynamic, 1, n_heads, n_seq_tokens, n_seqs,
+                    dynamic->nb[1], dynamic->nb[2], dynamic->nb[3], lag*dynamic->nb[0]);
 
-            window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
-            window = ggml_reshape_3d(ctx0, window, n_channels/n_heads, n_heads, n_tokens);
-
-            ggml_tensor * term = ggml_reshape_2d(ctx0, ggml_mul(ctx0, window, tap), n_channels, n_tokens);
-
-            out = ggml_add(ctx0, out, term);
+            out = ggml_add(ctx0, out, ggml_mul(ctx0, window, tap));
         }
-    }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+        out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+        res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(2*n_conv + 1));
+    }
+    ggml_build_forward_expand(gf, res);
+    return res;
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message

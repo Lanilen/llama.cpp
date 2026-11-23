@@ -4314,6 +4314,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_scale_f32, "ssm_conv_res_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[0], "conv_split_f32", conv_split_f32_len, conv_split_f32_data, "main", 5, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[1], "conv_split_dyn_f32", conv_split_dyn_f32_len, conv_split_dyn_f32_data, "main", 6, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -8279,6 +8281,8 @@ static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, s_buf, d_buf }, pc, elements);
 }
+
+static void ggml_vk_conv_split(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx);
 
 // a fused loop controller blend (ctrl_blend_pattern starting at node_idx): (cur - forget*cur) + gain*message
 static void ggml_vk_ctrl_blend(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -13842,7 +13846,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        if (ctx->fused_concat_rms_norm) {
+        if (ctx->fused_conv_split) {
+            ggml_vk_conv_split(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_concat_rms_norm) {
             ggml_vk_concat_rms_norm(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
@@ -15221,6 +15227,147 @@ static bool ggml_vk_can_fuse_clip_rows(const struct ggml_cgraph * cgraph, int no
     return true;
 }
 
+// conv_split_pattern (dyn: conv_split_dyn_pattern) at node_idx: the graph llama_model_inkling2::graph::convolve
+// builds, f32, a conv of 4 taps, x = concat(past, transpose(cur)) whose last columns go to a contiguous cell of the
+// state, the residual cur itself; GGML_VK_DISABLE_CONV_SPLIT turns it off (the plain conv then takes CONV_RES)
+static bool ggml_vk_can_fuse_conv_split(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool dyn) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_CONV_SPLIT") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const auto & pattern = dyn ? conv_split_dyn_pattern : conv_split_pattern;
+    const int last = node_idx + (int) pattern.size() - 1;
+    // the ops of the pattern, each computed, every one but the two outputs used only inside it. Not
+    // ggml_can_fuse_subgraph: the state's cell and the taps are views of tensors outside the pattern (the recurrent
+    // state, the taps' mat-vec), which its rule for views refuses, and they are inputs here
+    if (last >= cgraph->n_nodes) {
+        return false;
+    }
+    {
+        int k = 0;
+        for (ggml_op op : pattern) {
+            const ggml_tensor * node = cgraph->nodes[node_idx + k];
+            if (node->op != op || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                return false;
+            }
+            if (node_idx + k != node_idx + 3 && node_idx + k != last) {
+                if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                    return false;
+                }
+                int uses = 0;
+                for (int j = k + 1; j < (int) pattern.size(); ++j) {
+                    for (const ggml_tensor * src : cgraph->nodes[node_idx + j]->src) {
+                        uses += src == node;
+                    }
+                }
+                if (uses != ggml_node_get_use_count(cgraph, node_idx + k)) {
+                    return false;
+                }
+            }
+            ++k;
+        }
+    }
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * concat = n[0], * vlast = n[1], * vcell = n[2], * cpy = n[3], * conv = n[4];
+    const ggml_tensor * past = concat->src[0], * xt = concat->src[1];
+    if (ggml_get_op_params_i32(concat, 0) != 0 || xt->op != GGML_OP_TRANSPOSE || xt->src[0]->op != GGML_OP_RESHAPE) {
+        return false;
+    }
+    const ggml_tensor * cur = xt->src[0]->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const int64_t nc = w->ne[0], n_ch = conv->ne[0], n_t = conv->ne[1], n_s = conv->ne[2];
+    // the window, the state store and the conv
+    if (vlast->src[0] != concat || cpy->src[0] != vlast || cpy->src[1] != vcell || conv->src[0] != concat ||
+        nc != 4 || past->ne[0] != nc - 1 || past->ne[1] != n_ch || vlast->ne[0] != nc - 1 || vlast->ne[1] != n_ch ||
+        vlast->view_offs != (size_t) n_t*sizeof(float) || vcell->ne[0] != (nc - 1)*n_ch || !ggml_is_contiguous_rows(vcell) ||
+        cur->ne[0] != n_ch || cur->ne[1] != n_t*n_s || cur->nb[0] != sizeof(float) || past->nb[0] != sizeof(float) ||
+        w->nb[0] != sizeof(float) || w->ne[1] != n_ch) {
+        return false;
+    }
+    for (const ggml_tensor * t : { past, cur, w, concat, conv, vcell }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // the residual and the scale; with the taps, every lag's window and tap first
+    const ggml_tensor * sum = n[5];
+    int k = 6;
+    if (dyn) {
+        const ggml_tensor * tr = n[6], * ct = n[7];
+        if (sum->src[0] != conv || tr->src[0] != concat || ct->src[0] != tr) {
+            return false;
+        }
+        const ggml_tensor * taps = nullptr;
+        const ggml_tensor * acc = sum;
+        for (int64_t lag = 0; lag < nc; ++lag) {
+            const ggml_tensor * wv = n[8 + 4*lag], * tv = n[9 + 4*lag], * mul = n[10 + 4*lag], * add = n[11 + 4*lag];
+            if (lag == 0) {
+                taps = tv->src[0];
+            }
+            if (wv->src[0] != ct || tv->src[0] != taps || mul->src[0] != wv || mul->src[1] != tv ||
+                add->src[0] != acc || add->src[1] != mul ||
+                wv->view_offs != (size_t) (nc - 1 - lag)*ct->nb[1] || tv->view_offs != (size_t) lag*sizeof(float)) {
+                return false;
+            }
+            acc = add;
+        }
+        if (taps->type != GGML_TYPE_F32 || !ggml_is_contiguous(taps) || taps->ne[0] != nc || taps->ne[2] != n_t || taps->ne[3] != n_s ||
+            n_ch % taps->ne[1] != 0 || n[8]->ne[0] != n_ch/taps->ne[1] || n[24]->src[0] != acc) {
+            return false;
+        }
+        sum = n[24];
+        k = 25;
+    } else if (sum->src[0] != conv) {
+        return false;
+    }
+    const ggml_tensor * add = n[k], * scale = n[k + 1];
+    if (add->src[0] != cur || add->src[1] != sum || scale->src[0] != add || ggml_get_op_params_f32(scale, 1) != 0.0f ||
+        !ggml_is_contiguous_rows(scale) || scale->ne[0] != n_ch || scale->type != GGML_TYPE_F32) {
+        return false;
+    }
+    GGML_UNUSED(ctx);
+    return true;
+}
+
+// a fused conv from its two inputs (conv_split_pattern or conv_split_dyn_pattern at node_idx)
+static void ggml_vk_conv_split(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const bool dyn = ctx->num_additional_fused_ops == (int) conv_split_dyn_pattern.size() - 1;
+    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const ggml_tensor * concat = n[0], * vcell = n[2], * conv = n[4];
+    const ggml_tensor * past = concat->src[0];
+    const ggml_tensor * cur = concat->src[1]->src[0]->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const ggml_tensor * taps = dyn ? n[9]->src[0] : nullptr;
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    vk_pipeline pipeline = ctx->device->pipeline_conv_split_f32[dyn];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t fs = sizeof(float);
+    vk_op_conv_split_push_constants pc = {
+        (uint32_t) w->ne[0], (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2],
+        (uint32_t) (past->nb[1]/fs), (uint32_t) (past->nb[2]/fs), get_misalign_bytes(ctx, past)/fs,
+        (uint32_t) (w->nb[1]/fs),
+        (uint32_t) (cur->nb[1]/fs), get_misalign_bytes(ctx, cur)/fs,
+        (uint32_t) (dst->nb[1]/fs), get_misalign_bytes(ctx, dst)/fs,
+        (uint32_t) (vcell->nb[1]/fs), get_misalign_bytes(ctx, vcell)/fs,
+        dyn ? (uint32_t) (taps->nb[1]/fs) : 0u, dyn ? (uint32_t) (taps->nb[2]/fs) : 0u, dyn ? (uint32_t) (taps->nb[3]/fs) : 0u,
+        dyn ? get_misalign_bytes(ctx, taps)/fs : 0u, dyn ? (uint32_t) (conv->ne[0]/taps->ne[1]) : 1u,
+        ggml_get_op_params_f32(dst, 0),
+    };
+    const vk_subbuffer past_buf = ggml_vk_tensor_subbuffer(ctx, past, true);
+    const vk_subbuffer w_buf    = ggml_vk_tensor_subbuffer(ctx, w, true);
+    const vk_subbuffer cur_buf  = ggml_vk_tensor_subbuffer(ctx, cur, true);
+    const vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    const vk_subbuffer st_buf   = ggml_vk_tensor_subbuffer(ctx, vcell, true);
+    const std::array<uint32_t, 3> elements = { (uint32_t) conv->ne[0], (uint32_t) conv->ne[1], (uint32_t) conv->ne[2] };
+    if (dyn) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { past_buf, w_buf, cur_buf, dst_buf, st_buf, ggml_vk_tensor_subbuffer(ctx, taps, true) }, pc, elements);
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { past_buf, w_buf, cur_buf, dst_buf, st_buf }, pc, elements);
+    }
+}
+
 // concat_rms_norm_pattern at node_idx: f32, a CONCAT along dim 1 of two single rows of the same length, each with
 // contiguous elements, and its norm contiguous; GGML_VK_DISABLE_CONCAT_RMS_NORM turns it off
 static bool ggml_vk_can_fuse_concat_rms_norm(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16238,7 +16385,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        bool op_srcs_fused_elementwise[32];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
@@ -16248,6 +16395,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_clip_rows = false;
         ctx->fused_ctrl_blend = false;
         ctx->fused_concat_rms_norm = false;
+        ctx->fused_conv_split = false;
         ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
@@ -16264,6 +16412,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_clip_rows = true;
                 fusion_string = "CLIP_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_conv_split(ctx, cgraph, i, true) || ggml_vk_can_fuse_conv_split(ctx, cgraph, i, false)) {
+                const bool dyn = cgraph->nodes[i + 5]->op == GGML_OP_RESHAPE && i + 6 < cgraph->n_nodes &&
+                                 cgraph->nodes[i + 6]->op == GGML_OP_TRANSPOSE && ggml_vk_can_fuse_conv_split(ctx, cgraph, i, true);
+                ctx->num_additional_fused_ops = (int) (dyn ? conv_split_dyn_pattern.size() : conv_split_pattern.size()) - 1;
+                ctx->fused_conv_split = true;
+                // two outputs: the state's cell (the CPY) and the result
+                ctx->fused_ops_write_mask |= 1 << 3;
+                fusion_string = dyn ? "SSM_CONV_SPLIT_DYN" : "SSM_CONV_SPLIT";
+                // at one token every thread reads only its own token's elements before writing them, so the result
+                // may alias cur (the allocator gives it cur's memory); with more tokens a thread reads earlier ones
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, cgraph->nodes[i + 4]->ne[1] == 1);
             } else if (ggml_vk_can_fuse_concat_rms_norm(cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_concat_rms_norm = true;
@@ -16550,6 +16709,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_clip_rows = false;
                 ctx->fused_ctrl_blend = false;
                 ctx->fused_concat_rms_norm = false;
+                ctx->fused_conv_split = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -16830,7 +16990,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (ggml_vk_is_mm_unary_at(graph, first_unused) && keep_pattern(mm_unary_pattern)) {
             continue;
         }
-        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern)) {
+        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern) ||
+            keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern)) {
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -16857,6 +17018,19 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             keep_pattern(hc_post_gate_pattern);
             continue;
         }
+
+        // the conv from its inputs (conv_split_pattern): its windows, taps and state view do not depend on the node
+        // before them, so neither pass may pull one out
+        auto const &in_conv_split_pattern = [&](int n) -> bool {
+            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern }) {
+                for (int o = 0; o < (int) pat->size(); ++o) {
+                    if (n - o >= 0 && match_pattern(*pat, n - o)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -16898,7 +17072,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
+            if (in_conv_split_pattern(j) ||
+                match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias_eps, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
@@ -17068,6 +17243,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     continue;
                 }
                 if (!is_empty(graph->nodes[j])) {
+                    continue;
+                }
+                if (in_conv_split_pattern(j)) {
                     continue;
                 }
                 bool ok = true;

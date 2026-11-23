@@ -633,6 +633,19 @@ static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
     { 6, 0, 5 }, // clamp->src[0]    == div
     { 7, 1, 6 }, // mul->src[1]      == clamp
 };
+// Inkling 2's short convolution from its two inputs with its state store: x = concat(past, cur), the state the last
+// columns of x (a CPY), then the conv with its residual and scale; the dynamic form adds the input-dependent taps, lag
+// by lag (a transposed copy of x, and a window view, a tap view, MUL and ADD a lag)
+static constexpr std::initializer_list<ggml_op> conv_split_pattern { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
+    GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+static constexpr std::initializer_list<ggml_op> conv_split_dyn_pattern { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
+    GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE, GGML_OP_CONT,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
 // rms_norm(concat(a, b, 1)) of one row each: Inkling 2's loop controller input
 static constexpr std::initializer_list<ggml_op> concat_rms_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM };
 
@@ -1090,6 +1103,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_ssm_conv_res_scale_f32;
+    vk_pipeline pipeline_conv_split_f32[2];   // [without, with] the dynamic taps (conv_split.comp)
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1497,6 +1511,7 @@ struct ggml_backend_vk_context {
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
     bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
+    bool fused_conv_split {};      // CONCAT VIEW VIEW CPY SSM_CONV ...: Inkling 2's conv from its two inputs with its state store
     bool fused_concat_rms_norm {}; // CONCAT RMS_NORM: Inkling 2's controller input, the norm of [cur; message]
     bool fused_ctrl_blend {};   // MUL SUB MUL ADD: Inkling 2's loop controller blend, (cur - forget*cur) + gain*message
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

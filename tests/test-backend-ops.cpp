@@ -8424,6 +8424,74 @@ struct test_clip_rows : public test_case {
     }
 };
 
+// Inkling 2's short convolution as llama_model_inkling2::graph::convolve builds it: x = [past; cur], its last columns
+// stored to the recurrent state, the conv, [the dynamic taps lag by lag,] the residual and the scale; the Vulkan backend
+// fuses one token's into one dispatch (SSM_CONV_SPLIT, SSM_CONV_SPLIT_DYN)
+struct test_conv_split : public test_case {
+    const int64_t n_ch, n_tokens, n_heads; // n_heads 0: no dynamic taps
+    static const int64_t n_conv = 4;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_SPLIT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ch, n_tokens, n_heads);
+    }
+
+    test_conv_split(int64_t n_ch = 1024, int64_t n_tokens = 1, int64_t n_heads = 0)
+        : n_ch(n_ch), n_tokens(n_tokens), n_heads(n_heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+        ggml_set_name(cur, "cur");
+        // the state of two blocks of channels: this conv's at an offset, as the model's
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_conv - 1, 2*n_ch, 1);
+        ggml_set_name(history, "history");
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (n_conv - 1)*2*n_ch, 1);
+        ggml_set_name(state, "state");
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_ch);
+        ggml_set_name(weight, "weight");
+        ggml_tensor * dynamic = nullptr;
+        if (n_heads) {
+            dynamic = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv*n_heads, n_tokens);
+            ggml_set_name(dynamic, "dynamic");
+            dynamic = ggml_reshape_4d(ctx, dynamic, n_conv, n_heads, n_tokens, 1);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, dynamic);
+            }
+        }
+        const int64_t offset = n_ch;
+        ggml_tensor * past = ggml_view_3d(ctx, history, n_conv - 1, n_ch, 1, history->nb[1], history->nb[2], offset*history->nb[1]);
+        ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_ch, n_tokens, 1)), 0);
+        ggml_tensor * last = ggml_view_3d(ctx, x, n_conv - 1, n_ch, 1, x->nb[1], x->nb[2], ggml_row_size(x->type, n_tokens));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, (n_conv - 1)*n_ch, 1, state->nb[1], offset*(n_conv - 1)*ggml_element_size(state));
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, last, cell));
+        }
+        ggml_tensor * out = ggml_ssm_conv(ctx, x, weight);
+        if (n_heads) {
+            const int64_t n_head_ch = n_ch/n_heads;
+            out = ggml_reshape_4d(ctx, out, n_head_ch, n_heads, n_tokens, 1);
+            ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+            for (int64_t lag = 0; lag < n_conv; ++lag) {
+                ggml_tensor * window = ggml_view_4d(ctx, xt, n_head_ch, n_heads, n_tokens, 1,
+                        n_head_ch*xt->nb[0], xt->nb[1], xt->nb[2], (n_conv - 1 - lag)*xt->nb[1]);
+                ggml_tensor * tap = ggml_view_4d(ctx, dynamic, 1, n_heads, n_tokens, 1,
+                        dynamic->nb[1], dynamic->nb[2], dynamic->nb[3], lag*dynamic->nb[0]);
+                out = ggml_add(ctx, out, ggml_mul(ctx, window, tap));
+            }
+        }
+        out = ggml_reshape_2d(ctx, out, n_ch, n_tokens);
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf((n_heads ? 2 : 1)*n_conv + 1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling 2's loop controller input, the norm of each row of [cur; message] (CONCAT along dim 1, then RMS_NORM), as
 // llama_model_inkling2::graph::control builds it; the Vulkan backend fuses it (CONCAT_RMS_NORM)
 struct test_concat_rms_norm : public test_case {
@@ -13876,6 +13944,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int64_t n_tokens : { 1, 3 }) {
+        for (int64_t n_heads : { 0, 8 }) {
+            test_cases.emplace_back(new test_conv_split(1024, n_tokens, n_heads));
+        }
+    }
+    test_cases.emplace_back(new test_conv_split(2304, 1, 0));
     for (int64_t n_tokens : { 1, 3, 512 }) {
         for (bool msg_view : { true, false }) {
             test_cases.emplace_back(new test_concat_rms_norm(2304, n_tokens, msg_view));

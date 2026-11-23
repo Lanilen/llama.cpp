@@ -1,0 +1,89 @@
+#version 450
+
+// Inkling 2's short convolution from its two inputs, in one dispatch (the fork's SSM_CONV_SPLIT; fork file):
+//
+//   x     = [past; cur]                 the CONCAT the graph builds, read in place from its two sources
+//   state = the last n_conv - 1 of x    the recurrent state store (a CPY), written here by each channel's last token
+//   out   = conv(x, w)                  as ssm_conv.comp sums it (a vec4 dot for four taps)
+//   [out += x[t + n_conv-1 - lag] * tap[lag, head]   lag by lag, the input-dependent taps of the full-attention layers]
+//   dst   = (cur + out) * scale         the residual and the scale
+//
+// Each step rounds as the separate ops do (precise where they are separate ops), so the result is the same to the bit.
+// After fast-inkling-mac's INKLING_CONV (https://github.com/newideas99/Fast-Inkling-Mac-Uncensored, patches/0002, MIT).
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Past { float past[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) readonly buffer Cur { float cur[]; };
+layout(binding = 3) writeonly buffer Dst { float dst[]; };
+layout(binding = 4) writeonly buffer State { float state[]; };
+#if DYN_TAPS
+layout(binding = 5) readonly buffer Dyn { float dyn[]; };
+#endif
+
+layout(push_constant) uniform PushConstants {
+    uint nc; uint n_ch; uint n_t; uint n_s;
+    uint past_nb1; uint past_nb2; uint past_off;    // in elements
+    uint w_nb1;
+    uint cur_nb1; uint cur_off;                      // cur and dst: a row a token, tokens of all seqs in order
+    uint dst_nb1; uint dst_off;
+    uint st_nb1; uint st_off;                        // the state's cell: a row a seq, channel by channel
+    uint dyn_nb1; uint dyn_nb2; uint dyn_nb3; uint dyn_off; uint head_ch;
+    float scale;
+} p;
+
+float xv(uint i0, uint c, uint s) {
+    return i0 < p.nc - 1 ? past[p.past_off + s*p.past_nb2 + c*p.past_nb1 + i0]
+                         : cur[p.cur_off + (s*p.n_t + i0 - (p.nc - 1))*p.cur_nb1 + c];
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
+    const uint s = gl_WorkGroupID.z;
+
+    if (c >= p.n_ch || t >= p.n_t || s >= p.n_s) {
+        return;
+    }
+
+    const uint w_base = c * p.w_nb1;
+
+    float sum = 0.0;
+    if (p.nc == 4) {
+        sum = dot(
+            vec4(xv(t, c, s), xv(t + 1, c, s), xv(t + 2, c, s), xv(t + 3, c, s)),
+            vec4(w[w_base], w[w_base + 1], w[w_base + 2], w[w_base + 3])
+        );
+    } else {
+        for (uint i0 = 0; i0 < p.nc; i0++) {
+            sum += xv(t + i0, c, s) * w[w_base + i0];
+        }
+    }
+
+#if DYN_TAPS
+    const uint tap_base = p.dyn_off + s*p.dyn_nb3 + t*p.dyn_nb2 + (c / p.head_ch)*p.dyn_nb1;
+    for (uint lag = 0; lag < p.nc; lag++) {
+        precise float term = xv(t + p.nc - 1 - lag, c, s) * dyn[tap_base + lag];
+        precise float acc  = sum + term;
+        sum = acc;
+    }
+#endif
+
+    const uint row = s*p.n_t + t;
+    sum = (cur[p.cur_off + row*p.cur_nb1 + c] + sum) * p.scale;
+
+    // the state: the last n_conv - 1 of x, by the channel's last token, before dst: at one token the result may take
+    // cur's memory (the host allows it then, each thread reading only its own token)
+    if (t == p.n_t - 1) {
+        for (uint j = 0; j < p.nc - 1; j++) {
+            state[p.st_off + s*p.st_nb1 + c*(p.nc - 1) + j] = xv(p.n_t + j, c, s);
+        }
+    }
+    dst[p.dst_off + row*p.dst_nb1 + c] = sum;
+}
