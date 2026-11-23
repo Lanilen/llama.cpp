@@ -392,7 +392,7 @@ GPU. Seven changes:
 
 | change | what it does | switch |
 | --- | --- | --- |
-| SCALE through the strides | Inkling's SITU activation scales the gate and up halves of the merged gate_up, which are views. Vulkan's SCALE took only contiguous tensors, so the scheduler ran those scales on the CPU, 96 a token, and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary ops do | none |
+| SCALE through the strides | Inkling's SITU activation scales the gate and up halves of the merged gate_up, which are views. Vulkan's SCALE took only contiguous tensors, so the scheduler ran those scales on the CPU, 96 a token, and split a decode into 194 graphs. SCALE now reads and writes through the strides, as the other unary ops do. Upstream made the same change on its own ([#32735](https://github.com/ggml-org/llama.cpp/pull/32735)), and its version is the one in the fork now | none |
 | the depth mix's blocks normalized once | in the graph: each block is normalized once and kept, not at every mix that reads it (120 mixes a token) | none |
 | MUL_MAT → tanh or sigmoid | the loop controllers' gain and forget and the attention gate, in the mat-vec's store ([above](#the-mat-vec-store)) | `GGML_VK_DISABLE_MM_POST=1` |
 | the row clip | MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP and MUL, a row clipped to an L2 norm after an optional per-channel scale, in one shader (`clip_rows.comp`) | `GGML_VK_DISABLE_CLIP_ROWS=1` |
