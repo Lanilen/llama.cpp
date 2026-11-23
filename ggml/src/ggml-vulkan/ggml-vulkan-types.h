@@ -633,6 +633,38 @@ static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
     { 6, 0, 5 }, // clamp->src[0]    == div
     { 7, 1, 6 }, // mul->src[1]      == clamp
 };
+// Inkling 2's mask with its relative-position bias, as inkling2.cpp and build_attn (llm_graph_input_mem_hybrid_iswa_rel)
+// build it: the table less the sink, gathered by distance bin into [n_kv, n_q, n_head, n_stream], added to the mask, F16
+static constexpr std::initializer_list<ggml_op> bias_mask_pattern { GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS,
+    GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
+
+// situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn builds it (LLM_FFN_SITU)
+static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
+    GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+
+// Inkling 2's short convolution from its two inputs with its state store: x = concat(past, cur), the state the last
+// columns of x (a CPY), then the conv with its residual and scale; the dynamic form adds the input-dependent taps, lag
+// by lag (a transposed copy of x, and a window view, a tap view, MUL and ADD a lag)
+static constexpr std::initializer_list<ggml_op> conv_split_pattern { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
+    GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+static constexpr std::initializer_list<ggml_op> conv_split_dyn_pattern { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
+    GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE, GGML_OP_CONT,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
+    GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+// rms_norm(concat(a, b, 1)) of one row each: Inkling 2's loop controller input
+static constexpr std::initializer_list<ggml_op> concat_rms_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM };
+
+// (cur - forget*cur) + gain*message: Inkling 2's loop controller blend; the edges as {dst, src slot, src}
+static constexpr std::initializer_list<ggml_op> ctrl_blend_pattern { GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<std::array<int, 3>> ctrl_blend_edges {
+    { 1, 1, 0 }, // sub->src[1] == forget*cur
+    { 3, 0, 1 }, // add->src[0] == cur - forget*cur
+    { 3, 1, 2 }, // add->src[1] == gain*message
+};
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
 static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
@@ -972,6 +1004,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     // [src/dst 0=fp32,1=bf16][mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm[2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_concat_f32;
     // [src/dst 0=fp32,1=bf16][residual 0=fp32,1=bf16][post mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add[2][2][2];
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -979,6 +1012,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
     vk_pipeline pipeline_rms_norm_partials_f32;
+    // one-row norms in the order of the ADD's partials (rms_norm_ordered.comp): [without, with] the weight's MUL, and
+    // MUL + ADD [without, with] the post multiply
+    vk_pipeline pipeline_rms_norm_ordered_f32[2];
+    vk_pipeline pipeline_rms_norm_mul_add_ordered_f32[2];
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;
@@ -1041,6 +1078,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_clip_rows_f32;
+    vk_pipeline pipeline_ctrl_blend_f32;
     vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1074,6 +1112,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_ssm_conv_res_scale_f32;
+    vk_pipeline pipeline_conv_split_f32[2];   // [without, with] the dynamic taps (conv_split.comp)
+    vk_pipeline pipeline_situ_f32;            // Inkling 2's SITU activation (situ.comp)
+    vk_pipeline pipeline_bias_mask_f32_f16;   // Inkling 2's mask with its relative-position bias (bias_mask.comp)
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1481,6 +1522,11 @@ struct ggml_backend_vk_context {
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
     bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
+    bool fused_bias_mask {};       // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY: Inkling 2's biased F16 mask
+    bool fused_situ {};            // SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation
+    bool fused_conv_split {};      // CONCAT VIEW VIEW CPY SSM_CONV ...: Inkling 2's conv from its two inputs with its state store
+    bool fused_concat_rms_norm {}; // CONCAT RMS_NORM: Inkling 2's controller input, the norm of [cur; message]
+    bool fused_ctrl_blend {};   // MUL SUB MUL ADD: Inkling 2's loop controller blend, (cur - forget*cur) + gain*message
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

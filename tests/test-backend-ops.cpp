@@ -8424,6 +8424,253 @@ struct test_clip_rows : public test_case {
     }
 };
 
+// Inkling 2's attention mask with its relative-position bias, as inkling2.cpp and build_attn (the relative-position
+// input) build it: the table less the sinks, gathered by each cell's distance bin into [n_kv, n_q, n_head], added to
+// the mask and cast to F16; the Vulkan backend fuses it (BIAS_MASK)
+struct test_bias_mask : public test_case {
+    const int64_t n_bins, n_head, n_kv, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "BIAS_MASK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_bins, n_head, n_kv, n_tokens);
+    }
+
+    test_bias_mask(int64_t n_bins = 1025, int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 1)
+        : n_bins(n_bins), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % n_bins;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_bins, n_head, n_tokens);
+        ggml_set_name(table, "table");
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_set_name(sinks, "sinks");
+        ggml_tensor * bins = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_set_name(bins, "bins");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens, 1, 1);
+        ggml_set_name(mask, "mask");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, mask);
+        }
+        table = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, n_head, n_tokens));
+        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+        ggml_tensor * kq_b = ggml_get_rows(ctx, table, bins);
+        kq_b = ggml_reshape_4d(ctx, kq_b, n_head, n_kv, n_tokens, 1);
+        kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));
+        ggml_tensor * out = ggml_cast(ctx, ggml_add(ctx, kq_b, mask), GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Inkling 2's SITU activation of the experts, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn
+// builds it from the halves of the merged gate_up; the Vulkan backend fuses it (SITU)
+struct test_situ : public test_case {
+    const int64_t n_ff, n_used, n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ff, n_used, n_tokens);
+    }
+
+    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1)
+        : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_tokens);
+        ggml_set_name(gate_up, "gate_up");
+        ggml_tensor * x  = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, x);
+            ggml_build_forward_expand(gf, up);
+        }
+        const float beta = 6.0f, lb = 9.0f;
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, x, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, x));
+        up = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Inkling 2's short convolution as llama_model_inkling2::graph::convolve builds it: x = [past; cur], its last columns
+// stored to the recurrent state, the conv, [the dynamic taps lag by lag,] the residual and the scale; the Vulkan backend
+// fuses one token's into one dispatch (SSM_CONV_SPLIT, SSM_CONV_SPLIT_DYN)
+struct test_conv_split : public test_case {
+    const int64_t n_ch, n_tokens, n_heads; // n_heads 0: no dynamic taps
+    static const int64_t n_conv = 4;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_SPLIT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ch, n_tokens, n_heads);
+    }
+
+    test_conv_split(int64_t n_ch = 1024, int64_t n_tokens = 1, int64_t n_heads = 0)
+        : n_ch(n_ch), n_tokens(n_tokens), n_heads(n_heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+        ggml_set_name(cur, "cur");
+        // the state of two blocks of channels: this conv's at an offset, as the model's
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_conv - 1, 2*n_ch, 1);
+        ggml_set_name(history, "history");
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (n_conv - 1)*2*n_ch, 1);
+        ggml_set_name(state, "state");
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_ch);
+        ggml_set_name(weight, "weight");
+        ggml_tensor * dynamic = nullptr;
+        if (n_heads) {
+            dynamic = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv*n_heads, n_tokens);
+            ggml_set_name(dynamic, "dynamic");
+            dynamic = ggml_reshape_4d(ctx, dynamic, n_conv, n_heads, n_tokens, 1);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, dynamic);
+            }
+        }
+        const int64_t offset = n_ch;
+        ggml_tensor * past = ggml_view_3d(ctx, history, n_conv - 1, n_ch, 1, history->nb[1], history->nb[2], offset*history->nb[1]);
+        ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_ch, n_tokens, 1)), 0);
+        ggml_tensor * last = ggml_view_3d(ctx, x, n_conv - 1, n_ch, 1, x->nb[1], x->nb[2], ggml_row_size(x->type, n_tokens));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, (n_conv - 1)*n_ch, 1, state->nb[1], offset*(n_conv - 1)*ggml_element_size(state));
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, last, cell));
+        }
+        ggml_tensor * out = ggml_ssm_conv(ctx, x, weight);
+        if (n_heads) {
+            const int64_t n_head_ch = n_ch/n_heads;
+            out = ggml_reshape_4d(ctx, out, n_head_ch, n_heads, n_tokens, 1);
+            ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+            for (int64_t lag = 0; lag < n_conv; ++lag) {
+                ggml_tensor * window = ggml_view_4d(ctx, xt, n_head_ch, n_heads, n_tokens, 1,
+                        n_head_ch*xt->nb[0], xt->nb[1], xt->nb[2], (n_conv - 1 - lag)*xt->nb[1]);
+                ggml_tensor * tap = ggml_view_4d(ctx, dynamic, 1, n_heads, n_tokens, 1,
+                        dynamic->nb[1], dynamic->nb[2], dynamic->nb[3], lag*dynamic->nb[0]);
+                out = ggml_add(ctx, out, ggml_mul(ctx, window, tap));
+            }
+        }
+        out = ggml_reshape_2d(ctx, out, n_ch, n_tokens);
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf((n_heads ? 2 : 1)*n_conv + 1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Inkling 2's loop controller input, the norm of each row of [cur; message] (CONCAT along dim 1, then RMS_NORM), as
+// llama_model_inkling2::graph::control builds it; the Vulkan backend fuses it (CONCAT_RMS_NORM)
+struct test_concat_rms_norm : public test_case {
+    const int64_t n_embd, n_tokens;
+    const bool msg_view;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_RMS_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, msg_view);
+    }
+
+    test_concat_rms_norm(int64_t n_embd = 2304, int64_t n_tokens = 1, bool msg_view = true)
+        : n_embd(n_embd), n_tokens(n_tokens), msg_view(msg_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * message;
+        if (msg_view) {
+            // one of the loop's message rows, [n_embd, 4, n_tokens]
+            ggml_tensor * messages = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+            ggml_set_name(messages, "messages");
+            message = ggml_view_3d(ctx, messages, n_embd, 1, n_tokens, messages->nb[1], messages->nb[2], 2*messages->nb[1]);
+        } else {
+            message = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+            ggml_set_name(message, "message");
+        }
+        ggml_tensor * out = ggml_rms_norm(ctx, ggml_concat(ctx, cur, message, 1), 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Inkling 2's loop controller blend, (cur - forget*cur) + gain*message, as llama_model_inkling2::graph::control builds
+// it: the message a strided view of the loop's message rows; the Vulkan backend fuses it (CTRL_BLEND)
+struct test_ctrl_blend : public test_case {
+    const int64_t n_embd, n_tokens;
+    const int ctrl;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CTRL_BLEND";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, ctrl);
+    }
+
+
+    test_ctrl_blend(int64_t n_embd = 2304, int64_t n_tokens = 1, int ctrl = 1)
+        : n_embd(n_embd), n_tokens(n_tokens), ctrl(ctrl) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * messages = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+        ggml_set_name(messages, "messages");
+        // the tanh outputs of the gain and forget mat-vecs, as inputs: in the model they come before the blend
+        ggml_tensor * gain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(gain, "gain");
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(forget, "forget");
+        ggml_tensor * message = ggml_view_2d(ctx, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]);
+        // the view first, as the model expands it, so that the blend's four ops follow one another
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, message);
+        }
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, message));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling 2's depth mix: attention over the earlier block outputs (normalized) and the current state, as
 // llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses one token's (DEPTH_MIX)
 struct test_depth_mix : public test_case {
@@ -13795,6 +14042,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int64_t n_tokens : { 1, 3 }) {
+        for (int64_t n_kv : { 256, 1536 }) {
+            test_cases.emplace_back(new test_bias_mask(1025, 24, n_kv, n_tokens));
+        }
+    }
+    test_cases.emplace_back(new test_bias_mask(17, 3, 100, 5));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
+    }
+    test_cases.emplace_back(new test_situ(100, 3, 7));
+    for (int64_t n_tokens : { 1, 3 }) {
+        for (int64_t n_heads : { 0, 8 }) {
+            test_cases.emplace_back(new test_conv_split(1024, n_tokens, n_heads));
+        }
+    }
+    test_cases.emplace_back(new test_conv_split(2304, 1, 0));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        for (bool msg_view : { true, false }) {
+            test_cases.emplace_back(new test_concat_rms_norm(2304, n_tokens, msg_view));
+        }
+    }
+    test_cases.emplace_back(new test_concat_rms_norm(100, 7, true));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        for (int ctrl : { 0, 3 }) {
+            test_cases.emplace_back(new test_ctrl_blend(2304, n_tokens, ctrl));
+        }
+    }
+    test_cases.emplace_back(new test_ctrl_blend(100, 7, 2));
     for (int64_t n_embd : { 64, 2304 }) {
         for (int64_t n_blocks : { 1, 4, 8 }) {
             for (int64_t n_query : { 1, 3 }) {

@@ -870,6 +870,7 @@ void process_shaders() {
         const auto rms_bf16_dict = merge_maps(base_dict, {{"A_TYPE", "uint16_t"}, {"B_TYPE", "float"}, {"C_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_A_BF16", "1"}, {"DATA_D_BF16", "1"}, {"USE_SUBGROUP_ADD", use_subgroups ? "1" : "0"}});
         string_to_spv("rms_norm_f32" + suffix, "rms_norm.comp", rms_dict);
         string_to_spv("rms_norm_bf16" + suffix, "rms_norm.comp", rms_bf16_dict);
+        string_to_spv("rms_norm_concat_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_CONCAT_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_f32" + suffix, "rms_norm.comp", merge_maps(rms_bf16_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_bf16" + suffix, "rms_norm.comp", merge_maps({{"C_TYPE", "uint16_t"}, {"DATA_C_BF16", "1"}, {"RMS_NORM_ADD_FUSION", "1"}}, rms_bf16_dict));
@@ -880,6 +881,9 @@ void process_shaders() {
     }
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    // the fork's one-row norm in the partials' order (rms_norm_ordered.comp), with the partials' types
+    string_to_spv("rms_norm_ordered_f32", "rms_norm_ordered.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("rms_norm_mul_add_ordered_f32", "rms_norm_ordered.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
@@ -1082,6 +1086,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("clip_rows_f32", "clip_rows.comp", {});
+    string_to_spv("ctrl_blend_f32", "ctrl_blend.comp", {});
     string_to_spv("depth_mix_f32", "depth_mix.comp", {});
     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
@@ -1222,6 +1227,11 @@ void process_shaders() {
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+    // the fork's conv from its two inputs with its state store (conv_split.comp), [without, with] the dynamic taps
+    string_to_spv("situ_f32", "situ.comp", {});
+    string_to_spv("bias_mask_f32_f16", "bias_mask.comp", {});
+    string_to_spv("conv_split_f32", "conv_split.comp", {{"DYN_TAPS", "0"}});
+    string_to_spv("conv_split_dyn_f32", "conv_split.comp", {{"DYN_TAPS", "1"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
