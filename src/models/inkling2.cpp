@@ -193,6 +193,30 @@ ggml_tensor * llama_model_inkling2::graph::mix_blocks(const std::vector<ggml_ten
     return normed;
 }
 
+// one token's views of a row set are single rows, already contiguous: a copy only where the view is not
+ggml_tensor * llama_model_inkling2::graph::cont(ggml_tensor * cur) {
+    return ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+}
+
+// the relative-bias table with its zero row for the distant cells, padded once a graph for each weight: the passes of a
+// looped layer share it
+ggml_tensor * llama_model_inkling2::graph::rel_bias_padded(ggml_tensor * weight) {
+    auto it = rel_bias_pads.find(weight);
+    if (it == rel_bias_pads.end()) {
+        it = rel_bias_pads.emplace(weight, ggml_pad(ctx0, weight, 0, 1, 0, 0)).first;
+    }
+    return it->second;
+}
+
+// the zero sinks the attention takes (the sink logits are in the bias), filled once a graph
+ggml_tensor * llama_model_inkling2::graph::zero_sinks(int64_t n_head) {
+    auto it = zero_sinks_by_head.find(n_head);
+    if (it == zero_sinks_by_head.end()) {
+        it = zero_sinks_by_head.emplace(n_head, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f)).first;
+    }
+    return it->second;
+}
+
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     // the states from the last block to the first, then cur
     ggml_tensor * states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
@@ -307,7 +331,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return cont(ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -331,7 +355,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = is_swa && j > 0 ? inputs[0] : cont(ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
         }
     }
 
@@ -387,7 +411,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias_padded(layer.attn_rel_bias), Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
@@ -398,7 +422,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
         cb(kq_b, "kq_b", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        sinks = zero_sinks(n_head);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,

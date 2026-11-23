@@ -388,7 +388,7 @@ groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU'
 Inkling 2 Mini's layers are full of small ops: a depth mix over the earlier blocks before attention and before the
 experts, row clips of q, k and the relative-position query, short convolutions on k, v and the outputs, and in the
 looped layers controllers between passes. A generated token ran about 7,000 dispatches, and two of its ops left the
-GPU. Seven changes:
+GPU. Eight changes:
 
 | change | what it does | switch |
 | --- | --- | --- |
@@ -399,6 +399,7 @@ GPU. Seven changes:
 | the convolution's residual and scale | SSM_CONV, RESHAPE, ADD and SCALE, as a mode of the conv shader | `GGML_VK_DISABLE_CONV_RES=1` |
 | the router in TOPK_MOE | sigmoid, bias, top-k and the weights normalized by their sum in upstream's TOPK_MOE shader, 8 dispatches to 2: Inkling adds an epsilon to the sum (`expert_weights_norm_eps`, a SCALE where the pattern has a CLAMP), which the shader now takes; and MUL_MAT → sigmoid leaves a router's sigmoid to TOPK_MOE (GLM-5.3-Flash's router too) | none |
 | the depth mix of one token | RMS_NORM, CONCAT, TRANSPOSE + CONT, MUL_MAT, SOFT_MAX and MUL_MAT in one shader (`depth_mix.comp`, a workgroup a token: the current state's norm, every state's scores against each query, the softmax, the mix); for one token the graph also drops the query's REPEAT | `GGML_VK_DISABLE_DEPTH_MIX=1` |
+| copies and fills a token does not need | in the graph: no CONT of a view that is already one contiguous row (the loop's messages, the mixed Q, K and V inputs), a SWA layer's one mixed input copied once and not three times, the zero sinks filled once a graph, the relative-bias table padded once for each weight (the passes of a looped layer share it), and each attention mask cast to F32 once a graph in batches of up to 16 tokens. After [fast-inkling-mac](https://github.com/newideas99/Fast-Inkling-Mac-Uncensored)'s graph trims (its `patches/0002`) | none |
 
 **Measured:**
 - **Whole on the 1920X + R9700** (Q8_0, llama-bench), the first five: 43.6 tokens a second instead of 21.3, prompts of
@@ -407,9 +408,15 @@ GPU. Seven changes:
 - **The last two,** with the hot spare (a 4-bit quant, its experts in host memory): 5,311 dispatches a generated token
   become 4,310 on the 14600KF + RTX 4070 Ti, and a token is 2.3% shorter on one RX 480 (Q8_0 77.6 → 75.9 ms, Q4_K_M
   66.6 → 65.0 ms, the same text).
+- **The copies and fills,** on the 14600KF + RTX 4070 Ti with the hot spare (UD-Q4_K_XL): 4,541 dispatches a
+  generated token become 4,225, and the GPU's time a token 23.24 ms → 22.55 ms. The answers' speed is within the
+  runs' spread there, where the CPU's experts take most of a token.
 - **Rounding:** the clip and the depth mix sum in another order than the separate ops. A 4-bit quant's perplexity is
   4.0683 against 4.0697 with the clip; with the depth mix, the KL divergence of one-token logits from the CPU's is
-  0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path).
+  0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path). The copies and fills change no
+  value, but Inkling's rounding follows the graph's layout through the Vulkan fusions: with the fusions off, the logits
+  are the same to the bit before and after; with them on, 1 of 256 one-token positions takes another top token, about
+  what switching the fusions off does (2 of 256).
 
 ### Changes that apply without any option
 
