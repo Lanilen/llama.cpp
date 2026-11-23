@@ -17982,7 +17982,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SLEEP:
             return device->shader_clock;
         case GGML_OP_SCALE:
-            // scale.comp reads and writes through the strides
             return ggml_vk_is_float_elementwise(op);
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
