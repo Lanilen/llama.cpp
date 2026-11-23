@@ -450,6 +450,10 @@ private:
 
     copy_experts_info copy_experts;
 
+    // the expert tensors of inkling2_loop that several layers run (its loop), see sched_copy_experts
+    std::unordered_set<const ggml_tensor *> shared_exps;
+    bool shared_exps_init = false;
+
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
