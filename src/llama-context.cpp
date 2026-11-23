@@ -3592,8 +3592,23 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // Later loop passes can select different experts from the same device copy.
     // TODO: copy only the experts needed by each pass (see #32807 and #32809).
+    // Only the expert tensors that several layers run are left to the whole copy: the layers that run once keep the
+    // copy of their selected experts (and LLAMA_OFFLOAD_FAST's staging uploads).
     if (lctx->model.arch == LLM_ARCH_INKLING2_LOOP) {
-        return false;
+        if (!lctx->shared_exps_init) {
+            std::unordered_map<const ggml_tensor *, int> n_runs;
+            for (const auto & layer : lctx->model.layers) {
+                for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                    if (t != nullptr && ++n_runs[t] == 2) {
+                        lctx->shared_exps.insert(t);
+                    }
+                }
+            }
+            lctx->shared_exps_init = true;
+        }
+        if (lctx->shared_exps.count(src) > 0) {
+            return false;
+        }
     }
 
     const ggml_tensor * ids = node->src[2];
