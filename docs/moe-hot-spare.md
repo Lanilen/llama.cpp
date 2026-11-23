@@ -414,15 +414,20 @@ GPU. Ten changes:
   generated token become 4,225, and the GPU's time a token 23.24 ms → 22.55 ms. The answers' speed is within the
   runs' spread there, where the CPU's experts take most of a token.
 - **The controllers' blend,** the same setup: 4,225 dispatches a generated token become 3,937 (96 blends a token, four
-  dispatches each to one), the GPU's time a token about 0.9 ms less; with the input's norm, 3,841. The shader is exact against the CPU's separate ops and the same to the bit as the separate Vulkan ops; in the model, the logits
-  move a little (a median of 0.39 at 256 one-token positions, the same top token at every one), half of what turning
-  the Vulkan graph's reordering off does to the same build (0.79).
+  dispatches each to one), the GPU's time a token about 0.9 ms less; with the input's norm, 3,841. Both shaders are
+  the same to the bit as the separate Vulkan ops.
 - **Rounding:** the clip and the depth mix sum in another order than the separate ops. A 4-bit quant's perplexity is
   4.0683 against 4.0697 with the clip; with the depth mix, the KL divergence of one-token logits from the CPU's is
-  0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path). The copies and fills change no
-  value, but Inkling's rounding follows the graph's layout through the Vulkan fusions: with the fusions off, the logits
-  are the same to the bit before and after; with them on, 1 of 256 one-token positions takes another top token, about
-  what switching the fusions off does (2 of 256).
+  0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path).
+- **Rounding that follows the graph's order:** in a one-token graph, an ADD followed by the RMS_NORM of its one row
+  writes partial sums that the norm reduces (upstream's ADD + RMS_NORM fusion), in another order than the norm alone.
+  Any change that decides whether an ADD comes right before a norm changes that order: a fusion that takes the ADD in
+  (the blend before the attention's norm), a node shared or dropped (the copies and fills), or the graph's reordering.
+  The difference is an ulp at the first layer it reaches, but an expert near the router's cut can then flip, so
+  Inkling's logits move visibly: at 256 one-token positions a median of 0.4 to 0.8, about one top token of 256 (0.79
+  for switching the reordering off on the same build). With `GGML_VK_DISABLE_ADD_RMS_FUSION=1` the norm always
+  reduces alone, and the blend and the input's norm give the same logits as the separate ops, to the bit; so do the
+  copies and fills with the fusions off.
 
 ### Changes that apply without any option
 
@@ -1027,6 +1032,7 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `GGML_VK_DISABLE_DEPTH_MIX=1` | Vulkan: no fused depth mix ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CTRL_BLEND=1` | Vulkan: no fused blend of Inkling 2's loop controllers ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` | Vulkan: no fused norm of Inkling 2's loop controller input ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_ADD_RMS_FUSION=1` | Vulkan: no partial sums from an ADD for the one-row RMS_NORM after it, so that a new fusion can be compared with the graph before it to the bit ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONV_RES=1` | Vulkan: no fused SSM_CONV → ADD(residual) → SCALE |
 
 **Diagnostics**

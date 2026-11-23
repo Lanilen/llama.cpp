@@ -59,8 +59,9 @@ static const float    FIX_STDEV    = 0.1f;
 // not catch a wrong expert in a slot: with a quarter of the uploaded experts replaced by their neighbours the logits
 // of these random models move by 0.003 to 0.005 (qwen4exp) and 0.04 to 0.09 (glm5-next). The read-back checks do
 // (LLAMA_MOE_CACHE_VERIFY, LLAMA_MOE_CACHE_JIT_CHECK, LLAMA_OFFLOAD_FAST_CHECK: byte for byte against the host's).
-// inkling2_loop's rounding follows the graph's layout through the Vulkan fusions: the same math built with one node
-// shared or not gives 0.0007 to 0.0021 between a cached run and its reference (14600KF + RTX 4070 Ti, 2026-11-23).
+// inkling2_loop's rounding follows the graph's order: in a one-token graph an ADD right before a one-row RMS_NORM gives
+// it partial sums in another order (GGML_VK_DISABLE_ADD_RMS_FUSION), and a node shared or dropped decides which ADDs
+// those are; between a cached run and its reference that is 0.0007 to 0.0021 (14600KF + RTX 4070 Ti, 2026-11-23).
 static float tol_logit(const llm_arch arch) {
     return arch == LLM_ARCH_GLM5_NEXT ? 0.1f : arch == LLM_ARCH_INKLING2_LOOP ? 0.003f : 0.002f;
 }

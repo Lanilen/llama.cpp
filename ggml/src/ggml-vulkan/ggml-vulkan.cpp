@@ -5619,8 +5619,11 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
+        // GGML_VK_DISABLE_ADD_RMS_FUSION: no partial sums from an ADD for the one-row RMS_NORM after it; that norm then
+        // reduces as a plain one, so a fusion that takes the ADD in (or changes which ADD comes right before a norm) can
+        // be compared with the graph before it bit for bit
         device->add_rms_fusion = device->subgroup_arithmetic &&
-                                 device->vendor_id != VK_VENDOR_ID_INTEL;
+                                 device->vendor_id != VK_VENDOR_ID_INTEL && getenv("GGML_VK_DISABLE_ADD_RMS_FUSION") == nullptr;
         device->partials_binding_alignment =
             std::max(4u, (uint32_t)device->properties.limits.minStorageBufferOffsetAlignment);
 
