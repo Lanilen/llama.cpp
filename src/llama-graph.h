@@ -1185,6 +1185,7 @@ struct llm_graph_context {
               ggml_tensor * cur) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    // w_s defaults to the weight scale of w
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
@@ -1197,7 +1198,6 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
               ggml_tensor * slots = nullptr,
               ggml_tensor * ids_s = nullptr) const;
 
@@ -1270,9 +1270,6 @@ struct llm_graph_context {
                      int   il,
              ggml_tensor * probs_in = nullptr,
              ggml_tensor * gate_up_exps = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
@@ -1298,9 +1295,6 @@ struct llm_graph_context {
              ggml_tensor * probs_in = nullptr,
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * gate_up_exps_b = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
