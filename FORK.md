@@ -741,10 +741,8 @@ What it shows, in the order IQ4_XS on the RX 480s, then Q4 and Q6 on the R9700:
 
 ## The fork and upstream
 
-The fork follows upstream by merges, never rebases; every branch is at upstream `46eb1742d` (2026-11-21), past
-upstream's `v1.0.0`, with one later upstream commit taken ahead of the next merge: the loop fix for Inkling 2 Mini
-(#32704, `690b87d88`, cherry-picked onto `moe-hot-spare` with its hash), without which Unsloth's mainline files give
-wrong output. The rule for a conflict: where upstream has its own version of something the fork built and it
+The fork follows upstream by merges, never rebases; every branch is at upstream `f4f6f2e7d` (2026-11-23), past
+upstream's `v1.0.0`. The rule for a conflict: where upstream has its own version of something the fork built and it
 performs about as well in general, upstream's version stays and ours goes; ours stays only where it measures better on
 the real workload.
 
@@ -800,6 +798,14 @@ the real workload.
 - **Looped models** (Inkling 2 Mini: 24 layers, the middle twelve run three times, 48 slots). The MoE cache sees the
   slots; in hot-spare mode the passes of a layer share one resident set
   ([docs/moe-hot-spare.md](docs/moe-hot-spare.md#looped-models)). A predictor is not used for one yet.
+- **Weight scales applied by the graph** (#32669): every `<weight>.scale` tensor a file carries is multiplied into its
+  mat-mul. The hot spare's expert mat-muls take them the same way, gathered by expert, not by slot.
+- **The fused lightning indexer, always on** (#32650). Flash-Next's scheduler splits are the same as before.
+- **SCALE through the strides on Vulkan** (#32735), the same change as the fork's own for Inkling's activation, line
+  for line. Upstream's text is kept.
+- **The whole copy of a looped model's host experts** (#32807): upstream copies every expert tensor of
+  `inkling2_loop` whole. The fork keeps that to the tensors the loop shares, so the layers that run once still copy
+  only their selected experts, through `LLAMA_OFFLOAD_FAST`'s staging memory when it is on.
 
 **The merge of 2026-11-14** (131 upstream commits, in six stages so that a break had few suspects) was accepted on
 the tuned setups, the build before against the build after, back to back, two passes each:
@@ -854,6 +860,13 @@ Inkling's activation scales a strided view), and upstream's copy of the selected
 scheduler copies once per graph, left the later passes of a layer reading experts that were never copied (a weight
 that several layers share is now copied whole). Unsloth's first UD-Q4_K_XL of Inkling 2 Mini is in the format from
 before upstream's merge (`inkling2`, `loop_*` tensors) and loads in neither build; ggml-org's Q8_0 is in the final one.
+
+**The merge of 2026-11-23** (42 upstream commits, in eleven stages) is checked so far on the 14600KF + RTX 4070 Ti:
+the fork's tests pass, Inkling 2 Mini's answers and peak memory in the hot-spare setup are the same as before,
+Flash-Next's scheduler splits are the same, and `test-backend-ops` passes. Two of the fork's own parts needed a change:
+the cache tests' random model now sets its per-tensor weight scales to 1, since the graph applies every one it finds,
+and the copy rule above. The acceptance on the R9700 and the RX 480s, with upstream's RDNA4 mat-vecs and its
+flash-attention change for coopmat1, is still to run.
 
 **Upstream's cache against the hot spare at the same memory.** The ladder's rung 1 gives upstream's cache what its own
 build can allocate. In the fork's build, which splits the cache's banks, it can take the hot spare's 20900 MiB on the

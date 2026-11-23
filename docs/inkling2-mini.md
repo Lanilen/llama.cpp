@@ -9,15 +9,13 @@ Layers 6–17 run three times a token, each pass with its own attention and conv
 token makes 48 layer passes over 24 layers' experts. The experts are most of the model and ship in NVFP4.
 
 What the fork adds for it:
-- **Vulkan runs its small ops on the GPU and fuses most of them:** a SCALE of strided views that left the GPU, and
-  five fusions ([Inkling 2's small ops](moe-hot-spare.md#inkling-2s-small-ops)).
+- **Vulkan fuses most of its small ops:** five fusions
+  ([Inkling 2's small ops](moe-hot-spare.md#inkling-2s-small-ops)).
 - **The hot spare cache keeps one resident set per physical layer,** so an expert cached for one pass serves the
   other two ([Looped models](moe-hot-spare.md#looped-models)).
 - **An expert predictor trained for it,** on 718 traces ([its results](moe-predictor.md#inkling-2-mini)), on Hugging
   Face as [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor),
   for requests through the chat template.
-- **Upstream's loop fix** (#32704, taken ahead of the next merge), without which the later passes run NVFP4 experts
-  without their scales.
 
 ## Contents
 
