@@ -8,6 +8,10 @@
 //
 // each written as its own shader writes it (scale.comp's x*p1 + p2, unary.comp's tanh and sigmoid), so the result is
 // the same to the bit. gate and up are the two halves of the merged gate_up, strided views.
+//
+// With has_scale, the halves are first multiplied by the scale of their expert slot and token (the graph's MUL of the
+// merged gate_up by [1, ne1, ne2], the per-expert weight scale gathered by the selected ids): the pass then reads the
+// expert matmul's output directly, and the scaled gate_up is never written.
 // After fast-inkling-mac's INKLING_SITU (https://github.com/newideas99/Fast-Inkling-Mac-Uncensored, patches/0002, MIT).
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
@@ -21,11 +25,13 @@ layout(push_constant) uniform parameter
     float inv_beta; float beta; float inv_lb; float lb;
     float bias;                           // the SCALEs' bias (0), at run time as in scale.comp
     uint has_lb;
+    uint has_scale; uint s_off;           // the scale of slot i1, token i2 at s_off + i2*ne1 + i1
 } p;
 
 layout(binding = 0) readonly buffer G {float data_g[];};
 layout(binding = 1) readonly buffer U {float data_u[];};
 layout(binding = 2) writeonly buffer D {float data_d[];};
+layout(binding = 3) readonly buffer S {float data_s[];};
 
 float op_tanh(float x) {
     return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
@@ -43,8 +49,13 @@ void main() {
         return;
     }
 
-    const float g = data_g[p.g_off + i2*p.g_nb2 + i1*p.g_nb1 + i0];
-    float u       = data_u[p.u_off + i2*p.u_nb2 + i1*p.u_nb1 + i0];
+    float g = data_g[p.g_off + i2*p.g_nb2 + i1*p.g_nb1 + i0];
+    float u = data_u[p.u_off + i2*p.u_nb2 + i1*p.u_nb1 + i0];
+    if (p.has_scale != 0) {
+        const float s = data_s[p.s_off + i2*p.ne1 + i1];
+        g = g * s;
+        u = u * s;
+    }
 
     float t   = g * p.inv_beta + p.bias;
     t         = op_tanh(t);

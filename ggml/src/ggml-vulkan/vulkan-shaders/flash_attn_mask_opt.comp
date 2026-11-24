@@ -25,6 +25,11 @@ layout (push_constant) uniform parameter {
     uint nbd1;
     uint nbd2;
     uint nbd3;
+    // the fork: a mask whose blocks are all -inf in the same places for every head (a per-head bias added to one
+    // mask) is read once, from that one mask, and its result written for n_rep heads; no_zero drops the all-zero
+    // code, which the biased mask does not have
+    uint n_rep;
+    uint no_zero;
 };
 
 #define MASK_OPT_ALL_NEG_INF 1
@@ -157,6 +162,12 @@ void main() {
     }
 
     if (tid == 0) {
+        if (no_zero != 0) {
+            result &= 0x55555555u;
+        }
         data_d[i0 + i1 * nbd1 + i2 * nbd2 + i3 * nbd3] = result;
+        for (uint h = 1; h < n_rep; ++h) {
+            data_d[i0 + i1 * nbd1 + (i2 + h) * nbd2 + i3 * nbd3] = result;
+        }
     }
 }

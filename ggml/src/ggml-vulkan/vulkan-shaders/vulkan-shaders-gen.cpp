@@ -1231,6 +1231,7 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     // the fork's conv from its two inputs with its state store (conv_split.comp), [without, with] the dynamic taps
     string_to_spv("situ_f32", "situ.comp", {});
+    string_to_spv("moe_sum_f32", "moe_sum.comp", {});
     string_to_spv("bias_mask_f32_f16", "bias_mask.comp", {});
     string_to_spv("conv_split_f32", "conv_split.comp", {{"DYN_TAPS", "0"}});
     string_to_spv("conv_split_dyn_f32", "conv_split.comp", {{"DYN_TAPS", "1"}});

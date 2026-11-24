@@ -393,17 +393,20 @@ private:
     std::vector<float> moe_hidden_buf; // the newest token's input of a layer the MoE predictor reads
 
     // LLAMA_WINDOW_TIMING: host time of the batches that output all their tokens, by step and length, printed when the context is freed
+    // LLAMA_WINDOW_TIMING=2: the other batches too (a prompt's), as one more kind with their tokens
     struct decode_timing {
         enum step { SETUP, BUILD, GRAPH, INPUTS, BEFORE, COMPUTE, HIDDEN, UPDATE, EXTRACT, N_STEPS };   // GRAPH: the scheduler's allocation
-        static constexpr int N_KINDS = 5; // 1, 2, 3, 4 tokens, longer
+        static constexpr int N_KINDS = 5; // 1, 2, 3, 4 tokens, longer; then the batches that do not output all their tokens
 
         bool    enabled = false;
+        bool    prompts = false;
         bool    built   = false;
         int64_t t_last  = 0;
         int64_t t_cur[N_STEPS] = {};
-        int64_t t_sum[N_KINDS][N_STEPS] = {};
-        int64_t n[N_KINDS]       = {};
-        int64_t n_built[N_KINDS] = {};
+        int64_t t_sum[N_KINDS + 1][N_STEPS] = {};
+        int64_t n[N_KINDS + 1]       = {};
+        int64_t n_built[N_KINDS + 1] = {};
+        int64_t n_prompt_tokens      = 0;
 
         void begin();
         void lap(step s);

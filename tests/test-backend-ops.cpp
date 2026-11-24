@@ -8490,24 +8490,30 @@ struct test_bias_mask : public test_case {
 // builds it from the halves of the merged gate_up; the Vulkan backend fuses it (SITU)
 struct test_situ : public test_case {
     const int64_t n_ff, n_used, n_tokens;
+    const bool scaled; // gate_up is first multiplied by a scale for each expert slot and token (SITU_SCALE)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "SITU";
+        return scaled ? "SITU_SCALE" : "SITU";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_ff, n_used, n_tokens);
+        return VARS_TO_STR4(n_ff, n_used, n_tokens, scaled);
     }
 
-    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1)
-        : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens) {}
+    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1, bool scaled = false)
+        : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens), scaled(scaled) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_tokens);
         ggml_set_name(gate_up, "gate_up");
+        if (scaled) {
+            ggml_tensor * scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+            ggml_set_name(scale, "scale");
+            gate_up = ggml_mul(ctx, gate_up, scale);
+        }
         ggml_tensor * x  = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
         ggml_tensor * up = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
         if (mode == MODE_TEST) {
@@ -8519,6 +8525,56 @@ struct test_situ : public test_case {
         act = ggml_mul(ctx, act, ggml_sigmoid(ctx, x));
         up = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
         ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the weighted sum of a MoE layer's expert outputs as build_moe_ffn builds it: [the outputs times the scales of their
+// expert slots,] times the routing weights, the slots' views added in order; the Vulkan backend fuses it (MOE_SUM)
+struct test_moe_sum : public test_case {
+    const int64_t n_embd, n_used, n_tokens;
+    const bool scaled;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_SUM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_used, n_tokens, scaled);
+    }
+
+    test_moe_sum(int64_t n_embd = 2304, int64_t n_used = 8, int64_t n_tokens = 1, bool scaled = true)
+        : n_embd(n_embd), n_used(n_used), n_tokens(n_tokens), scaled(scaled) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+        ggml_set_name(experts, "experts");
+        if (scaled) {
+            ggml_tensor * scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+            ggml_set_name(scale, "scale");
+            experts = ggml_mul(ctx, experts, scale);
+        }
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "weights");
+        experts = ggml_mul(ctx, experts, weights);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, experts);
+        }
+        std::vector<ggml_tensor *> views;
+        for (int64_t i = 0; i < n_used; ++i) {
+            views.push_back(ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]));
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, views.back());
+            }
+        }
+        ggml_tensor * out = views[0];
+        for (int64_t i = 1; i < n_used; ++i) {
+            out = ggml_add(ctx, out, views[i]);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -8674,7 +8730,7 @@ struct test_ctrl_blend : public test_case {
 };
 
 // Inkling 2's depth mix: attention over the earlier block outputs (normalized) and the current state, as
-// llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses one token's (DEPTH_MIX)
+// llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses it for one token and for a ubatch (DEPTH_MIX)
 struct test_depth_mix : public test_case {
     const int64_t n_embd, n_blocks, n_query, n_tokens;
 
@@ -14060,12 +14116,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
     }
     test_cases.emplace_back(new test_situ(100, 3, 7));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        test_cases.emplace_back(new test_situ(1152, 8, n_tokens, true));
+    }
+    test_cases.emplace_back(new test_situ(100, 3, 7, true));
+    for (bool scaled : { true, false }) {
+        for (int64_t n_tokens : { 1, 3, 512 }) {
+            test_cases.emplace_back(new test_moe_sum(2304, 8, n_tokens, scaled));
+        }
+        test_cases.emplace_back(new test_moe_sum(100, 3, 7, scaled));
+        test_cases.emplace_back(new test_moe_sum(64, 15, 5, scaled));
+    }
     for (int64_t n_tokens : { 1, 3 }) {
         for (int64_t n_heads : { 0, 8 }) {
             test_cases.emplace_back(new test_conv_split(1024, n_tokens, n_heads));
         }
     }
     test_cases.emplace_back(new test_conv_split(2304, 1, 0));
+    // a prompt's ubatch: the fusion fires there too once its inputs stay allocated
+    for (int64_t n_heads : { 0, 8 }) {
+        test_cases.emplace_back(new test_conv_split(1024, 512, n_heads));
+    }
+    test_cases.emplace_back(new test_conv_split(2304, 64, 24));
     for (int64_t n_tokens : { 1, 3, 512 }) {
         for (bool msg_view : { true, false }) {
             test_cases.emplace_back(new test_concat_rms_norm(2304, n_tokens, msg_view));
@@ -14085,7 +14157,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    test_cases.emplace_back(new test_depth_mix(2304, 4, 3, 5));   // a prompt's: repeated queries, not fused
+    // a prompt's ubatch: the queries repeated for each token, fused too (the shader reads the one query)
+    test_cases.emplace_back(new test_depth_mix(2304, 4, 3, 5));
+    test_cases.emplace_back(new test_depth_mix(2304, 2, 1, 512));
+    test_cases.emplace_back(new test_depth_mix(2304, 1, 4, 512));
 
     for (bool with_bias : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,
