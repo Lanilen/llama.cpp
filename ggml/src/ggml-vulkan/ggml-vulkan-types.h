@@ -618,6 +618,21 @@ static constexpr std::initializer_list<std::array<int, 3>> depth_mix_edges {
     { 6, 1, 5 }, // mul_mat->src[1]  == soft_max
 };
 
+// the same for a ubatch of several tokens, where the graph repeats the query for each token before the scores
+static constexpr std::initializer_list<ggml_op> depth_mix_rep_pattern { GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE,
+                                                                         GGML_OP_CONT, GGML_OP_REPEAT, GGML_OP_MUL_MAT,
+                                                                         GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_rep_edges {
+    { 1, 1, 0 }, // concat->src[1]   == rms_norm
+    { 2, 0, 1 }, // transpose->src[0] == concat
+    { 3, 0, 2 }, // cont->src[0]     == transpose
+    { 5, 0, 1 }, // mul_mat->src[0]  == concat (the scores)
+    { 5, 1, 4 }, // mul_mat->src[1]  == the repeated query
+    { 6, 0, 5 }, // soft_max->src[0] == the scores
+    { 7, 0, 3 }, // mul_mat->src[0]  == cont (the mix)
+    { 7, 1, 6 }, // mul_mat->src[1]  == soft_max
+};
+
 static constexpr std::initializer_list<ggml_op> clip_rows_scale_pattern { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS,
     GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> clip_rows_pattern { GGML_OP_SQR, GGML_OP_SUM_ROWS,
@@ -1520,7 +1535,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
-    bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
+    bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT [REPEAT] MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
     bool fused_bias_mask {};       // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY: Inkling 2's biased F16 mask
     bool fused_situ {};            // SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation

@@ -8430,14 +8430,16 @@ static void ggml_vk_ctrl_blend(ggml_backend_vk_context * ctx, vk_context& subctx
 
 // a fused depth mix (depth_mix_pattern starting at node_idx), one workgroup a token
 static void ggml_vk_depth_mix(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    // depth_mix_rep_pattern has the query's REPEAT before the scores: the shader reads its source for every token
+    const int r = cgraph->nodes[node_idx + 4]->op == GGML_OP_REPEAT ? 1 : 0;
     const ggml_tensor * rms    = cgraph->nodes[node_idx];
     const ggml_tensor * concat = cgraph->nodes[node_idx + 1];
-    const ggml_tensor * scores = cgraph->nodes[node_idx + 4];
-    const ggml_tensor * sm     = cgraph->nodes[node_idx + 5];
-    ggml_tensor       * dst    = cgraph->nodes[node_idx + 6];
+    const ggml_tensor * scores = cgraph->nodes[node_idx + 4 + r];
+    const ggml_tensor * sm     = cgraph->nodes[node_idx + 5 + r];
+    ggml_tensor       * dst    = cgraph->nodes[node_idx + 6 + r];
     const ggml_tensor * cur    = rms->src[0];
     const ggml_tensor * blocks = concat->src[0];
-    const ggml_tensor * query  = scores->src[1];
+    const ggml_tensor * query  = r ? cgraph->nodes[node_idx + 4]->src[0] : scores->src[1];
     VK_LOG_DEBUG("ggml_vk_depth_mix(" << blocks << ", " << cur << ", " << query << ", " << dst << ")");
 
     vk_pipeline pipeline = ctx->device->pipeline_depth_mix_f32;
@@ -15544,24 +15546,38 @@ static bool ggml_vk_can_fuse_ctrl_blend(const struct ggml_cgraph * cgraph, int n
 }
 
 // depth_mix_pattern at node_idx: f32 throughout, the blocks and cur in rows of n_embd, at most 32 states and 4 queries, a
-// softmax without mask or ALiBi; GGML_VK_DISABLE_DEPTH_MIX turns it off
-static bool ggml_vk_can_fuse_depth_mix(const struct ggml_cgraph * cgraph, int node_idx) {
+// softmax without mask or ALiBi; GGML_VK_DISABLE_DEPTH_MIX turns it off. With rep, depth_mix_rep_pattern: a ubatch of
+// several tokens, whose query the graph repeats for each token (the shader reads the one query for all of them);
+// GGML_VK_DISABLE_DEPTH_MIX_BATCH turns that one off
+static bool ggml_vk_can_fuse_depth_mix(const struct ggml_cgraph * cgraph, int node_idx, bool rep = false) {
     static const bool disabled = getenv("GGML_VK_DISABLE_DEPTH_MIX") != nullptr;
-    if (disabled) {
+    static const bool disabled_rep = getenv("GGML_VK_DISABLE_DEPTH_MIX_BATCH") != nullptr;
+    if (disabled || (rep && disabled_rep)) {
         return false;
     }
-    const int last = node_idx + (int) depth_mix_pattern.size() - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, depth_mix_pattern, { last }) || !ggml_check_edges(cgraph, node_idx, depth_mix_edges)) {
+    const auto & pattern = rep ? depth_mix_rep_pattern : depth_mix_pattern;
+    const int last = node_idx + (int) pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, pattern, { last }) ||
+        !ggml_check_edges(cgraph, node_idx, rep ? depth_mix_rep_edges : depth_mix_edges)) {
         return false;
     }
+    const int r = rep ? 1 : 0;
     const ggml_tensor * rms    = cgraph->nodes[node_idx];
     const ggml_tensor * concat = cgraph->nodes[node_idx + 1];
-    const ggml_tensor * scores = cgraph->nodes[node_idx + 4];
-    const ggml_tensor * sm     = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * scores = cgraph->nodes[node_idx + 4 + r];
+    const ggml_tensor * sm     = cgraph->nodes[node_idx + 5 + r];
     const ggml_tensor * out    = cgraph->nodes[last];
     const ggml_tensor * cur    = rms->src[0];
     const ggml_tensor * blocks = concat->src[0];
-    const ggml_tensor * query  = scores->src[1];
+    // the repeat's source: one query for every token, which the repeat only copies
+    const ggml_tensor * query  = rep ? cgraph->nodes[node_idx + 4]->src[0] : scores->src[1];
+    if (rep) {
+        const ggml_tensor * repeated = cgraph->nodes[node_idx + 4];
+        if (query->ne[2] != 1 || query->ne[3] != 1 || repeated->ne[0] != query->ne[0] || repeated->ne[1] != query->ne[1] ||
+            repeated->ne[2] != cur->ne[2] || repeated->ne[3] != 1) {
+            return false;
+        }
+    }
     for (int i = node_idx; i <= last; ++i) {
         if (cgraph->nodes[i]->type != GGML_TYPE_F32) {
             return false;
@@ -16527,6 +16543,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_depth_mix = true;
                 fusion_string = "DEPTH_MIX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_depth_mix(cgraph, i, true)) {
+                ctx->num_additional_fused_ops = (int) depth_mix_rep_pattern.size() - 1;
+                ctx->fused_depth_mix = true;
+                fusion_string = "DEPTH_MIX";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_clip_rows(cgraph, i, true) || ggml_vk_can_fuse_clip_rows(cgraph, i, false)) {
                 ctx->num_additional_fused_ops = cgraph->nodes[i]->op == GGML_OP_MUL ? (int) clip_rows_scale_pattern.size() - 1
                                                                                      : (int) clip_rows_pattern.size() - 1;
@@ -17147,7 +17168,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return cover;
     };
-    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern });
+    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern });
     const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_pattern });
 
     int first_unused = 0;
@@ -17251,7 +17272,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (ggml_vk_is_mm_unary_at(graph, first_unused) && keep_pattern(mm_unary_pattern)) {
             continue;
         }
-        if (keep_pattern(depth_mix_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern) ||
+        if (keep_pattern(depth_mix_pattern) || keep_pattern(depth_mix_rep_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern) ||
             keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern) || keep_pattern(situ_pattern) || keep_pattern(bias_mask_pattern)) {
             continue;
         }
@@ -17287,7 +17308,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             if (!conv_cover[n]) {
                 return false;
             }
-            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern }) {
+            // (and the batch depth mix: its query's repeat depends on nothing in the chain)
+            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
                 for (int o = 0; o < (int) pat->size(); ++o) {
                     if (n - o >= 0 && match_pattern(*pat, n - o)) {
                         return true;

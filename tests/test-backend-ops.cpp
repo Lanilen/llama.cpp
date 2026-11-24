@@ -8672,7 +8672,7 @@ struct test_ctrl_blend : public test_case {
 };
 
 // Inkling 2's depth mix: attention over the earlier block outputs (normalized) and the current state, as
-// llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses one token's (DEPTH_MIX)
+// llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses it for one token and for a ubatch (DEPTH_MIX)
 struct test_depth_mix : public test_case {
     const int64_t n_embd, n_blocks, n_query, n_tokens;
 
@@ -14077,7 +14077,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    test_cases.emplace_back(new test_depth_mix(2304, 4, 3, 5));   // a prompt's: repeated queries, not fused
+    // a prompt's ubatch: the queries repeated for each token, fused too (the shader reads the one query)
+    test_cases.emplace_back(new test_depth_mix(2304, 4, 3, 5));
+    test_cases.emplace_back(new test_depth_mix(2304, 2, 1, 512));
+    test_cases.emplace_back(new test_depth_mix(2304, 1, 4, 512));
 
     for (bool with_bias : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,
