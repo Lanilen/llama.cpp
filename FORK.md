@@ -66,11 +66,13 @@ llama.cpp with its defaults to the fork's setup, on one request set per machine:
 | [`moe-predictor`](https://github.com/Lanilen/llama.cpp/tree/moe-predictor) | `moe-hot-spare` plus the expert predictor and its training pipeline, just-in-time uploads for prompts that keep the cache, the work beside the MoE, and the tuning script with its cache and draft stages | [docs/moe-predictor.md](docs/moe-predictor.md) |
 | [`moe-tuning`](https://github.com/Lanilen/llama.cpp/tree/moe-tuning) | `moe-predictor` plus the CPU's expert op, larger prompts that keep the cache, faster expert copies for those that don't, the graph per batch length, and the tuning script's CPU and Vulkan stages | [docs/moe-hot-spare.md](docs/moe-hot-spare.md#the-cpus-experts), [tools/moe-trace](tools/moe-trace/README.md#tuning-a-machine) |
 | [`vk-rdna4`](https://github.com/Lanilen/llama.cpp/tree/vk-rdna4) | Vulkan matrix kernel tuning for RDNA4; it passes its tests, and the tuning continues | [docs/vk-rdna4.md](docs/vk-rdna4.md) |
+| [`vk-argmax`](https://github.com/Lanilen/llama.cpp/tree/vk-argmax) | a Vulkan ARGMAX for vocabulary-sized rows, and the CPU's index when the largest value repeats | [docs/inkling2-mini.md](docs/inkling2-mini.md#speculative-decoding-with-its-dspark-drafter) |
 | `master` | upstream, unchanged | |
 
 Each branch is upstream llama.cpp plus that part, kept up to date with upstream by merges, so a part can be used
 without the others. `moe-predictor` is stacked on `moe-hot-spare`, and `moe-tuning` on `moe-predictor`. `polaris`
-merges all five.
+merges all six, and upstream changes taken before upstream merges them
+([The fork and upstream](#the-fork-and-upstream)).
 
 ## What the fork adds
 
@@ -276,6 +278,9 @@ apply to any such model, with or without the cache:
 - **Polling the GPU instead of sleeping** (`GGML_VK_SPIN_WAIT=N`, opt-in): a split model's host blocks on the GPU once
   a layer, and a blocking wait returns through an interrupt and the scheduler; with this the host polls the semaphore
   for up to N µs first.
+- **ARGMAX of a long row in one large workgroup** (branch `vk-argmax`): a row was one subgroup's threads, so an
+  ARGMAX over a vocabulary (200,058 logits, what a drafter takes at each step) took 1.23 ms on the R9700 and 2.06 ms on
+  an RX 480. Rows longer than 4096 now take 1024 threads: 59 and 129 µs. Ties now give the CPU's index (the last).
 - **A graph per batch length** (`LLAMA_GRAPH_CACHE=N`, opt-in): a verify batch of another length than the last one
   rebuilds and reallocates the graph, 14–21 ms on the 1920X. With the cache, each small length (up to
   `LLAMA_GRAPH_CACHE_TOKENS` tokens, 16) keeps a scheduler and graph of its own, about 50 MiB of device memory each,
@@ -499,12 +504,11 @@ llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8
 ```
 
-27–28.5 tokens a second generating and 65–70 on a 1.3k-token prompt, in 8.3 GB of VRAM (measured with the predictor's
-version 3; version 5 has the same size and cost). The predictor is for chat requests: for raw completion, leave out
-the two `--moe-cache-predictor` files. `--no-op-offload` is needed
-on NVIDIA, `-t 6` is the CPU's performance cores, and the cache size follows the free VRAM. The guide,
-[docs/inkling2-mini.md](docs/inkling2-mini.md), has why each setting, the sizes for 6 and 8 GB cards, the quants, and
-the RX 480 and R9700 measurements.
+30–32 tokens a second generating and 70 on a 1.3k-token prompt, in 7.6 GB of VRAM with a light desktop on the card; with
+`--moe-cache-mib 7500`, 35–37 tokens a second in 11.6 GB. The predictor is for chat requests: for raw completion, leave
+out the two `--moe-cache-predictor` files. `--no-op-offload` is needed on NVIDIA, `-t 6` is the CPU's performance cores,
+and the cache size follows the free VRAM. The guide, [docs/inkling2-mini.md](docs/inkling2-mini.md), has why each
+setting, the sizes for 6 and 8 GB cards, the quants, and the RX 480 and R9700 measurements.
 
 **Its small ops on the GPU:** in this setup a generated token runs 2,652 Vulkan dispatches, 4,541 before the fusions
 of 2026-11-23: the loop controllers' blend and input norm, the short convolutions read from their two inputs with
@@ -522,9 +526,11 @@ Three measurements outside Flash-Next, for models that fit a card:
   (185 against 116 tok/s) and ROCm reads prompts faster. With Flash-Next's experts on the CPU and no hot spare, the two
   generate at about the same speed (ROCm −1.8% to +4.2%), and ROCm reads prompts 72–90% faster.
 - **Inkling 2 Mini on the R9700,** whole on the card (llama-bench): with Unsloth's UD-Q4_K_XL the fork generates at
-  48.0 tok/s, upstream's Vulkan at 37.2 and its ROCm at 33.7; prompts of 512 at 1265, 1200 and 1278 tok/s, and at a
-  depth of 2048 at 1007–1042, 965–970 and 656. The Q8_0 alike: 46.2, 36.2 and 31.2 tok/s. The fork's lead is the
-  fusions of the model's small ops ([docs/inkling2-mini.md](docs/inkling2-mini.md#whole-on-one-gpu-1920x--r9700)).
+  62.3 tok/s, upstream's Vulkan at 37.2 and its ROCm at 33.7; prompts of 512 at 1360–1382, 1200 and 1278 tok/s, and at
+  a depth of 2048 at 1219, 965–970 and 656. The Q8_0 alike: 59.5, 36.2 and 31.2 tok/s. The fork's lead is the fusions
+  of the model's small ops ([docs/inkling2-mini.md](docs/inkling2-mini.md#whole-on-one-gpu-1920x--r9700)). With the
+  model's own drafter (DSpark, below), its answers to everyday requests go from 57.4–57.5 to 80.7–82.5 tok/s, and new code
+  from 59.0 to 64.1–66.6 ([the table](docs/inkling2-mini.md#speculative-decoding-with-its-dspark-drafter)).
 
 ## Tuning a machine
 
@@ -872,12 +878,25 @@ scheduler copies once per graph, left the later passes of a layer reading expert
 that several layers share is now copied whole). Unsloth's first UD-Q4_K_XL of Inkling 2 Mini is in the format from
 before upstream's merge (`inkling2`, `loop_*` tensors) and loads in neither build; ggml-org's Q8_0 is in the final one.
 
-**The merge of 2026-11-23** (42 upstream commits, in eleven stages) is checked so far on the 14600KF + RTX 4070 Ti:
-the fork's tests pass, Inkling 2 Mini's answers and peak memory in the hot-spare setup are the same as before,
-Flash-Next's scheduler splits are the same, and `test-backend-ops` passes. Two of the fork's own parts needed a change:
-the cache tests' random model now sets its per-tensor weight scales to 1, since the graph applies every one it finds,
-and the copy rule above. The acceptance on the R9700 and the RX 480s, with upstream's RDNA4 mat-vecs and its
-flash-attention change for coopmat1, is still to run.
+**The merge of 2026-11-23** (42 upstream commits, in eleven stages): the fork's tests pass, Inkling 2 Mini's answers
+and peak memory in the hot-spare setup are the same as before, Flash-Next's scheduler splits are the same, and
+`test-backend-ops` passes. Two of the fork's own parts needed a change: the cache tests' random model now sets its
+per-tensor weight scales to 1, since the graph applies every one it finds, and the copy rule above. The acceptance on
+the R9700 and the RX 480s (with the Inkling fusions of the same day) passed: all 23,422 op tests on the R9700 and an
+RX 480, the logits of Flash-Next and of the RX480x2 setup within rounding, the tuned rungs' verify steps the same as
+before (Q4 61.7 / 61.5 ms, Q6 75.2 / 75.5, RX480x2 92.8 / 92.8). It found one slowdown of the fork's own: the Vulkan
+graph optimizer's guards for the new fusions searched every node, 3–5% of a Flash-Next verify step on the R9700, fixed
+by looking up which nodes a fusion can cover once a call. A flash-attention case that ran slower once ran the same in
+an interleaved rerun; one of upstream's RDNA4 decode cases at 2k of context has two speeds, on either build.
+
+**Taken before upstream merges it: Inkling 2's DSpark drafter**
+([#32218](https://github.com/ggml-org/llama.cpp/pull/32218) by pwilkin, at `9f57b4453`, still under review),
+merged into `polaris` as it stands, since it is upstream's own code and will come with a merge once upstream takes it
+([docs/inkling2-mini.md](docs/inkling2-mini.md#speculative-decoding-with-its-dspark-drafter)). With it the fork's
+checks pass (all 23,429 op tests and the cache tests on an RX 460). Its taps of the hidden states share their slots
+with the expert predictor's: they agree for the first six layers and the loop's first pass, which is all Inkling's
+predictor reads (same hits, predictions and text with and without it, on an RX 480). A predictor reading a later
+layer of a looped model would collide.
 
 **Upstream's cache against the hot spare at the same memory.** The ladder's rung 1 gives upstream's cache what its own
 build can allocate. In the fork's build, which splits the cache's banks, it can take the hot spare's 20900 MiB on the
@@ -950,6 +969,9 @@ These either didn't help or cost more than they gained. Measured on the 1920X + 
   worked, but verify passes got slower (36.0 / 50.0 / 93.5 ms → 45.9 / 67.0 / 112.4 at 1 / 3 / 8 tokens): the
   prediction's ops, the read-back and the touch's memory traffic cost 8–11 ms a pass, and the CPU's op is only 7–15 ms
   of it. Archived as the tag `archive/early-routing`.
+- **Inkling 2 drafting for itself** with fewer passes of its loop (one pass agrees with three on 71–77% of tokens but
+  costs half a token: 0.89–0.95× of plain decoding), and **upstream's n-gram drafts** on everyday requests (3–20%
+  slower) ([docs/inkling2-mini.md](docs/inkling2-mini.md#tried-and-not-kept)).
 - **ik_llama.cpp's CPU kernels** for the experts. On the 1920X its AVX2 K-quant dot is slower per thread than ggml's
   (Qwen3-30B-A3B with one thread: 5.09 → 4.43 tok/s on q4_K experts, 4.08 → 3.22 on q6_K). With 12 threads it reaches
   26.96 and 20.66 tok/s against this fork's fused op at 25.84 and 21.31: its gain there is work distribution, which the
@@ -957,6 +979,8 @@ These either didn't help or cost more than they gained. Measured on the 1920X + 
 
 ## Still to measure
 
+- **Inkling 2's drafter beside the hot spare** (one RX 480, the RTX 4070 Ti), a smaller draft vocabulary chosen as an
+  answer goes, and two drafts at a near tie ([docs/inkling2-mini.md](docs/inkling2-mini.md#still-to-measure)).
 - **Whether upstream's small-n split_k should also cover GCN** (the RX 480s): the fork's own version did.
 - **The indexer's shader against today's upstream** on an RX 480: the guide's tables predate upstream's mask kernel.
 - **Upstream's `GGML_VK_KEEPALIVE` against the udev rule** that keeps the RX 480s awake.
