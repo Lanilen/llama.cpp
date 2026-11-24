@@ -667,6 +667,9 @@ static constexpr std::initializer_list<ggml_op> situ_scale_pattern { GGML_OP_MUL
 // ggml's): the fused shader never writes it, so its allocation is a token one (ggml_backend_vk_buffer_type_get_alloc_size).
 // Inkling 2's biased mask has two such tensors of [n_kv, n_q, n_head] F32, 768 MiB each at 512 tokens of a 16k context.
 #define GGML_VK_TENSOR_FLAG_ELIDED (1 << 24)
+// A FLASH_ATTN_EXT whose per-head mask is one mask plus a per-head bias (Inkling 2), and whose one mask the
+// optimizer kept allocated to it: the blocks that are all -inf are found in the one mask (ggml_vk_fa_mask_base)
+#define GGML_VK_TENSOR_FLAG_FA_MASK_BASE (1 << 25)
 
 // Inkling 2's short convolution from its two inputs with its state store: x = concat(past, cur), the state the last
 // columns of x (a CPY), then the conv with its residual and scale; the dynamic form adds the input-dependent taps, lag

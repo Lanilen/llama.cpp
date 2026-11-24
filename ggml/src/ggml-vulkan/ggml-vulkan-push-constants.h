@@ -1057,6 +1057,8 @@ struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nbd1;
     uint32_t nbd2;
     uint32_t nbd3;
+    uint32_t n_rep;
+    uint32_t no_zero;
 };
 
 struct vk_op_flash_attn_sparse_compact_push_constants {

@@ -9459,6 +9459,32 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// The one F16 mask under a per-head mask built as cast(bias + cast(mask)) (llm_graph_context::build_attn with a
+// relative-position bias): [n_kv, n_q, 1, n_stream] where the per-head mask is [n_kv, n_q, n_head, n_stream]. The bias
+// is finite, so a block of the per-head mask is all -inf exactly where the one mask's is, for every head: flash
+// attention's block scan then reads the one mask (2 bytes a cell) and not every head's (48 with 24 heads), in each
+// layer. GGML_VK_DISABLE_FA_MASK_BASE=1 turns it off.
+static const ggml_tensor * ggml_vk_fa_mask_base(const ggml_tensor * mask) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_FA_MASK_BASE") != nullptr;
+    if (disabled || mask == nullptr || mask->op != GGML_OP_CPY || mask->type != GGML_TYPE_F16 || mask->ne[2] <= 1) {
+        return nullptr;
+    }
+    const ggml_tensor * add = mask->src[0];
+    if (add == nullptr || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, mask)) {
+        return nullptr;
+    }
+    const ggml_tensor * m32 = add->src[1];
+    if (m32 == nullptr || m32->op != GGML_OP_CPY || m32->type != GGML_TYPE_F32 || m32->src[0] == nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * base = m32->src[0];
+    if (base->type != GGML_TYPE_F16 || base->nb[0] != sizeof(ggml_fp16_t) || !ggml_are_same_shape(base, m32) ||
+        base->ne[0] != mask->ne[0] || base->ne[1] != mask->ne[1] || base->ne[2] != 1 || base->ne[3] != mask->ne[3]) {
+        return nullptr;
+    }
+    return base;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -9955,7 +9981,30 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
-    if (use_mask_opt)
+    // the one mask under a per-head biased mask, when the optimizer kept it allocated to this node
+    const ggml_tensor * mask_base = use_mask_opt && (dst->flags & GGML_VK_TENSOR_FLAG_FA_MASK_BASE) ? ggml_vk_fa_mask_base(mask) : nullptr;
+
+    if (use_mask_opt && mask_base != nullptr)
+    {
+        const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
+            nem0,
+            nem1,
+            1,
+            (uint32_t)(mask_base->nb[1] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask_base->nb[2] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask_base->nb[3] / sizeof(ggml_fp16_t)),
+            mask_opt_num_dwords,
+            mask_opt_num_dwords * CEIL_DIV(nem1, Br),
+            mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2,
+            nem2, 1,
+        };
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
+                                  { ggml_vk_tensor_subbuffer(ctx, mask_base), mask_opt_buf }, opt_pc,
+                                  { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem3 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    else if (use_mask_opt)
     {
         const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
             nem0,
@@ -9967,6 +10016,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             mask_opt_num_dwords,
             mask_opt_num_dwords * CEIL_DIV(nem1, Br),
             mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2,
+            0, 0,
         };
 
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
@@ -14897,8 +14947,9 @@ size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft)
 
 size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // a node inside a fused chain is never written (ggml_vk_graph_optimize marks them)
+    // (never more than the tensor's own size: an empty tensor stays empty)
     if (tensor->flags & GGML_VK_TENSOR_FLAG_ELIDED) {
-        return ggml_type_size(tensor->type);
+        return std::min(ggml_nbytes(tensor), ggml_type_size(tensor->type));
     }
     return ggml_nbytes(tensor);
 
@@ -17227,11 +17278,25 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     for (int i = 0; i < graph->n_nodes; ++i) {
-        graph->nodes[i]->flags &= ~GGML_VK_TENSOR_FLAG_ELIDED;
+        graph->nodes[i]->flags &= ~(GGML_VK_TENSOR_FLAG_ELIDED | GGML_VK_TENSOR_FLAG_FA_MASK_BASE);
     }
 
     if (ctx->device->disable_graph_optimize) {
         return;
+    }
+
+    // flash attention with a per-head biased mask reads the one mask under it for its block scan
+    // (ggml_vk_fa_mask_base); that mask's last reader in the graph is the cast before the bias, so it is kept
+    // allocated to the attention here
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        if (const ggml_tensor * base = ggml_vk_fa_mask_base(node->src[3])) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(base), node);
+            node->flags |= GGML_VK_TENSOR_FLAG_FA_MASK_BASE;
+        }
     }
 
     // Inkling 2's biased mask (bias_mask_pattern) is built as a chain of nine nodes, but other nodes can land between
@@ -17506,8 +17571,14 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             // allocator would also let the chain's result take an inner node's place (same layout), or an inner node
             // an input's (and free the rest of it): a dependency on the inner operands of the last node prevents the
             // first, the inputs' own dependencies the second. GGML_VK_DISABLE_FUSION_ELIDE=1 turns it off.
+            // (not in a build with assertions: the scheduler asserts an allocation of at least the tensor's size)
             static const bool no_elide = getenv("GGML_VK_DISABLE_FUSION_ELIDE") != nullptr;
+#ifdef NDEBUG
             const bool elide = !no_elide && !no_deps && !ctx->device->disable_fusion;
+#else
+            const bool elide = false;
+            GGML_UNUSED(no_elide);
+#endif
             auto const &elide_chain = [&](int first, int len) {
                 ggml_tensor * last_node = graph->nodes[first + len - 1];
                 for (int j = 0; j < len - 1; ++j) {
