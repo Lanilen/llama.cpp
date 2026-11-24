@@ -4315,7 +4315,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_scale_f32, "ssm_conv_res_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_bias_mask_f32_f16, "bias_mask_f32_f16", bias_mask_f32_f16_len, bias_mask_f32_f16_data, "main", 5, sizeof(vk_op_bias_mask_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 4, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_moe_sum_f32, "moe_sum_f32", moe_sum_f32_len, moe_sum_f32_data, "main", 4, sizeof(vk_op_moe_sum_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[0], "conv_split_f32", conv_split_f32_len, conv_split_f32_data, "main", 5, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_split_f32[1], "conv_split_dyn_f32", conv_split_dyn_f32_len, conv_split_dyn_f32_data, "main", 6, sizeof(vk_op_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
 
@@ -8376,25 +8377,172 @@ static bool ggml_vk_can_fuse_situ(const struct ggml_cgraph * cgraph, int node_id
     return ggml_is_contiguous(out);
 }
 
-// a fused SITU activation (situ_pattern at node_idx)
+// situ_scale_pattern at node_idx: the activation above of the two halves of a MUL of the merged gate_up by the scales
+// of its expert slots, [1, n_used, n_tokens] (build_lora_mm_id, a file with scaled expert weights); the pass then reads
+// the MUL's operands and the scaled gate_up is never written. GGML_VK_DISABLE_SITU_SCALE turns it off
+static bool ggml_vk_can_fuse_situ_scale(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_SITU_SCALE") != nullptr;
+    if (disabled || cgraph->nodes[node_idx]->op != GGML_OP_MUL) {
+        return false;
+    }
+    const int last = node_idx + (int) situ_scale_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, situ_scale_pattern, { last }) || !ggml_vk_can_fuse_situ(cgraph, node_idx + 3)) {
+        return false;
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx], * gate = cgraph->nodes[node_idx + 1], * up = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * raw = mul->src[0], * scale = mul->src[1];
+    if (cgraph->nodes[node_idx + 3]->src[0] != gate || cgraph->nodes[node_idx + 8]->src[0] != up ||
+        gate->src[0] != mul || up->src[0] != mul || gate->view_src != mul || up->view_src != mul) {
+        return false;
+    }
+    // the halves are read from raw at the views' places in the MUL
+    if (mul->type != GGML_TYPE_F32 || raw->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul, raw) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(raw) || !ggml_is_contiguous(scale) ||
+        scale->ne[0] != 1 || scale->ne[1] != mul->ne[1] || scale->ne[2] != mul->ne[2] || scale->ne[3] != 1 || mul->ne[3] != 1) {
+        return false;
+    }
+    return true;
+}
+
+// a fused SITU activation (situ_pattern at node_idx, or situ_scale_pattern: the chain then starts three nodes on)
 static void ggml_vk_situ(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * const * n = cgraph->nodes + node_idx;
+    const bool scaled = cgraph->nodes[node_idx]->op == GGML_OP_MUL;
+    const int first = node_idx + (scaled ? 3 : 0);
+    const ggml_tensor * const * n = cgraph->nodes + first;
     const ggml_tensor * gate = n[0]->src[0], * up = n[5]->src[0];
-    ggml_tensor * dst = cgraph->nodes[node_idx + 8];
+    ggml_tensor * dst = cgraph->nodes[first + 8];
     vk_pipeline pipeline = ctx->device->pipeline_situ_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     const uint32_t fs = sizeof(float);
+    // scaled: gate and up are views of the MUL, which is not computed; the same elements of its first operand are read
+    const ggml_tensor * raw   = scaled ? cgraph->nodes[node_idx]->src[0] : nullptr;
+    const ggml_tensor * scale = scaled ? cgraph->nodes[node_idx]->src[1] : nullptr;
+    const uint32_t g_off = scaled ? (uint32_t) ((get_misalign_bytes(ctx, raw) + gate->view_offs)/fs) : get_misalign_bytes(ctx, gate)/fs;
+    const uint32_t u_off = scaled ? (uint32_t) ((get_misalign_bytes(ctx, raw) + up->view_offs)/fs)   : get_misalign_bytes(ctx, up)/fs;
     vk_op_situ_push_constants pc = {
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
-        (uint32_t) (gate->nb[1]/fs), (uint32_t) (gate->nb[2]/fs), get_misalign_bytes(ctx, gate)/fs,
-        (uint32_t) (up->nb[1]/fs), (uint32_t) (up->nb[2]/fs), get_misalign_bytes(ctx, up)/fs,
+        (uint32_t) (gate->nb[1]/fs), (uint32_t) (gate->nb[2]/fs), g_off,
+        (uint32_t) (up->nb[1]/fs), (uint32_t) (up->nb[2]/fs), u_off,
         (uint32_t) (dst->nb[1]/fs), (uint32_t) (dst->nb[2]/fs), get_misalign_bytes(ctx, dst)/fs,
         ggml_get_op_params_f32(n[0], 0), ggml_get_op_params_f32(n[2], 0), ggml_get_op_params_f32(n[5], 0), ggml_get_op_params_f32(n[7], 0),
         ggml_get_op_params_f32(n[0], 1), 1u,
+        scaled ? 1u : 0u, scaled ? get_misalign_bytes(ctx, scale)/fs : 0u,
     };
+    const vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx, scaled ? raw : gate, true);
+    const vk_subbuffer u_buf = scaled ? g_buf : ggml_vk_tensor_subbuffer(ctx, up, true);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, gate, true), ggml_vk_tensor_subbuffer(ctx, up, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        { g_buf, u_buf, ggml_vk_tensor_subbuffer(ctx, dst, true), scaled ? ggml_vk_tensor_subbuffer(ctx, scale, true) : g_buf }, pc,
         { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] });
+}
+
+// The weighted sum of a MoE layer's expert outputs as build_moe_ffn builds it, at node_idx: [a MUL by the scales of the
+// expert slots (build_lora_mm_id, a file with scaled expert weights),] the MUL by the routing weights, one VIEW a slot,
+// and the ADDs of the views in their order. Returns its number of nodes, 0 without a match: the ops and their edges
+// only, so that the reorder pass can ask too.
+static int ggml_vk_moe_sum_len(const struct ggml_cgraph * cgraph, int node_idx) {
+    const int n_nodes = cgraph->n_nodes;
+    if (node_idx + 4 >= n_nodes || cgraph->nodes[node_idx]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    int w = node_idx;
+    if (cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
+        w = node_idx + 1;
+        if (cgraph->nodes[w]->src[0] != cgraph->nodes[node_idx]) {
+            return 0;
+        }
+    } else if (cgraph->nodes[node_idx + 1]->op != GGML_OP_VIEW) {
+        return 0;
+    }
+    const ggml_tensor * mw = cgraph->nodes[w];
+    // (the slots are bounded by the size of the fusion's bookkeeping, 32 nodes)
+    const int n_used = (int) mw->ne[1];
+    if (mw->ne[1] < 2 || mw->ne[1] > 15 || w + 2*n_used - 1 >= n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n_used; ++k) {
+        const ggml_tensor * v = cgraph->nodes[w + 1 + k];
+        if (v->op != GGML_OP_VIEW || v->src[0] != mw || v->view_src != mw || v->view_offs != k*mw->nb[1] ||
+            v->ne[0] != mw->ne[0] || v->ne[1] != mw->ne[2] || v->ne[2] != 1 || v->ne[3] != 1 || v->nb[1] != mw->nb[2]) {
+            return 0;
+        }
+    }
+    for (int k = 1; k < n_used; ++k) {
+        const ggml_tensor * a = cgraph->nodes[w + n_used + k];
+        if (a->op != GGML_OP_ADD || a->src[0] != cgraph->nodes[k == 1 ? w + 1 : w + n_used + k - 1] || a->src[1] != cgraph->nodes[w + 1 + k]) {
+            return 0;
+        }
+    }
+    return (w - node_idx) + 2*n_used;
+}
+
+// the sum above in one pass (MOE_SUM): f32, the weights and scales [1, n_used, n_tokens], nothing but the sum read
+// outside the chain. A sum that goes on into another ADD (a layer's residual) is left to MULTI_ADD, which takes that
+// ADD along. GGML_VK_DISABLE_MOE_SUM turns it off
+static bool ggml_vk_can_fuse_moe_sum(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_MOE_SUM") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const int len = ggml_vk_moe_sum_len(cgraph, node_idx);
+    if (len == 0) {
+        return false;
+    }
+    const int last = node_idx + len - 1;
+    int idxs[32];
+    ggml_op ops[32];
+    GGML_ASSERT(len <= 32);
+    for (int i = 0; i < len; ++i) {
+        idxs[i] = node_idx + i;
+        ops[i]  = cgraph->nodes[node_idx + i]->op;
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, len, ops, &last, 1)) {
+        return false;
+    }
+    const bool scaled = cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL;
+    const ggml_tensor * ms = scaled ? cgraph->nodes[node_idx] : nullptr;
+    const ggml_tensor * mw = cgraph->nodes[node_idx + (scaled ? 1 : 0)];
+    const ggml_tensor * x  = scaled ? ms->src[0] : mw->src[0];
+    const ggml_tensor * dst = cgraph->nodes[last];
+    if (last + 1 < cgraph->n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_ADD &&
+        (cgraph->nodes[last + 1]->src[0] == dst || cgraph->nodes[last + 1]->src[1] == dst)) {
+        return false;
+    }
+    auto const &slot_scalars = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+               t->ne[0] == 1 && t->ne[1] == mw->ne[1] && t->ne[2] == mw->ne[2] && t->ne[3] == 1;
+    };
+    if (mw->type != GGML_TYPE_F32 || mw->ne[3] != 1 || !ggml_is_contiguous(mw) || !slot_scalars(mw->src[1]) ||
+        x->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, mw) || x->nb[0] != sizeof(float) ||
+        (scaled && (ms->type != GGML_TYPE_F32 || !ggml_is_contiguous(ms) || !slot_scalars(ms->src[1]))) ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_moe_sum(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const bool scaled = cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL;
+    const ggml_tensor * ms = scaled ? cgraph->nodes[node_idx] : nullptr;
+    const ggml_tensor * mw = cgraph->nodes[node_idx + (scaled ? 1 : 0)];
+    const ggml_tensor * x  = scaled ? ms->src[0] : mw->src[0];
+    const ggml_tensor * s  = scaled ? ms->src[1] : nullptr;
+    const ggml_tensor * w  = mw->src[1];
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    vk_pipeline pipeline = ctx->device->pipeline_moe_sum_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t fs = sizeof(float);
+    vk_op_moe_sum_push_constants pc = {
+        (uint32_t) mw->ne[0], (uint32_t) mw->ne[1], (uint32_t) mw->ne[2],
+        (uint32_t) (x->nb[1]/fs), (uint32_t) (x->nb[2]/fs), get_misalign_bytes(ctx, x)/fs,
+        scaled ? get_misalign_bytes(ctx, s)/fs : 0u, get_misalign_bytes(ctx, w)/fs, get_misalign_bytes(ctx, dst)/fs,
+        (uint32_t) (dst->nb[1]/fs),
+        scaled ? 1u : 0u,
+    };
+    const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w, true);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x, true), scaled ? ggml_vk_tensor_subbuffer(ctx, s, true) : w_buf, w_buf,
+          ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        { (uint32_t) mw->ne[0], (uint32_t) mw->ne[2], 1 });
 }
 
 // a fused loop controller blend (ctrl_blend_pattern starting at node_idx): (cur - forget*cur) + gain*message
@@ -13945,7 +14093,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL:
-        if (ctx->fused_clip_rows) {
+        if (ctx->fused_situ) {
+            ggml_vk_situ(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_moe_sum) {
+            ggml_vk_moe_sum(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_clip_rows) {
             ggml_vk_clip_rows(ctx, compute_ctx, cgraph, node_idx);
         } else if (ctx->fused_ctrl_blend) {
             ggml_vk_ctrl_blend(ctx, compute_ctx, cgraph, node_idx);
@@ -16532,6 +16684,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_concat_rms_norm = false;
         ctx->fused_conv_split = false;
         ctx->fused_situ = false;
+        ctx->fused_moe_sum = false;
         ctx->fused_bias_mask = false;
         ctx->fused_depth_mix = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -16561,6 +16714,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 // the cast's CPY names its own output as a source: that alias, and only it, is allowed
                 op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
+            } else if (ggml_vk_can_fuse_situ_scale(cgraph, i)) {
+                ctx->num_additional_fused_ops = (int) situ_scale_pattern.size() - 1;
+                ctx->fused_situ = true;
+                fusion_string = "SITU_SCALE";
+                // the output is half the size of the matmul's it reads
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_moe_sum(cgraph, i)) {
+                ctx->num_additional_fused_ops = ggml_vk_moe_sum_len(cgraph, i) - 1;
+                ctx->fused_moe_sum = true;
+                fusion_string = "MOE_SUM";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_situ(cgraph, i)) {
                 ctx->num_additional_fused_ops = (int) situ_pattern.size() - 1;
                 ctx->fused_situ = true;
@@ -16874,6 +17038,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_concat_rms_norm = false;
                 ctx->fused_conv_split = false;
                 ctx->fused_situ = false;
+                ctx->fused_moe_sum = false;
                 ctx->fused_bias_mask = false;
                 ctx->fused_depth_mix = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -17165,7 +17330,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return cover;
     };
-    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern });
+    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern });
     const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_pattern });
 
     int first_unused = 0;
@@ -17281,7 +17446,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             bool kept = false;
             for (const auto * pat : { &depth_mix_pattern, &depth_mix_rep_pattern, &clip_rows_scale_pattern, &clip_rows_pattern,
                                       &ssm_conv_res_scale_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
-                                      &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern }) {
+                                      &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern }) {
                 if (match_pattern(*pat, first_unused)) {
                     if (!no_deps) {
                         add_pattern_alloc_deps(*pat, first_unused + (int) pat->size() - 1);
@@ -17292,6 +17457,33 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             if (kept) {
                 continue;
+            }
+            // the weighted sum of a MoE layer's expert outputs (MOE_SUM), one VIEW and one ADD an expert slot
+            if (const int len = ggml_vk_moe_sum_len(graph, first_unused)) {
+                if (std::none_of(used.begin() + first_unused, used.begin() + first_unused + len, [](bool u) { return u; })) {
+                    if (!no_deps) {
+                        std::set<ggml_tensor *> seen;
+                        for (int j = 0; j < len; ++j) {
+                            ggml_tensor * node = graph->nodes[first_unused + j];
+                            for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                                ggml_tensor * src = node->src[s];
+                                if (src && seen.insert(src).second) {
+                                    params->add_alloc_dep(params->user_data, src, graph->nodes[first_unused + len - 1]);
+                                }
+                            }
+                            seen.insert(node);
+                        }
+                    }
+                    for (int j = 0; j < len; ++j) {
+                        new_order.push_back(graph->nodes[first_unused + j]);
+                        used_node_set.insert(graph->nodes[first_unused + j]);
+                        used[first_unused + j] = true;
+                    }
+                    while (first_unused < graph->n_nodes && used[first_unused]) {
+                        first_unused++;
+                    }
+                    continue;
+                }
             }
         }
         if (keep_pattern(topk_qsa_pattern)) {
@@ -17327,7 +17519,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 return false;
             }
             // (and the batch depth mix: its query's repeat depends on nothing in the chain)
-            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
+            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
                 for (int o = 0; o < (int) pat->size(); ++o) {
                     if (n - o >= 0 && match_pattern(*pat, n - o)) {
                         return true;

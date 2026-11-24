@@ -1,0 +1,45 @@
+#version 450
+
+// The weighted sum of a MoE layer's expert outputs, in one pass (the fork's MOE_SUM fusion; fork file):
+//
+//   dst[i0, t] = sum over the expert slots k of x[i0, k, t] * s[k, t] * w[k, t]
+//
+// the graph's MUL by the per-expert weight scale (has_scale; a file with scaled expert weights, NVFP4), its MUL by the
+// routing weights, and the ADDs of the slots' views, slot by slot from zero as multi_add.comp sums them; each product
+// and sum is rounded as the separate ops round them (precise: no contraction into an fma), so the result is the same
+// to the bit. x is the expert matmul's output [ne0, n_used, n_tokens], s and w are [1, n_used, n_tokens].
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne0; uint n_used; uint n_tokens;
+    uint x_nb1; uint x_nb2; uint x_off;   // in elements
+    uint s_off; uint w_off; uint d_off;
+    uint d_nb1;
+    uint has_scale;
+} p;
+
+layout(binding = 0) readonly buffer X {float data_x[];};
+layout(binding = 1) readonly buffer S {float data_s[];};
+layout(binding = 2) readonly buffer W {float data_w[];};
+layout(binding = 3) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x;
+    const uint t  = gl_GlobalInvocationID.y;
+    if (i0 >= p.ne0 || t >= p.n_tokens) {
+        return;
+    }
+
+    precise float sum = 0.0f;
+    for (uint k = 0; k < p.n_used; ++k) {
+        precise float v = data_x[p.x_off + t*p.x_nb2 + k*p.x_nb1 + i0];
+        if (p.has_scale != 0) {
+            v = v * data_s[p.s_off + t*p.n_used + k];
+        }
+        v = v * data_w[p.w_off + t*p.n_used + k];
+        sum = sum + v;
+    }
+    data_d[p.d_off + t*p.d_nb1 + i0] = sum;
+}

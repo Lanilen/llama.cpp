@@ -656,6 +656,12 @@ static constexpr std::initializer_list<ggml_op> bias_mask_pattern { GGML_OP_SUB,
 // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn builds it (LLM_FFN_SITU)
 static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
     GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+// the same after the MUL of the merged gate_up by its experts' weight scales (build_lora_mm_id, a file with scaled
+// expert weights) and the views of its halves: the activation then reads the expert matmul's output
+static constexpr std::initializer_list<ggml_op> situ_scale_pattern { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
+    GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+// (the weighted sum of the expert outputs, MOE_SUM, has one VIEW and one ADD an expert slot: ggml_vk_moe_sum_len)
 
 // Inkling 2's short convolution from its two inputs with its state store: x = concat(past, cur), the state the last
 // columns of x (a CPY), then the conv with its residual and scale; the dynamic form adds the input-dependent taps, lag
@@ -1129,6 +1135,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_res_scale_f32;
     vk_pipeline pipeline_conv_split_f32[2];   // [without, with] the dynamic taps (conv_split.comp)
     vk_pipeline pipeline_situ_f32;            // Inkling 2's SITU activation (situ.comp)
+    vk_pipeline pipeline_moe_sum_f32;         // the weighted sum of a MoE layer's expert outputs (moe_sum.comp)
     vk_pipeline pipeline_bias_mask_f32_f16;   // Inkling 2's mask with its relative-position bias (bias_mask.comp)
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
@@ -1538,7 +1545,8 @@ struct ggml_backend_vk_context {
     bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT [REPEAT] MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
     bool fused_bias_mask {};       // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY: Inkling 2's biased F16 mask
-    bool fused_situ {};            // SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation
+    bool fused_situ {};            // [MUL VIEW VIEW] SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation
+    bool fused_moe_sum {};         // [MUL] MUL VIEW.. ADD..: the expert outputs scaled, weighted and summed
     bool fused_conv_split {};      // CONCAT VIEW VIEW CPY SSM_CONV ...: Inkling 2's conv from its two inputs with its state store
     bool fused_concat_rms_norm {}; // CONCAT RMS_NORM: Inkling 2's controller input, the norm of [cur; message]
     bool fused_ctrl_blend {};   // MUL SUB MUL ADD: Inkling 2's loop controller blend, (cur - forget*cur) + gain*message

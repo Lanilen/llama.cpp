@@ -874,6 +874,15 @@ struct vk_op_situ_push_constants {
     float inv_beta, beta, inv_lb, lb;
     float bias;
     uint32_t has_lb;
+    uint32_t has_scale, s_off;
+};
+
+struct vk_op_moe_sum_push_constants {
+    uint32_t ne0, n_used, n_tokens;
+    uint32_t x_nb1, x_nb2, x_off;
+    uint32_t s_off, w_off, d_off;
+    uint32_t d_nb1;
+    uint32_t has_scale;
 };
 
 struct vk_op_conv_split_push_constants {
