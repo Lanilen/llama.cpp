@@ -8693,21 +8693,22 @@ struct test_concat_rms_norm : public test_case {
 struct test_ctrl_blend : public test_case {
     const int64_t n_embd, n_tokens;
     const int ctrl;
+    const bool with_tanh; // gain and forget are the TANH of the inputs, right before the blend (CTRL_BLEND_TANH)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "CTRL_BLEND";
+        return with_tanh ? "CTRL_BLEND_TANH" : "CTRL_BLEND";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_tokens, ctrl);
+        return VARS_TO_STR4(n_embd, n_tokens, ctrl, with_tanh);
     }
 
 
-    test_ctrl_blend(int64_t n_embd = 2304, int64_t n_tokens = 1, int ctrl = 1)
-        : n_embd(n_embd), n_tokens(n_tokens), ctrl(ctrl) {}
+    test_ctrl_blend(int64_t n_embd = 2304, int64_t n_tokens = 1, int ctrl = 1, bool with_tanh = false)
+        : n_embd(n_embd), n_tokens(n_tokens), ctrl(ctrl), with_tanh(with_tanh) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -8723,6 +8724,14 @@ struct test_ctrl_blend : public test_case {
         // the view first, as the model expands it, so that the blend's four ops follow one another
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, message);
+        }
+        if (with_tanh) {
+            gain   = ggml_tanh(ctx, gain);
+            forget = ggml_tanh(ctx, forget);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, gain);
+                ggml_build_forward_expand(gf, forget);
+            }
         }
         ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, message));
         ggml_set_name(out, "out");
@@ -14145,6 +14154,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_ctrl_blend(100, 7, 2));
+    for (int64_t n_tokens : { 1, 3, 512 }) {
+        test_cases.emplace_back(new test_ctrl_blend(2304, n_tokens, 1, true));
+    }
+    test_cases.emplace_back(new test_ctrl_blend(100, 7, 2, true));
     for (int64_t n_embd : { 64, 2304 }) {
         for (int64_t n_blocks : { 1, 4, 8 }) {
             for (int64_t n_query : { 1, 3 }) {

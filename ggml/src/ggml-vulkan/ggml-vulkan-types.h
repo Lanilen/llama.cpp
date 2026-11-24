@@ -689,6 +689,8 @@ static constexpr std::initializer_list<ggml_op> concat_rms_norm_pattern { GGML_O
 
 // (cur - forget*cur) + gain*message: Inkling 2's loop controller blend; the edges as {dst, src slot, src}
 static constexpr std::initializer_list<ggml_op> ctrl_blend_pattern { GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD };
+// the same with the TANH of its gain and of its forget before it, as inkling2.cpp's control() orders them
+static constexpr std::initializer_list<ggml_op> ctrl_blend_tanh_pattern { GGML_OP_UNARY, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD };
 static constexpr std::initializer_list<std::array<int, 3>> ctrl_blend_edges {
     { 1, 1, 0 }, // sub->src[1] == forget*cur
     { 3, 0, 1 }, // add->src[0] == cur - forget*cur
