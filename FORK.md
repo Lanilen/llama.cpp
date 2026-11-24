@@ -278,6 +278,10 @@ apply to any such model, with or without the cache:
 - **Polling the GPU instead of sleeping** (`GGML_VK_SPIN_WAIT=N`, opt-in): a split model's host blocks on the GPU once
   a layer, and a blocking wait returns through an interrupt and the scheduler; with this the host polls the semaphore
   for up to N µs first.
+- **Inkling 2's bias-mask chain kept whole with a drafter** (branch `moe-tuning`): with recurrent rollback the conv
+  state stores' nodes and the mask's cast landed inside the chain, and its fusion stopped matching (prompts 17–21%
+  slower with the DSpark drafter on the R9700, 3–9% now). The optimizer moves them before the chain in graphs with
+  rollback; without it the graph is unchanged (`GGML_VK_DISABLE_BIAS_MASK_HOIST=1` turns it off).
 - **ARGMAX of a long row in one large workgroup** (branch `vk-argmax`): a row was one subgroup's threads, so an
   ARGMAX over a vocabulary (200,058 logits, what a drafter takes at each step) took 1.23 ms on the R9700 and 2.06 ms on
   an RX 480. Rows longer than 4096 now take 1024 threads: 59 and 129 µs. Ties now give the CPU's index (the last).

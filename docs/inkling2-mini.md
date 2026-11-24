@@ -232,8 +232,11 @@ The two-draft row was measured before the ARGMAX change below, the others with i
 - **English answers about code and notes gain most,** new code least, where fewer drafts land.
   [A measurement on an RX 9070 XT](https://github.com/ggml-org/llama.cpp/pull/32773) found code best and prose (in
   French) losing.
-- **The costs:** prompts are 17% slower (1,110–1,140 tok/s → about 925), since the drafter's context reads them too,
-  and the drafter takes 1.5 GB more VRAM.
+- **The costs:** prompts are 3–9% slower (1,130–1,160 tok/s → 1,055–1,115), since the drafter's context reads them
+  too, and the drafter takes 1.5 GB more VRAM. They were 17–21% slower until a fix of the fork's: with a drafter the
+  target keeps rollback slots for its convolution state, and the nodes that builds landed inside the attention's
+  bias-mask chain, so its fusion stopped matching in every layer. The Vulkan graph optimizer now moves them out of the
+  chain in such graphs (`GGML_VK_DISABLE_BIAS_MASK_HOIST=1` turns it off), with the same answers and drafts.
 - **The text at temperature 0 differs** from the run without drafts: the target checks a draft as a batch, which
   rounds a little differently from one token at a time.
 - **A graph per batch length** (`LLAMA_GRAPH_CACHE`) covers what that RX 9070 XT report found costly with drafts of
