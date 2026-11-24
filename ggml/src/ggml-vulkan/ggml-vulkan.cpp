@@ -8655,13 +8655,16 @@ static void ggml_vk_moe_sum(ggml_backend_vk_context * ctx, vk_context & subctx, 
 
 // a fused loop controller blend (ctrl_blend_pattern starting at node_idx): (cur - forget*cur) + gain*message
 static void ggml_vk_ctrl_blend(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * fc  = cgraph->nodes[node_idx];
-    const ggml_tensor * gm  = cgraph->nodes[node_idx + 2];
-    const ggml_tensor * f   = fc->src[0];
+    // ctrl_blend_tanh_pattern: the blend starts two nodes on, and the shader takes the tanh of what the TANHs read
+    const bool with_tanh = cgraph->nodes[node_idx]->op == GGML_OP_UNARY;
+    const int  first     = node_idx + (with_tanh ? 2 : 0);
+    const ggml_tensor * fc  = cgraph->nodes[first];
+    const ggml_tensor * gm  = cgraph->nodes[first + 2];
+    const ggml_tensor * f   = with_tanh ? fc->src[0]->src[0] : fc->src[0];
     const ggml_tensor * c   = fc->src[1];
-    const ggml_tensor * g   = gm->src[0];
+    const ggml_tensor * g   = with_tanh ? gm->src[0]->src[0] : gm->src[0];
     const ggml_tensor * m   = gm->src[1];
-    ggml_tensor       * dst = cgraph->nodes[node_idx + 3];
+    ggml_tensor       * dst = cgraph->nodes[first + 3];
     VK_LOG_DEBUG("ggml_vk_ctrl_blend(" << f << ", " << c << ", " << g << ", " << m << ", " << dst << ")");
 
     vk_pipeline pipeline = ctx->device->pipeline_ctrl_blend_f32;
@@ -8679,6 +8682,7 @@ static void ggml_vk_ctrl_blend(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_nb_elem(f, 1), ggml_vk_nb_elem(c, 1), ggml_vk_nb_elem(g, 1), ggml_vk_nb_elem(m, 1), ggml_vk_nb_elem(dst, 1),
         get_misalign_bytes(ctx, f) / fs, get_misalign_bytes(ctx, c) / fs, get_misalign_bytes(ctx, g) / fs,
         get_misalign_bytes(ctx, m) / fs, get_misalign_bytes(ctx, dst) / fs,
+        with_tanh ? 1u : 0u,
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { f_buf, c_buf, g_buf, m_buf, d_buf }, pc,
                               { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], 1 });
@@ -14410,6 +14414,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->fused_ctrl_blend) {
+            ggml_vk_ctrl_blend(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->num_additional_fused_ops) {
             ggml_vk_unary_mul(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -15869,6 +15877,31 @@ static bool ggml_vk_can_fuse_ctrl_blend(const struct ggml_cgraph * cgraph, int n
     return true;
 }
 
+// ctrl_blend_tanh_pattern at node_idx: the blend above whose gain and forget are the TANH of two tensors of its shape
+// (the controller's two matmuls), in a batch of any size: the blend's shader takes the tanh as it reads them, with
+// unary.comp's formula. GGML_VK_DISABLE_CTRL_BLEND_TANH turns it off (the TANHs and the blend then run apart)
+static bool ggml_vk_can_fuse_ctrl_blend_tanh(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_CTRL_BLEND_TANH") != nullptr;
+    if (disabled || cgraph->nodes[node_idx]->op != GGML_OP_UNARY) {
+        return false;
+    }
+    const int last = node_idx + (int) ctrl_blend_tanh_pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ctrl_blend_tanh_pattern, { last }) || !ggml_vk_can_fuse_ctrl_blend(cgraph, node_idx + 2)) {
+        return false;
+    }
+    const ggml_tensor * tg = cgraph->nodes[node_idx], * tf = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * fc = cgraph->nodes[node_idx + 2], * gm = cgraph->nodes[node_idx + 4];
+    if (ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || fc->src[0] != tf || gm->src[0] != tg) {
+        return false;
+    }
+    for (const ggml_tensor * t : { tg->src[0], tf->src[0] }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || !ggml_are_same_shape(t, tg)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // depth_mix_pattern at node_idx: f32 throughout, the blocks and cur in rows of n_embd, at most 32 states and 4 queries, a
 // softmax without mask or ALiBi; GGML_VK_DISABLE_DEPTH_MIX turns it off. With rep, depth_mix_rep_pattern: a ubatch of
 // several tokens, whose query the graph repeats for each token (the shader reads the one query for all of them);
@@ -16919,6 +16952,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_concat_rms_norm = true;
                 fusion_string = "CONCAT_RMS_NORM";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_ctrl_blend_tanh(cgraph, i)) {
+                ctx->num_additional_fused_ops = (int) ctrl_blend_tanh_pattern.size() - 1;
+                ctx->fused_ctrl_blend = true;
+                fusion_string = "CTRL_BLEND_TANH";
+                // elementwise as the blend below
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
             } else if (ggml_vk_can_fuse_ctrl_blend(cgraph, i)) {
                 ctx->num_additional_fused_ops = (int) ctrl_blend_pattern.size() - 1;
                 ctx->fused_ctrl_blend = true;
@@ -17561,8 +17600,47 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return cover;
     };
-    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern });
-    const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_pattern });
+    // the spans of those matches a node is in, as {start, length}: the guard below then only has to see that a span's
+    // nodes are all unscheduled, instead of matching each of the six patterns at every offset the node could have
+    // in it (most of this function's time in an Inkling 2 graph, where these chains cover much of a layer)
+    std::vector<std::vector<std::pair<int, int>>> conv_spans(graph->n_nodes);
+    for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
+        const int len = (int) pat->size();
+        for (int s = 0; s + len <= graph->n_nodes; ++s) {
+            int k = 0;
+            while (k < len && graph->nodes[s + k]->op == pat->begin()[k]) {
+                ++k;
+            }
+            if (k == len) {
+                for (int i = s; i < s + len; ++i) {
+                    conv_spans[i].emplace_back(s, len);
+                }
+            }
+        }
+    }
+    const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_tanh_pattern, &ctrl_blend_pattern });
+    const std::vector<bool> qsa_cover   = op_cover({ &topk_qsa_pattern });
+    // and the nodes where the ops of one of the patterns the loop below must not pull a node out of begin: the
+    // loop asked each of these twenty at every candidate node (a prompt batch of Inkling 2 has 11,500 nodes, the
+    // reordering was 14 of the 18 ms its graph's allocation took on the 1920X)
+    std::vector<bool> start_cover(graph->n_nodes, false);
+    for (const auto * pat : { &topk_moe_early_softmax_norm, &topk_moe_sigmoid_norm_bias, &topk_moe_sigmoid_norm_bias_eps,
+                              &topk_moe_sqrt_softplus_norm_bias, &topk_moe_early_softmax, &topk_moe_late_softmax, &snake_pattern,
+                              &mm_scale_unary_pattern, &mm_unary_pattern, &depth_mix_pattern, &clip_rows_scale_pattern,
+                              &clip_rows_pattern, &ssm_conv_res_scale_pattern, &concat_rms_norm_pattern,
+                              &rms_norm_mul_add_mul_pattern, &rms_norm_mul_add_pattern, &rms_norm_mul_rope_view_set_rows_pattern,
+                              &rms_norm_view_set_rows_pattern, &rope_view_set_rows_pattern, &hc_post_gate_pattern }) {
+        const int len = (int) pat->size();
+        for (int s = 0; s + len <= graph->n_nodes; ++s) {
+            int k = 0;
+            while (k < len && graph->nodes[s + k]->op == pat->begin()[k]) {
+                ++k;
+            }
+            if (k == len) {
+                start_cover[s] = true;
+            }
+        }
+    }
 
     int first_unused = 0;
 
@@ -17709,7 +17787,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             };
             bool kept = false;
             for (const auto * pat : { &depth_mix_pattern, &depth_mix_rep_pattern, &clip_rows_scale_pattern, &clip_rows_pattern,
-                                      &ssm_conv_res_scale_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
+                                      &ssm_conv_res_scale_pattern, &ctrl_blend_tanh_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
                                       &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern }) {
                 if (match_pattern(*pat, first_unused)) {
                     const int last = first_unused + (int) pat->size() - 1;
@@ -17800,16 +17878,16 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // the conv from its inputs (conv_split_pattern) and the SITU activation: some of their nodes do not depend on
         // the node before them (the windows, taps and state view; the up half and the gate's sigmoid), so neither pass
         // may pull one out
+        // (and the batch depth mix: its query's repeat depends on nothing in the chain)
         auto const &in_conv_split_pattern = [&](int n) -> bool {
-            if (!conv_cover[n]) {
-                return false;
-            }
-            // (and the batch depth mix: its query's repeat depends on nothing in the chain)
-            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
-                for (int o = 0; o < (int) pat->size(); ++o) {
-                    if (n - o >= 0 && match_pattern(*pat, n - o)) {
-                        return true;
-                    }
+            for (const auto & span : conv_spans[n]) {
+                // (as match_pattern: the ops match, which the span says, and none of its nodes is scheduled)
+                bool unused = true;
+                for (int i = span.first; unused && i < span.first + span.second; ++i) {
+                    unused = !used[i];
+                }
+                if (unused) {
+                    return true;
                 }
             }
             return false;
@@ -17839,6 +17917,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
             auto const &in_qsa_pattern = [&](int n) -> bool {
+                if (!qsa_cover[n]) {
+                    return false;
+                }
                 for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
                     if (n - o >= 0 && match_pattern(topk_qsa_pattern, n - o)) {
                         return true;
@@ -17851,15 +17932,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (!blend_cover[n]) {
                     return false;
                 }
-                for (int o = 0; o < (int) ctrl_blend_pattern.size(); ++o) {
-                    if (n - o >= 0 && match_pattern(ctrl_blend_pattern, n - o)) {
-                        return true;
+                for (const auto * pat : { &ctrl_blend_tanh_pattern, &ctrl_blend_pattern }) {
+                    for (int o = 0; o < (int) pat->size(); ++o) {
+                        if (n - o >= 0 && match_pattern(*pat, n - o)) {
+                            return true;
+                        }
                     }
                 }
                 return false;
             };
-            if (in_conv_split_pattern(j) ||
-                match_pattern(topk_moe_early_softmax_norm, j) ||
+            if (in_conv_split_pattern(j) || in_ctrl_blend_pattern(j) || in_qsa_pattern(j)) {
+                continue;
+            }
+            // (start_cover: none of these can match where none of their ops do)
+            if (start_cover[j] &&
+               (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias_eps, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
@@ -17870,14 +17957,13 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 (match_pattern(mm_unary_pattern, j) && ggml_vk_is_mm_unary_at(graph, j)) ||
                 match_pattern(depth_mix_pattern, j) ||
                 match_pattern(clip_rows_scale_pattern, j) || match_pattern(clip_rows_pattern, j) ||
-                match_pattern(ssm_conv_res_scale_pattern, j) || in_ctrl_blend_pattern(j) || match_pattern(concat_rms_norm_pattern, j) ||
-                in_qsa_pattern(j) ||
+                match_pattern(ssm_conv_res_scale_pattern, j) || match_pattern(concat_rms_norm_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j))) {
                 continue;
             }
             bool ok = true;

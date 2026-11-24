@@ -257,6 +257,7 @@ struct vk_op_ctrl_blend_push_constants {
     uint32_t ne0; uint32_t ne1;
     uint32_t nbf; uint32_t nbc; uint32_t nbg; uint32_t nbm; uint32_t nbd;
     uint32_t of; uint32_t oc; uint32_t og; uint32_t om; uint32_t od;
+    uint32_t tanh_fg;
 };
 
 struct vk_op_depth_mix_push_constants {
