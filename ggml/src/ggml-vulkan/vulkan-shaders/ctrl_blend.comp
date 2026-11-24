@@ -16,6 +16,7 @@ layout(push_constant) uniform parameter
     uint ne0; uint ne1;
     uint nbf; uint nbc; uint nbg; uint nbm; uint nbd;   // row strides, in elements
     uint of; uint oc; uint og; uint om; uint od;        // offsets, in elements
+    uint tanh_fg;                                       // forget and gain are the tanh of what is read (CTRL_BLEND_TANH)
 } p;
 
 layout(binding = 0) readonly buffer F {float data_f[];};
@@ -23,6 +24,11 @@ layout(binding = 1) readonly buffer C {float data_c[];};
 layout(binding = 2) readonly buffer G {float data_g[];};
 layout(binding = 3) readonly buffer M {float data_m[];};
 layout(binding = 4) writeonly buffer D {float data_d[];};
+
+// as unary.comp's, so that the two fused TANH give its bits
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
 
 void main() {
     const uint i0 = gl_GlobalInvocationID.x;
@@ -33,9 +39,16 @@ void main() {
 
     const float c = data_c[p.oc + i1*p.nbc + i0];
 
-    precise float fc   = data_f[p.of + i1*p.nbf + i0] * c;
+    float f = data_f[p.of + i1*p.nbf + i0];
+    float g = data_g[p.og + i1*p.nbg + i0];
+    if (p.tanh_fg != 0) {
+        f = op_tanh(f);
+        g = op_tanh(g);
+    }
+
+    precise float fc   = f * c;
     precise float kept = c - fc;
-    precise float gm   = data_g[p.og + i1*p.nbg + i0] * data_m[p.om + i1*p.nbm + i0];
+    precise float gm   = g * data_m[p.om + i1*p.nbm + i0];
     precise float r    = kept + gm;
 
     data_d[p.od + i1*p.nbd + i0] = r;

@@ -304,17 +304,25 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     gate = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, gate, 1e-6f), 2*n_embd, n_tokens);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
 
-    // the operands first, so that the blend's MUL, SUB, MUL and ADD follow one another (the Vulkan backend fuses them,
-    // CTRL_BLEND)
+    // the operands first, then the two TANH, so that they and the blend's MUL, SUB, MUL and ADD follow one another
+    // (the Vulkan backend fuses the six, CTRL_BLEND_TANH: in a prompt batch each TANH was a pass of its own)
     ggml_build_forward_expand(gf, gain);
     ggml_build_forward_expand(gf, forget);
     ggml_build_forward_expand(gf, message);
     ggml_build_forward_expand(gf, cur);
 
-    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    gain   = ggml_tanh(ctx0, gain);
+    forget = ggml_tanh(ctx0, forget);
+    ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_expand(gf, forget);
+
+    // (and the blend here, before the next controller's nodes: the caller may use it only after them)
+    ggml_tensor * res = ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    ggml_build_forward_expand(gf, res);
+    return res;
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
