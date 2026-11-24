@@ -8575,6 +8575,9 @@ struct test_moe_sum : public test_case {
         for (int64_t i = 1; i < n_used; ++i) {
             out = ggml_add(ctx, out, views[i]);
         }
+        // a reader of the sum that is not an ADD, as the model has (the fusion leaves a sum alone whose readers it
+        // does not all see, or that goes on into an ADD)
+        out = ggml_scale(ctx, out, 0.5f);
         ggml_set_name(out, "out");
         return out;
     }

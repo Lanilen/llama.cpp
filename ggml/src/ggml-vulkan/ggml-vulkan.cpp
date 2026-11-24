@@ -8570,6 +8570,15 @@ static int ggml_vk_moe_sum_len(const struct ggml_cgraph * cgraph, int node_idx) 
             return 0;
         }
     }
+    // Without the MUL by the experts' scales (a file whose expert weights have none) the sum is left as it is, unless
+    // GGML_VK_MOE_SUM_UNSCALED=1 asks for it: there the fusion saves one pass where it saves two with the scales, and
+    // with Flash-Next on the two RX 480s it moved the cache's hit rate after a restore by a point (57.1-58.1% against
+    // 58.5-59.4%; the same logits, a released prompt 4% faster), which is not explained. Inkling 2's Q8_0 and Q4_K_M
+    // give the same logits to the bit with it.
+    static const bool unscaled = getenv("GGML_VK_MOE_SUM_UNSCALED") != nullptr && atoi(getenv("GGML_VK_MOE_SUM_UNSCALED")) != 0;
+    if (w == node_idx && !unscaled && !taken) {
+        return 0;
+    }
     // a sum that goes on into another ADD (a layer's residual) is MULTI_ADD's, which takes that ADD along
     const int last = w + 2*n_used - 1;
     if (!taken && last + 1 < n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_ADD &&
