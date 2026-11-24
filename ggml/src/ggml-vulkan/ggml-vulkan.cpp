@@ -8440,6 +8440,10 @@ static void ggml_vk_situ(ggml_backend_vk_context * ctx, vk_context & subctx, con
 // and the ADDs of the views in their order. Returns its number of nodes, 0 without a match: the ops and their edges
 // only, so that the reorder pass can ask too.
 static int ggml_vk_moe_sum_len(const struct ggml_cgraph * cgraph, int node_idx) {
+    // a chain the graph optimizer took (its nodes then have no memory, GGML_VK_TENSOR_FLAG_ELIDED) is taken here too:
+    // the rule about what follows it was applied there, to the graph's order before the reordering, which can bring
+    // the next ADD to the chain's end
+    const bool taken = (cgraph->nodes[node_idx]->flags & GGML_VK_TENSOR_FLAG_ELIDED) != 0;
     const int n_nodes = cgraph->n_nodes;
     if (node_idx + 4 >= n_nodes || cgraph->nodes[node_idx]->op != GGML_OP_MUL) {
         return 0;
@@ -8474,7 +8478,7 @@ static int ggml_vk_moe_sum_len(const struct ggml_cgraph * cgraph, int node_idx) 
     }
     // a sum that goes on into another ADD (a layer's residual) is MULTI_ADD's, which takes that ADD along
     const int last = w + 2*n_used - 1;
-    if (last + 1 < n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_ADD &&
+    if (!taken && last + 1 < n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_ADD &&
         (cgraph->nodes[last + 1]->src[0] == cgraph->nodes[last] || cgraph->nodes[last + 1]->src[1] == cgraph->nodes[last])) {
         return 0;
     }
