@@ -663,6 +663,11 @@ static constexpr std::initializer_list<ggml_op> situ_scale_pattern { GGML_OP_MUL
     GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 // (the weighted sum of the expert outputs, MOE_SUM, has one VIEW and one ADD an expert slot: ggml_vk_moe_sum_len)
 
+// A node inside a fused chain that the graph optimizer found certain to fuse (the backend's own tensor flag, above
+// ggml's): the fused shader never writes it, so its allocation is a token one (ggml_backend_vk_buffer_type_get_alloc_size).
+// Inkling 2's biased mask has two such tensors of [n_kv, n_q, n_head] F32, 768 MiB each at 512 tokens of a 16k context.
+#define GGML_VK_TENSOR_FLAG_ELIDED (1 << 24)
+
 // Inkling 2's short convolution from its two inputs with its state store: x = concat(past, cur), the state the last
 // columns of x (a CPY), then the conv with its residual and scale; the dynamic form adds the input-dependent taps, lag
 // by lag (a transposed copy of x, and a window view, a tap view, MUL and ADD a lag)

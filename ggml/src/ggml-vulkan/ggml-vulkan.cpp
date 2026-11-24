@@ -8472,12 +8472,17 @@ static int ggml_vk_moe_sum_len(const struct ggml_cgraph * cgraph, int node_idx) 
             return 0;
         }
     }
+    // a sum that goes on into another ADD (a layer's residual) is MULTI_ADD's, which takes that ADD along
+    const int last = w + 2*n_used - 1;
+    if (last + 1 < n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_ADD &&
+        (cgraph->nodes[last + 1]->src[0] == cgraph->nodes[last] || cgraph->nodes[last + 1]->src[1] == cgraph->nodes[last])) {
+        return 0;
+    }
     return (w - node_idx) + 2*n_used;
 }
 
 // the sum above in one pass (MOE_SUM): f32, the weights and scales [1, n_used, n_tokens], nothing but the sum read
-// outside the chain. A sum that goes on into another ADD (a layer's residual) is left to MULTI_ADD, which takes that
-// ADD along. GGML_VK_DISABLE_MOE_SUM turns it off
+// outside the chain. GGML_VK_DISABLE_MOE_SUM turns it off
 static bool ggml_vk_can_fuse_moe_sum(const struct ggml_cgraph * cgraph, int node_idx) {
     static const bool disabled = getenv("GGML_VK_DISABLE_MOE_SUM") != nullptr;
     if (disabled) {
@@ -8503,10 +8508,6 @@ static bool ggml_vk_can_fuse_moe_sum(const struct ggml_cgraph * cgraph, int node
     const ggml_tensor * mw = cgraph->nodes[node_idx + (scaled ? 1 : 0)];
     const ggml_tensor * x  = scaled ? ms->src[0] : mw->src[0];
     const ggml_tensor * dst = cgraph->nodes[last];
-    if (last + 1 < cgraph->n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_ADD &&
-        (cgraph->nodes[last + 1]->src[0] == dst || cgraph->nodes[last + 1]->src[1] == dst)) {
-        return false;
-    }
     auto const &slot_scalars = [&](const ggml_tensor * t) {
         return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
                t->ne[0] == 1 && t->ne[1] == mw->ne[1] && t->ne[2] == mw->ne[2] && t->ne[3] == 1;
@@ -14895,6 +14896,10 @@ size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft)
 }
 
 size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    // a node inside a fused chain is never written (ggml_vk_graph_optimize marks them)
+    if (tensor->flags & GGML_VK_TENSOR_FLAG_ELIDED) {
+        return ggml_type_size(tensor->type);
+    }
     return ggml_nbytes(tensor);
 
     UNUSED(buft);
@@ -17046,6 +17051,47 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        // Elided nodes (GGML_VK_TENSOR_FLAG_ELIDED) have no memory: they may only run inside the fused chain the
+        // optimizer marked them for. A fusion that starts before such a chain and takes its first nodes along
+        // (upstream's MUL_MAT_ID + MUL, in a mat-vec graph) is cancelled, so that the chain starts at its own node;
+        // a marked node that would run on its own is a bug, and stops here instead of writing outside its allocation.
+        if (!(cgraph->nodes[i]->flags & GGML_VK_TENSOR_FLAG_ELIDED)) {
+            for (int k = 1; k <= ctx->num_additional_fused_ops; ++k) {
+                if (cgraph->nodes[i + k]->flags & GGML_VK_TENSOR_FLAG_ELIDED) {
+                    ctx->num_additional_fused_ops = 0;
+                    ctx->fused_ops_write_mask = 1;
+                    ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                    ctx->fused_topk_moe_scale = false;
+                    ctx->fused_topk_qsa = false;
+                    ctx->fused_hc_post_gate = false;
+                    ctx->fused_mm_post = false;
+                    ctx->fused_clip_rows = false;
+                    ctx->fused_ctrl_blend = false;
+                    ctx->fused_concat_rms_norm = false;
+                    ctx->fused_conv_split = false;
+                    ctx->fused_situ = false;
+                    ctx->fused_moe_sum = false;
+                    ctx->fused_bias_mask = false;
+                    ctx->fused_depth_mix = false;
+                    ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                    fusion_string = nullptr;
+                    break;
+                }
+            }
+        } else {
+            const int n_fused = ctx->num_additional_fused_ops;
+            bool whole = (ctx->fused_bias_mask || ctx->fused_situ || ctx->fused_moe_sum) && n_fused > 0 &&
+                         !(cgraph->nodes[i + n_fused]->flags & GGML_VK_TENSOR_FLAG_ELIDED);
+            for (int k = 1; whole && k < n_fused; ++k) {
+                whole = (cgraph->nodes[i + k]->flags & GGML_VK_TENSOR_FLAG_ELIDED) != 0;
+            }
+            if (!whole) {
+                GGML_ABORT("ggml_vulkan: node %d (%s, %s) was left without memory for a fused chain that did not fuse (%s, %d nodes); "
+                           "GGML_VK_DISABLE_FUSION_ELIDE=1 turns the elision off",
+                           i, cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op), fusion_string ? fusion_string : "none", n_fused + 1);
+            }
+        }
+
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
@@ -17179,6 +17225,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        graph->nodes[i]->flags &= ~GGML_VK_TENSOR_FLAG_ELIDED;
+    }
 
     if (ctx->device->disable_graph_optimize) {
         return;
@@ -17448,13 +17498,43 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // GGML_VK_DISABLE_FUSION_ALLOC_DEPS=1 turns it off.
         {
             static const bool no_deps = getenv("GGML_VK_DISABLE_FUSION_ALLOC_DEPS") != nullptr;
+            // The inner nodes of a chain that is certain to fuse are never written, so they get a token allocation
+            // (GGML_VK_TENSOR_FLAG_ELIDED): the unfused plan of Inkling 2's biased mask holds two tensors of
+            // [n_kv, n_q, n_head] F32 at once, most of a prompt batch's compute buffer. It takes the full fusion
+            // check here, where the scheduler has not allocated yet, and the chain's inputs kept allocated to its
+            // last node, so that the graph build cannot cancel the fusion for an output placed over an input. The
+            // allocator would also let the chain's result take an inner node's place (same layout), or an inner node
+            // an input's (and free the rest of it): a dependency on the inner operands of the last node prevents the
+            // first, the inputs' own dependencies the second. GGML_VK_DISABLE_FUSION_ELIDE=1 turns it off.
+            static const bool no_elide = getenv("GGML_VK_DISABLE_FUSION_ELIDE") != nullptr;
+            const bool elide = !no_elide && !no_deps && !ctx->device->disable_fusion;
+            auto const &elide_chain = [&](int first, int len) {
+                ggml_tensor * last_node = graph->nodes[first + len - 1];
+                for (int j = 0; j < len - 1; ++j) {
+                    graph->nodes[first + j]->flags |= GGML_VK_TENSOR_FLAG_ELIDED;
+                }
+                for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                    ggml_tensor * src = last_node->src[s];
+                    if (src && src != last_node && (src->flags & GGML_VK_TENSOR_FLAG_ELIDED)) {
+                        params->add_alloc_dep(params->user_data, src, last_node);
+                    }
+                }
+            };
             bool kept = false;
             for (const auto * pat : { &depth_mix_pattern, &depth_mix_rep_pattern, &clip_rows_scale_pattern, &clip_rows_pattern,
                                       &ssm_conv_res_scale_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
                                       &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern }) {
                 if (match_pattern(*pat, first_unused)) {
                     const int last = first_unused + (int) pat->size() - 1;
-                    if (!no_deps && pat == &bias_mask_pattern) {
+                    // the chains that are certain to fuse, and whose inner nodes then need no memory
+                    const bool fuses = elide &&
+                        ((pat == &bias_mask_pattern  && ggml_vk_can_fuse_bias_mask(graph, first_unused)) ||
+                         (pat == &situ_scale_pattern && ggml_vk_can_fuse_situ_scale(graph, first_unused)) ||
+                         (pat == &situ_pattern       && ggml_vk_can_fuse_situ(graph, first_unused)));
+                    if (fuses) {
+                        add_pattern_alloc_deps(*pat, last);
+                        elide_chain(first_unused, (int) pat->size());
+                    } else if (!no_deps && pat == &bias_mask_pattern) {
                         // The bias table is kept through its SUB's output, not by itself. The last chain that reads a
                         // table has its SUB take the table's memory; a dependency on the table denies it that, and the
                         // one more small allocation lands in the free block the chain's two mask-sized tensors
@@ -17476,6 +17556,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             // the weighted sum of a MoE layer's expert outputs (MOE_SUM), one VIEW and one ADD an expert slot
             if (const int len = ggml_vk_moe_sum_len(graph, first_unused)) {
                 if (std::none_of(used.begin() + first_unused, used.begin() + first_unused + len, [](bool u) { return u; })) {
+                    const bool fuses = elide && ggml_vk_can_fuse_moe_sum(graph, first_unused);
                     if (!no_deps) {
                         std::set<ggml_tensor *> seen;
                         for (int j = 0; j < len; ++j) {
@@ -17488,6 +17569,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                             }
                             seen.insert(node);
                         }
+                    }
+                    if (fuses) {
+                        elide_chain(first_unused, len);
                     }
                     for (int j = 0; j < len; ++j) {
                         new_order.push_back(graph->nodes[first_unused + j]);
