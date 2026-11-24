@@ -14792,6 +14792,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Inkling 2 Mini's experts in a prompt's ubatch: 128 of them, 8 used a token (about 32 rows an expert at 512 tokens),
+    // gate+up 2304 -> 2304 and down 1152 -> 2304, NVFP4 as the model ships them and Q8_0 as its last layers are
+    for (int bs : {512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 2304));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
+        }
+    }
+
+    // the same weights as one dense matmul by the rows an expert gets: what the expert matmul could reach per expert
+    for (int n : {16, 32, 64, 128, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2304, n, 2304, {1, 1}, {1, 1}));
+        }
+    }
+
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
