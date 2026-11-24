@@ -3135,13 +3135,15 @@ struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
 
+    const bool ties; // many equal largest values in a row: the index must be the CPU's (the last)
+
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return ties ? VARS_TO_STR3(type, ne, ties) : VARS_TO_STR2(type, ne);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1}, bool ties = false)
+        : type(type), ne(ne), ties(ties) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -3158,11 +3160,11 @@ struct test_argmax : public test_case {
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
-                // initialize with unique values to avoid ties
+                // unique values (no ties), or with ties every row's largest value many times over
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        data[i] = ties ? i % 7 : i;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -11511,6 +11513,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {200058, 1, 1, 1})); // a vocabulary (Inkling 2's), one row and a draft block
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {200058, 5, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {4097,   3, 1, 1})); // the first wide row
+    for (int64_t n : {32, 1000, 4097, 200058}) {
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {n, 4, 1, 1}, true));
+    }
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
