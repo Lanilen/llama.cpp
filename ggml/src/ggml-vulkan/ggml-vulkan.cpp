@@ -16854,6 +16854,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
             }
             if (need_disable) {
+                // GGML_VK_DEBUG_FUSION_CANCEL=1: say which fusion the allocator's placement cancelled
+                static const bool cancel_dbg = getenv("GGML_VK_DEBUG_FUSION_CANCEL") != nullptr;
+                static int n_cancel_logged = 0;
+                if (cancel_dbg && n_cancel_logged < 200) {
+                    ++n_cancel_logged;
+                    fprintf(stderr, "ggml_vulkan: fusion %s at node %d (%s, %d nodes) cancelled: its output shares memory with an input\n",
+                            fusion_string ? fusion_string : "?", i, cgraph->nodes[i]->name, ctx->num_additional_fused_ops + 1);
+                }
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
@@ -17012,20 +17020,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     }
 
     // Inkling 2's biased mask (bias_mask_pattern) is built as a chain of nine nodes, but other nodes can land between
-    // them: with recurrent rollback (n_rs_seq, which a drafter sets) the mask's own cast to F32 (the chain's ADD reads
-    // it) and the conv state stores' slot order (ARANGE, SCALE). The chain then no longer matches, the reorder
-    // below spreads it out further, and every attention layer runs its bias and mask unfused (a prompt batch 16%
-    // longer on the R9700). Here the nodes the chain does not read through its src[0] links are moved to just before
-    // it, where the chain finds their results: only nodes that read no node of the chain and whose own inputs come
-    // before it. GGML_VK_DISABLE_BIAS_MASK_HOIST=1 turns it off.
+    // them: a view in the first layer of each kind, the mask's own cast to F32 (the chain's ADD reads it), and with
+    // recurrent rollback (n_rs_seq, which a drafter sets) the conv state stores' slot order (ARANGE, SCALE). The chain
+    // then no longer matches, the reorder below spreads it out further, and that layer runs its bias and mask
+    // unfused: a per-head bias for every cell and token, ~700 MB an op at 2048 tokens. Here the nodes the chain does
+    // not read through its src[0] links are moved to just before it, where the chain finds their results: only
+    // nodes that read no node of the chain, write nothing it reads through a view, and whose own inputs come before
+    // it. GGML_VK_DISABLE_BIAS_MASK_HOIST=1 turns it off.
     static const bool no_hoist = getenv("GGML_VK_DISABLE_BIAS_MASK_HOIST") != nullptr;
-    // only in graphs with recurrent rollback (their conv state stores build a slot order with ARANGE): without it the
-    // chains match as they are, and moving the nodes there moves the logits a little, which is still to explain
-    bool rollback = false;
-    for (int i = 0; i < graph->n_nodes && !rollback; ++i) {
-        rollback = graph->nodes[i]->op == GGML_OP_ARANGE;
-    }
-    if (!no_hoist && rollback) {
+    if (!no_hoist) {
         const int len = (int) bias_mask_pattern.size();
         const int max_extra = 8;
         for (int s = 0; s + len <= graph->n_nodes; ++s) {
@@ -17061,12 +17064,6 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             bool ok = true;
             for (int o : other) {
                 const ggml_tensor * t = graph->nodes[o];
-                // a view-type node in the chain (the first layer's) is left where it is, and its chain unfused as before
-                if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
-                    t->op == GGML_OP_NONE) {
-                    ok = false;
-                    break;
-                }
                 // nor write, through a view, into what the chain reads (moving it before the chain would reverse that)
                 const bool writes_view = t->view_src != nullptr && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE &&
                                          t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE && t->op != GGML_OP_NONE;
@@ -17272,9 +17269,30 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (ggml_vk_is_mm_unary_at(graph, first_unused) && keep_pattern(mm_unary_pattern)) {
             continue;
         }
-        if (keep_pattern(depth_mix_pattern) || keep_pattern(depth_mix_rep_pattern) || keep_pattern(clip_rows_scale_pattern) || keep_pattern(clip_rows_pattern) || keep_pattern(ssm_conv_res_scale_pattern) || keep_pattern(ctrl_blend_pattern) || keep_pattern(concat_rms_norm_pattern) ||
-            keep_pattern(conv_split_dyn_pattern) || keep_pattern(conv_split_pattern) || keep_pattern(situ_pattern) || keep_pattern(bias_mask_pattern)) {
-            continue;
+        // The fork's patterns: a fused pattern reads its inputs while the last node's output is written, so the graph
+        // build cancels a fusion whose output shares memory with an input (and the separate ops run). The allocator
+        // frees an input after the node of the chain that reads it, so whether that happens depends on where it
+        // places things: at 2048 tokens a batch it cancelled Inkling 2's bias mask in many layers (prompts 30% slower
+        // on the R9700), and it decided which of the conv fusions a prompt's layers ran. Keeping the inputs allocated
+        // to the last node, as upstream does for its TOPK_MOE, makes each of these fire wherever it matches.
+        // GGML_VK_DISABLE_FUSION_ALLOC_DEPS=1 turns it off.
+        {
+            static const bool no_deps = getenv("GGML_VK_DISABLE_FUSION_ALLOC_DEPS") != nullptr;
+            bool kept = false;
+            for (const auto * pat : { &depth_mix_pattern, &depth_mix_rep_pattern, &clip_rows_scale_pattern, &clip_rows_pattern,
+                                      &ssm_conv_res_scale_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
+                                      &conv_split_dyn_pattern, &conv_split_pattern, &situ_pattern, &bias_mask_pattern }) {
+                if (match_pattern(*pat, first_unused)) {
+                    if (!no_deps) {
+                        add_pattern_alloc_deps(*pat, first_unused + (int) pat->size() - 1);
+                    }
+                    kept = keep_pattern(*pat);
+                    break;
+                }
+            }
+            if (kept) {
+                continue;
+            }
         }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;

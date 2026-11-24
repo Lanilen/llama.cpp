@@ -14058,6 +14058,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_conv_split(2304, 1, 0));
+    // a prompt's ubatch: the fusion fires there too once its inputs stay allocated
+    for (int64_t n_heads : { 0, 8 }) {
+        test_cases.emplace_back(new test_conv_split(1024, 512, n_heads));
+    }
+    test_cases.emplace_back(new test_conv_split(2304, 64, 24));
     for (int64_t n_tokens : { 1, 3, 512 }) {
         for (bool msg_view : { true, false }) {
             test_cases.emplace_back(new test_concat_rms_norm(2304, n_tokens, msg_view));
