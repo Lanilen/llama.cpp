@@ -17376,18 +17376,23 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
-        auto const &add_pattern_alloc_deps = [&](const std::initializer_list<ggml_op> &pattern, int last_node) {
+        // (first_src0 false: not the first node's first operand, see the bias mask below)
+        auto const &add_pattern_alloc_deps = [&](const std::initializer_list<ggml_op> &pattern, int last_node, bool first_src0 = true) {
             // Keep external inputs alive through the fused output.
             std::set<ggml_tensor *> seen;
             for (size_t j = 0; j < pattern.size(); ++j) {
                 ggml_tensor * node = graph->nodes[first_unused + j];
+                // (a cast's CPY names its own output as a source)
+                seen.insert(node);
                 for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
                     ggml_tensor * src = node->src[s];
+                    if (j == 0 && s == 0 && !first_src0) {
+                        continue;
+                    }
                     if (src && seen.insert(src).second) {
                         params->add_alloc_dep(params->user_data, src, graph->nodes[last_node]);
                     }
                 }
-                seen.insert(node);
             }
         };
 
@@ -17448,8 +17453,18 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                                       &ssm_conv_res_scale_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
                                       &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern }) {
                 if (match_pattern(*pat, first_unused)) {
-                    if (!no_deps) {
-                        add_pattern_alloc_deps(*pat, first_unused + (int) pat->size() - 1);
+                    const int last = first_unused + (int) pat->size() - 1;
+                    if (!no_deps && pat == &bias_mask_pattern) {
+                        // The bias table is kept through its SUB's output, not by itself. The last chain that reads a
+                        // table has its SUB take the table's memory; a dependency on the table denies it that, and the
+                        // one more small allocation lands in the free block the chain's two mask-sized tensors
+                        // exactly fill: the second then goes to the end of the buffer (14600KF + RTX 4070 Ti, the hot
+                        // spare, -c 16384 -ub 512: a compute buffer of 2,655 MiB against 1,878; 1,932 this way).
+                        // Where the SUB does not take the table's memory, a later chain still reads the table.
+                        add_pattern_alloc_deps(*pat, last, false);
+                        params->add_alloc_dep(params->user_data, graph->nodes[first_unused], graph->nodes[last]);
+                    } else if (!no_deps) {
+                        add_pattern_alloc_deps(*pat, last);
                     }
                     kept = keep_pattern(*pat);
                     break;
