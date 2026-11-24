@@ -17449,7 +17449,24 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return cover;
     };
-    const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern });
+    // the spans of those matches a node is in, as {start, length}: the guard below then only has to see that a span's
+    // nodes are all unscheduled, instead of matching each of the six patterns at every offset the node could have
+    // in it (most of this function's time in an Inkling 2 graph, where these chains cover much of a layer)
+    std::vector<std::vector<std::pair<int, int>>> conv_spans(graph->n_nodes);
+    for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
+        const int len = (int) pat->size();
+        for (int s = 0; s + len <= graph->n_nodes; ++s) {
+            int k = 0;
+            while (k < len && graph->nodes[s + k]->op == pat->begin()[k]) {
+                ++k;
+            }
+            if (k == len) {
+                for (int i = s; i < s + len; ++i) {
+                    conv_spans[i].emplace_back(s, len);
+                }
+            }
+        }
+    }
     const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_pattern });
     const std::vector<bool> qsa_cover   = op_cover({ &topk_qsa_pattern });
     // and the nodes where the ops of one of the patterns the loop below must not pull a node out of begin: the
@@ -17710,16 +17727,16 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // the conv from its inputs (conv_split_pattern) and the SITU activation: some of their nodes do not depend on
         // the node before them (the windows, taps and state view; the up half and the gate's sigmoid), so neither pass
         // may pull one out
+        // (and the batch depth mix: its query's repeat depends on nothing in the chain)
         auto const &in_conv_split_pattern = [&](int n) -> bool {
-            if (!conv_cover[n]) {
-                return false;
-            }
-            // (and the batch depth mix: its query's repeat depends on nothing in the chain)
-            for (const auto * pat : { &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern }) {
-                for (int o = 0; o < (int) pat->size(); ++o) {
-                    if (n - o >= 0 && match_pattern(*pat, n - o)) {
-                        return true;
-                    }
+            for (const auto & span : conv_spans[n]) {
+                // (as match_pattern: the ops match, which the span says, and none of its nodes is scheduled)
+                bool unused = true;
+                for (int i = span.first; unused && i < span.first + span.second; ++i) {
+                    unused = !used[i];
+                }
+                if (unused) {
+                    return true;
                 }
             }
             return false;
