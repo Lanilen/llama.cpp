@@ -278,10 +278,24 @@ apply to any such model, with or without the cache:
 - **Polling the GPU instead of sleeping** (`GGML_VK_SPIN_WAIT=N`, opt-in): a split model's host blocks on the GPU once
   a layer, and a blocking wait returns through an interrupt and the scheduler; with this the host polls the semaphore
   for up to N µs first.
-- **Inkling 2's bias-mask chain kept whole with a drafter** (branch `moe-tuning`): with recurrent rollback the conv
-  state stores' nodes and the mask's cast landed inside the chain, and its fusion stopped matching (prompts 17–21%
-  slower with the DSpark drafter on the R9700, 3–9% now). The optimizer moves them before the chain in graphs with
-  rollback; without it the graph is unchanged (`GGML_VK_DISABLE_BIAS_MASK_HOIST=1` turns it off).
+- **Inkling 2's bias-mask chain kept whole** (branch `moe-tuning`): the mask's own cast, a view, and with a drafter
+  the conv state stores' nodes (recurrent rollback) landed inside the chain, and its fusion stopped matching in those
+  layers (prompts 17–21% slower with the DSpark drafter on the R9700, 5–7% now). The optimizer moves them to just
+  before the chain, in every graph (`GGML_VK_DISABLE_BIAS_MASK_HOIST=1` turns it off).
+- **Prompt batches of Inkling 2 Mini** (branch `moe-tuning`): its depth mix fused for a batch too, the experts'
+  weight scale read inside their activation's pass and their scale, routing weights and sum in one pass (both for
+  files with scaled expert weights, UD-Q4_K_XL), flash attention's scan for masked blocks reading the one mask under
+  the per-head bias, and the loop controllers' blend taking its two TANH along. On the 1920X + R9700 a 3.5k-token
+  prompt reads at 1,547 tokens a second with `-ub 512` (1,169 before) and 2,017 with `-ub 2048` (1,121)
+  ([the table](docs/moe-hot-spare.md#inkling-2s-small-ops)). The Vulkan graph's reordering, host time at every graph
+  allocation, no longer matches its guarded chains again at every node: 20 ms a prompt batch became 12 on the 1920X.
+- **Fused chains keep their inputs, and their inner nodes get no memory** (branch `moe-tuning`): a fused chain reads
+  its inputs while it writes its last node's output, and the graph build cancels a fusion whose output shares memory
+  with an input. The allocator's placement decided that, so a change anywhere in a graph could change which chains
+  fused (and with it a model's last bits). The fork's chains now keep their inputs allocated to their last node
+  (`GGML_VK_DISABLE_FUSION_ALLOC_DEPS=1`); for the chains that are certain to fuse, the inner nodes, which the fused
+  shader never writes, get a token allocation (`GGML_VK_DISABLE_FUSION_ELIDE=1`): Inkling 2's prompt batches take a
+  third of the compute buffer they took (633 MiB against 1,863 at 512 tokens of a 16k context).
 - **ARGMAX of a long row in one large workgroup** (branch `vk-argmax`): a row was one subgroup's threads, so an
   ARGMAX over a vocabulary (200,058 logits, what a drafter takes at each step) took 1.23 ms on the R9700 and 2.06 ms on
   an RX 480. Rows longer than 4096 now take 1024 threads: 59 and 129 µs. Ties now give the CPU's index (the last).
@@ -508,8 +522,8 @@ llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8
 ```
 
-30–32 tokens a second generating and 70 on a 1.3k-token prompt, in 7.6 GB of VRAM with a light desktop on the card; with
-`--moe-cache-mib 7500`, 35–37 tokens a second in 11.6 GB. The predictor is for chat requests: for raw completion, leave
+30–32 tokens a second generating and 70 on a 1.3k-token prompt, in 6.4 GB of VRAM with a light desktop on the card; with
+`--moe-cache-mib 7500`, 35–37 tokens a second in 10.4 GB (a 12 GB card now takes 8500). The predictor is for chat requests: for raw completion, leave
 out the two `--moe-cache-predictor` files. `--no-op-offload` is needed on NVIDIA, `-t 6` is the CPU's performance cores,
 and the cache size follows the free VRAM. The guide, [docs/inkling2-mini.md](docs/inkling2-mini.md), has why each
 setting, the sizes for 6 and 8 GB cards, the quants, and the RX 480 and R9700 measurements.
@@ -530,11 +544,11 @@ Three measurements outside Flash-Next, for models that fit a card:
   (185 against 116 tok/s) and ROCm reads prompts faster. With Flash-Next's experts on the CPU and no hot spare, the two
   generate at about the same speed (ROCm −1.8% to +4.2%), and ROCm reads prompts 72–90% faster.
 - **Inkling 2 Mini on the R9700,** whole on the card (llama-bench): with Unsloth's UD-Q4_K_XL the fork generates at
-  62.3 tok/s, upstream's Vulkan at 37.2 and its ROCm at 33.7; prompts of 512 at 1360–1382, 1200 and 1278 tok/s, and at
-  a depth of 2048 at 1219, 965–970 and 656. The Q8_0 alike: 59.5, 36.2 and 31.2 tok/s. The fork's lead is the fusions
+  63.9 tok/s, upstream's Vulkan at 37.2 and its ROCm at 33.7; prompts of 512 at 1960, 1200 and 1278 tok/s, and at
+  a depth of 2048 at 1837, 965–970 and 656. The Q8_0 alike: 60.1, 36.2 and 31.2 tok/s. The fork's lead is the fusions
   of the model's small ops ([docs/inkling2-mini.md](docs/inkling2-mini.md#whole-on-one-gpu-1920x--r9700)). With the
-  model's own drafter (DSpark, below), its answers to everyday requests go from 57.4–57.5 to 80.7–82.5 tok/s, and new code
-  from 59.0 to 64.1–66.6 ([the table](docs/inkling2-mini.md#speculative-decoding-with-its-dspark-drafter)).
+  model's own drafter (DSpark, below), its answers to everyday requests go from 60 to 79–86 tok/s, and new code
+  from 61.3 to 68.4 ([the table](docs/inkling2-mini.md#speculative-decoding-with-its-dspark-drafter)).
 
 ## Tuning a machine
 

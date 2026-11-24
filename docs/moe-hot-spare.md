@@ -217,7 +217,7 @@ that run once copy only their selected experts, through `LLAMA_OFFLOAD_FAST`'s s
 layer's experts stay copied through all three: a prompt's ubatch of 512 asks for a compute buffer of about 8.5 GB
 (Inkling 2 Mini, a 4-bit quant, `-c 2048`). RADV lets such a buffer spill into system memory; NVIDIA's driver
 refuses it, with or without resize. `--no-op-offload` leaves a large batch's experts where they are, and the buffer is
-then 1.8 GB at `-c 16384`. The hot spare then runs prompts itself, given `--moe-cache-resize`, a large
+then 0.65 GB at `-c 16384` (1.9 GB before the fused chains' inner nodes lost their memory, [below](#inkling-2s-small-ops)). The hot spare then runs prompts itself, given `--moe-cache-resize`, a large
 `--moe-cache-batch` and `-b` equal to `-ub`: resize decides on the whole batch the server hands over, so with the
 default `-b 2048` a long prompt would release the cache and leave its experts all to the CPU. `--moe-cache-mode lru`
 needs small ubatches instead (`-ub 16`). The setups are in
@@ -388,7 +388,7 @@ groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU'
 Inkling 2 Mini's layers are full of small ops: a depth mix over the earlier blocks before attention and before the
 experts, row clips of q, k and the relative-position query, short convolutions on k, v and the outputs, and in the
 looped layers controllers between passes. A generated token ran about 7,000 dispatches, and two of its ops left the
-GPU. Thirteen changes:
+GPU. Twenty changes, the last seven for prompt batches:
 
 | change | what it does | switch |
 | --- | --- | --- |
@@ -404,7 +404,14 @@ GPU. Thirteen changes:
 | the loop controllers' input | the norm of `[cur; message]`, CONCAT along dim 1 and RMS_NORM, as a mode of the norm's own shader that reads each row from its source (`rms_norm.comp`, `RMS_NORM_CONCAT_FUSION`): the same block sizes and reduction, so the pair rounds as before, to the bit. After fast-inkling-mac's CTRL_IN | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` |
 | the short convolution from its two inputs | the window `[past; cur]` read in place from its two sources instead of a CONCAT, the recurrent state written by the conv instead of a CPY, the conv, and for the full-attention layers' k and v the input-dependent taps lag by lag (in the graph: one transposed copy of the window and a view for every lag, in place of a copy for every lag), the residual and the scale, all in one shader (`conv_split.comp`). One token's only: there the result may take `cur`'s memory, each thread reading its own token. The graph puts the taps and `cur` first and the whole run in one place, and the Vulkan graph's reordering keeps it together. Each step rounds as the separate ops do. After fast-inkling-mac's INKLING_CONV | `GGML_VK_DISABLE_CONV_SPLIT=1` (the plain conv then takes the conv's residual and scale above) |
 | the experts' SITU activation | `beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)`, the SCALE, TANH, SCALE, SIGMOID, MUL, SCALE, TANH, SCALE and MUL over the two halves of the merged gate_up, in one elementwise shader (`situ.comp`), each step written as its own shader writes it. The graph puts the two halves' views first, and the Vulkan graph's reordering keeps the nine together. After fast-inkling-mac's INKLING_SITU | `GGML_VK_DISABLE_SITU=1` |
-| the attention's biased mask | the relative-position bias of each distance bin and head less the sink logit, gathered by every cell's bin and added to the mask in F16 for flash attention: the SUB, PERMUTE + CONT, GET_ROWS, PERMUTE + CONT, ADD and the cast in one shader (`bias_mask.comp`) that writes the F16 mask, each step rounded as the separate ops round it. One token's (the mask's F32 cast is then once a graph); the graph's reordering keeps the run together, and a pass whose mask would take the memory of the table it reads stays unfused | `GGML_VK_DISABLE_BIAS_MASK=1` |
+| the attention's biased mask | the relative-position bias of each distance bin and head less the sink logit, gathered by every cell's bin and added to the mask in F16 for flash attention: the SUB, PERMUTE + CONT, GET_ROWS, PERMUTE + CONT, ADD and the cast in one shader (`bias_mask.comp`) that writes the F16 mask, each step rounded as the separate ops round it. For any number of tokens: the Vulkan graph's reordering first moves the nodes that land inside the run to just before it (the mask's own cast to F32, a view, and with a drafter the conv state's slot order), then keeps the run together | `GGML_VK_DISABLE_BIAS_MASK=1` |
+| the depth mix of a batch | the same chain for a ubatch of several tokens, where the graph repeats the query for each token: the REPEAT is part of the chain (`depth_mix_rep_pattern`) and the shader reads the one query for all of them. A prompt batch ran the mix as six ops, a tiny matmul a token among them | `GGML_VK_DISABLE_DEPTH_MIX_BATCH=1` |
+| the experts' scale in the SITU pass | a file with scaled expert weights (NVFP4: UD-Q4_K_XL) multiplies the merged gate_up by the scale of each selected expert, a pass over the whole of it before the activation. `situ.comp` multiplies as it reads the matmul's output (SITU_SCALE: the MUL, the views of the halves and the nine above) | `GGML_VK_DISABLE_SITU_SCALE=1` |
+| the experts' weighted sum | with such a file: the MUL by the experts' scales, the MUL by the routing weights and the ADDs of the eight slots' views in one pass (`moe_sum.comp`, MOE_SUM), each product and sum rounded as the separate ops round them and the slots added in their order. A sum that goes on into an ADD right after it is left to upstream's fused ADDs, which take that ADD along. Without the scales (a Q8_0 or K-quant file, every other MoE model here) the sum stays as it was unless `GGML_VK_MOE_SUM_UNSCALED=1` asks for it: it saves one pass there, not two, and with Flash-Next on the 1920X + RX480x2 it moved the cache's hit rate after a restore by a point, with the same logits, which is not explained | `GGML_VK_DISABLE_MOE_SUM=1` |
+| fused chains keep their inputs | a fused chain reads its inputs while its last node's output is written, so the graph build cancels a fusion whose output shares memory with an input and runs the separate ops. The allocator frees an input after the node of the chain that reads it, so where it placed things decided which chains fused: at 2048 tokens a batch it cancelled the biased mask in many layers, and it decided which of the conv's two fusions a prompt's layers ran. The fork's chains now keep their inputs allocated to their last node, as upstream does for its TOPK_MOE | `GGML_VK_DISABLE_FUSION_ALLOC_DEPS=1` |
+| no memory for a fused chain's inner nodes | the scheduler allocated every node of a chain although a fused shader writes only the last: the unfused plan of the biased mask holds two tensors of [n_kv, n_tokens, n_head] in F32 at once, most of a prompt batch's compute buffer. The graph's reordering now runs the whole fusion check for the biased mask, SITU and MOE_SUM, and marks the inner nodes of a chain that will fuse; they get a token allocation. A marked node that would run on its own stops the program with a message. Not in a build with assertions | `GGML_VK_DISABLE_FUSION_ELIDE=1` |
+| flash attention's block scan on the one mask | flash attention first scans its mask for blocks that are all masked, for every head: with the per-head bias, the whole [n_kv, n_tokens, 24] mask read again in each layer. The bias is finite, so a block is masked for every head exactly where the one mask under the bias is: the scan reads that one mask and writes its result for all heads (`flash_attn_mask_opt.comp`; the attention shaders are unchanged) | `GGML_VK_DISABLE_FA_MASK_BASE=1` |
+| the controllers' blend with its two TANH | the gain and the forget of a loop controller are the tanh of two matmuls. One token's were in the mat-vec's store; in a prompt batch each was a pass of its own, 192 a batch. The graph now puts the two TANH right before the blend and the blend right after them, and `ctrl_blend.comp` takes the tanh of what it reads, with the unary shader's formula: UNARY, UNARY, MUL, SUB, MUL and ADD in one dispatch for any number of tokens (CTRL_BLEND_TANH) | `GGML_VK_DISABLE_CTRL_BLEND_TANH=1` |
 
 **Measured:**
 - **Whole on the 1920X + R9700** (Q8_0, llama-bench), the first five: 43.6 tokens a second instead of 21.3, prompts of
@@ -426,6 +433,36 @@ GPU. Thirteen changes:
   dispatches each to one).
 - **The biased mask,** the same setup: 2,882 dispatches a generated token become 2,652 (46 of the 48 attention passes:
   the first of each mask kind casts the mask in between). A token of this setup began the day at 4,541.
+- **Prompt batches, whole on the 1920X + R9700** (UD-Q4_K_XL, a 3.5k-token and a 3.3k-token prompt through
+  `llama-server`, tokens a second; each row adds to the one above):
+
+  | | `-ub 512` | `-ub 1024` | `-ub 2048` |
+  | --- | --- | --- | --- |
+  | before | 1,127–1,169 | 1,247–1,276 | 1,110–1,121 |
+  | the depth mix of a batch | 1,354–1,394 | 1,516–1,550 | 1,292–1,305 |
+  | fused chains keep their inputs, the mask's nodes moved out of its chain | 1,367–1,413 | 1,531–1,568 | 1,730–1,770 |
+  | the experts' scale in the SITU pass, their weighted sum | 1,455–1,520 | | 1,853–1,892 |
+  | flash attention's block scan on the one mask | 1,458–1,517 | | 1,917–1,971 |
+  | the blend with its TANH, a faster reorder pass | 1,485–1,547 | | 1,962–2,017 |
+
+  A ubatch of 4096 read them at 2,048 before the last row. The reorder pass is host time: the Vulkan graph's
+  reordering matched its guarded chains again at every candidate node, 12 of the 20 ms the allocation of a prompt
+  batch's graph took on the 1920X; it now keeps their spans (12 ms in all, 6 on the 14600KF). A prompt batch spent 15% of its GPU time in the depth mix's tiny matmuls, one
+  a token; 2048 tokens a batch were slower than 1024 because the allocator's placement cancelled the biased mask's
+  fusion in many layers, each then writing ~700 MB of per-head bias.
+- **Memory:** with no memory for the chains' inner nodes, the compute buffer of a prompt batch at a 16k context is
+  633 MiB at 512 tokens (1,863 before) and 3,916 MiB at 2048 (7,728) on the R9700, and 643 MiB (1,878) on the 14600KF
+  + RTX 4070 Ti with the hot spare. With Inkling's drafter at 2048 tokens a batch the card had been short of memory:
+  its prompts read at 1,750 tokens a second now, 1,120 before.
+- **Rounding of the seven:** the depth mix of a batch sums in another order than the separate ops, and which of the
+  conv's two fusions a prompt's layer runs changed with the kept inputs; in a batch those two differ in their last
+  bits. Against the build before, a prompt's logits have a mean KL divergence of 0.0029 and the same perplexity
+  (3.7549, 3.7526 before), the distance Inkling's logits have between any two backends. The other five give the same
+  logits to the bit (the scale and the sum checked with UD-Q4_K_XL, the memory change and the scan with the Q8_0
+  and a Q4_K_M too).
+- **Flash-Next is unchanged by the seven:** its graphs have none of these chains but the expert sum, which stays as it
+  was for experts without weight scales. The lab's canaries on the 1920X + R9700 and the 1920X + RX480x2 give the
+  same logits, fit, hit rates and times as before.
 - **Rounding:** the clip and the depth mix sum in another order than the separate ops. A 4-bit quant's perplexity is
   4.0683 against 4.0697 with the clip; with the depth mix, the KL divergence of one-token logits from the CPU's is
   0.0046 against 0.0049 unfused (0.0043 and 0.0045 without fp16, the RX 480's path).
@@ -470,11 +507,14 @@ sparse-attention shaders and the RDNA4 kernels of other branches): a verify step
 | Vulkan: MUL_MAT followed by tanh or sigmoid, the row clip, and SSM_CONV with its residual and scale run as one dispatch each ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_MM_POST=1`, `GGML_VK_DISABLE_CLIP_ROWS=1`, `GGML_VK_DISABLE_CONV_RES=1` |
 | Vulkan: TOPK_MOE takes a sigmoid router whose weights' sum adds an epsilon, and a router's sigmoid goes to TOPK_MOE before MUL_MAT -> sigmoid ([Inkling 2's small ops](#inkling-2s-small-ops)) | Vulkan GPUs, sigmoid routers (Inkling 2, GLM-5.3-Flash) | none |
 | Vulkan: Inkling 2's depth mix of one token runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_DEPTH_MIX=1` |
-| Vulkan: Inkling 2's attention mask with its relative-position bias is built in one dispatch at one token ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_BIAS_MASK=1` |
+| Vulkan: Inkling 2's attention mask with its relative-position bias is built in one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_BIAS_MASK=1` |
+| Vulkan: Inkling 2's depth mix runs as one dispatch in a batch too; the experts' scale joins the SITU dispatch, and their scale, routing weights and sum are one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs; the last two: files with scaled expert weights (NVFP4) | `GGML_VK_DISABLE_DEPTH_MIX_BATCH=1`, `GGML_VK_DISABLE_SITU_SCALE=1`, `GGML_VK_DISABLE_MOE_SUM=1` |
+| Vulkan: the fork's fused chains keep their inputs allocated to their last node, and the inner nodes of the biased mask, SITU and MOE_SUM chains get no memory ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs, graphs with those chains | `GGML_VK_DISABLE_FUSION_ALLOC_DEPS=1`, `GGML_VK_DISABLE_FUSION_ELIDE=1` |
+| Vulkan: flash attention with a mask that is one mask plus a per-head bias scans the one mask for masked blocks ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs, masks built as cast(bias + cast(mask)) | `GGML_VK_DISABLE_FA_MASK_BASE=1` |
 | Vulkan: the SITU activation of the experts (Inkling 2) runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs, `LLM_FFN_SITU` | `GGML_VK_DISABLE_SITU=1` |
 | Vulkan: Inkling 2's short convolution of one token, with its window and state store, runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CONV_SPLIT=1` |
 | Vulkan: a one-row f32 RMS_NORM sums in the order of upstream's ADD + RMS_NORM partials (`rms_norm_ordered.comp`), so its bits do not depend on whether an ADD right before it hands it partial sums ([Inkling 2's small ops](#inkling-2s-small-ops), [docs/moe-testing.md](moe-testing.md#the-one-row-norms-order)) | Vulkan GPUs with subgroup arithmetic, not Intel's (those with the partials path) | `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` keeps upstream's plain norm |
-| Vulkan: Inkling 2's loop controller blend runs as one dispatch ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CTRL_BLEND=1` |
+| Vulkan: Inkling 2's loop controller blend runs as one dispatch, with the two TANH before it ([Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CTRL_BLEND=1`, `GGML_VK_DISABLE_CTRL_BLEND_TANH=1` |
 | Vulkan: a CONCAT along dim 1 of two single rows followed by RMS_NORM runs as one dispatch (Inkling 2's loop controller input, [Inkling 2's small ops](#inkling-2s-small-ops)) | all Vulkan GPUs | `GGML_VK_DISABLE_CONCAT_RMS_NORM=1` |
 | Inkling 2: the depth mix's blocks are normalized once ([Inkling 2's small ops](#inkling-2s-small-ops)) | `inkling2`, `inkling2_loop` | none |
 | Flash-Next's MTP draft: the rows without an output stop after the attention ([The draft's catch-up](#the-drafts-catch-up)) | `qwen4exp` draft heads | `LLAMA_MTP_FFN_ALL=1` |
@@ -1010,6 +1050,8 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `LLAMA_MOE_CACHE_JIT_BG=0` | `--moe-cache-jit`: uploads on the transfer queue that every synchronization waits for, so the CPU's experts wait for them, to compare |
 | `LLAMA_MOE_CACHE_JIT_PINNED_MAPS=0` | `--moe-cache-jit`: the device maps written from the host maps (each write synchronizes the device), to compare |
 | `LLAMA_WINDOW_TIMING=1` | `llama-server`: host time of a pass with drafts by step, after each answer and so far |
+| `LLAMA_WINDOW_TIMING=2` | the same, and at exit the host time of the batches that do not output all their tokens (a prompt's), by step: graph build, the scheduler's allocation, inputs, compute |
+| `GGML_VK_DEBUG_FUSION_CANCEL=1` | Vulkan: name each fusion the graph build cancels because its output shares memory with an input |
 | `GGML_VK_HOST_DELAY_US=N` | Vulkan: spin N µs at each graph_compute; if a pass slows by all of it, host time on the Vulkan side is on its critical path |
 | `GGML_VK_DMMV_LARGE_M=N` | Vulkan on AMD: large mul_mat_vec workgroups for matrices of up to N rows and at least 1024 columns, as NVIDIA and Intel always choose them |
 | `GGML_VK_DMMV_SUBGROUP=N` | Vulkan: the mul_mat_vec subgroup size, where the device allows it (RDNA reports 64 and allows 32) |
@@ -1054,6 +1096,15 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `GGML_VK_DISABLE_ORDERED_RMS_NORM=1` | Vulkan: upstream's plain norm for one row, not the one in the ADD partials' order ([docs/moe-testing.md](moe-testing.md#the-one-row-norms-order)) |
 | `GGML_VK_DISABLE_ADD_RMS_FUSION=1` | Vulkan: no partial sums from an ADD for the one-row RMS_NORM after it, so that a new fusion can be compared with the graph before it to the bit ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CONV_RES=1` | Vulkan: no fused SSM_CONV → ADD(residual) → SCALE |
+| `GGML_VK_DISABLE_DEPTH_MIX_BATCH=1` | Vulkan: Inkling 2's depth mix fused for one token only ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_SITU_SCALE=1` | Vulkan: the experts' scale as a pass of its own before the SITU activation ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_MOE_SUM=1` | Vulkan: the experts' scale, routing weights and sum as separate ops ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_MOE_SUM_UNSCALED=1` | Vulkan: the routing weights and the sum in one pass also for experts without weight scales (off: [Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_BIAS_MASK_HOIST=1` | Vulkan: the nodes that land inside Inkling 2's biased-mask chain stay there, and those layers build the mask unfused ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_FUSION_ALLOC_DEPS=1` | Vulkan: the fork's fused chains do not keep their inputs allocated; the allocator's placement then decides which of them fuse ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_FUSION_ELIDE=1` | Vulkan: the inner nodes of a fused chain are allocated in full ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_FA_MASK_BASE=1` | Vulkan: flash attention scans every head's mask for masked blocks, also where they are one mask plus a bias ([Inkling 2's small ops](#inkling-2s-small-ops)) |
+| `GGML_VK_DISABLE_CTRL_BLEND_TANH=1` | Vulkan: the two TANH of Inkling 2's loop controller apart from its blend ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 
 **Diagnostics**
 
