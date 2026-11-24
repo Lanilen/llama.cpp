@@ -618,6 +618,21 @@ static constexpr std::initializer_list<std::array<int, 3>> depth_mix_edges {
     { 6, 1, 5 }, // mul_mat->src[1]  == soft_max
 };
 
+// the same for a ubatch of several tokens, where the graph repeats the query for each token before the scores
+static constexpr std::initializer_list<ggml_op> depth_mix_rep_pattern { GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE,
+                                                                         GGML_OP_CONT, GGML_OP_REPEAT, GGML_OP_MUL_MAT,
+                                                                         GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_rep_edges {
+    { 1, 1, 0 }, // concat->src[1]   == rms_norm
+    { 2, 0, 1 }, // transpose->src[0] == concat
+    { 3, 0, 2 }, // cont->src[0]     == transpose
+    { 5, 0, 1 }, // mul_mat->src[0]  == concat (the scores)
+    { 5, 1, 4 }, // mul_mat->src[1]  == the repeated query
+    { 6, 0, 5 }, // soft_max->src[0] == the scores
+    { 7, 0, 3 }, // mul_mat->src[0]  == cont (the mix)
+    { 7, 1, 6 }, // mul_mat->src[1]  == soft_max
+};
+
 static constexpr std::initializer_list<ggml_op> clip_rows_scale_pattern { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS,
     GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> clip_rows_pattern { GGML_OP_SQR, GGML_OP_SUM_ROWS,
@@ -641,6 +656,20 @@ static constexpr std::initializer_list<ggml_op> bias_mask_pattern { GGML_OP_SUB,
 // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn builds it (LLM_FFN_SITU)
 static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
     GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+// the same after the MUL of the merged gate_up by its experts' weight scales (build_lora_mm_id, a file with scaled
+// expert weights) and the views of its halves: the activation then reads the expert matmul's output
+static constexpr std::initializer_list<ggml_op> situ_scale_pattern { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
+    GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+// (the weighted sum of the expert outputs, MOE_SUM, has one VIEW and one ADD an expert slot: ggml_vk_moe_sum_len)
+
+// A node inside a fused chain that the graph optimizer found certain to fuse (the backend's own tensor flag, above
+// ggml's): the fused shader never writes it, so its allocation is a token one (ggml_backend_vk_buffer_type_get_alloc_size).
+// Inkling 2's biased mask has two such tensors of [n_kv, n_q, n_head] F32, 768 MiB each at 512 tokens of a 16k context.
+#define GGML_VK_TENSOR_FLAG_ELIDED (1 << 24)
+// A FLASH_ATTN_EXT whose per-head mask is one mask plus a per-head bias (Inkling 2), and whose one mask the
+// optimizer kept allocated to it: the blocks that are all -inf are found in the one mask (ggml_vk_fa_mask_base)
+#define GGML_VK_TENSOR_FLAG_FA_MASK_BASE (1 << 25)
 
 // Inkling 2's short convolution from its two inputs with its state store: x = concat(past, cur), the state the last
 // columns of x (a CPY), then the conv with its residual and scale; the dynamic form adds the input-dependent taps, lag
@@ -1114,6 +1143,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_res_scale_f32;
     vk_pipeline pipeline_conv_split_f32[2];   // [without, with] the dynamic taps (conv_split.comp)
     vk_pipeline pipeline_situ_f32;            // Inkling 2's SITU activation (situ.comp)
+    vk_pipeline pipeline_moe_sum_f32;         // the weighted sum of a MoE layer's expert outputs (moe_sum.comp)
     vk_pipeline pipeline_bias_mask_f32_f16;   // Inkling 2's mask with its relative-position bias (bias_mask.comp)
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
@@ -1520,10 +1550,11 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_mm_post {};      // MUL_MAT [+ SCALE] + UNARY in the mat-vec's store (num_additional_fused_ops 2 with the SCALE, 1 without)
-    bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
+    bool fused_depth_mix {};    // RMS_NORM CONCAT TRANSPOSE CONT [REPEAT] MUL_MAT SOFT_MAX MUL_MAT: Inkling 2's depth mix
     bool fused_clip_rows {};    // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL: a row clip to an L2 norm
     bool fused_bias_mask {};       // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY: Inkling 2's biased F16 mask
-    bool fused_situ {};            // SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation
+    bool fused_situ {};            // [MUL VIEW VIEW] SCALE TANH SCALE SIGMOID MUL [SCALE TANH SCALE] MUL: Inkling 2's SITU activation
+    bool fused_moe_sum {};         // [MUL] MUL VIEW.. ADD..: the expert outputs scaled, weighted and summed
     bool fused_conv_split {};      // CONCAT VIEW VIEW CPY SSM_CONV ...: Inkling 2's conv from its two inputs with its state store
     bool fused_concat_rms_norm {}; // CONCAT RMS_NORM: Inkling 2's controller input, the norm of [cur; message]
     bool fused_ctrl_blend {};   // MUL SUB MUL ADD: Inkling 2's loop controller blend, (cur - forget*cur) + gain*message
