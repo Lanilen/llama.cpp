@@ -17451,6 +17451,28 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     };
     const std::vector<bool> conv_cover  = op_cover({ &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern, &depth_mix_rep_pattern });
     const std::vector<bool> blend_cover = op_cover({ &ctrl_blend_pattern });
+    const std::vector<bool> qsa_cover   = op_cover({ &topk_qsa_pattern });
+    // and the nodes where the ops of one of the patterns the loop below must not pull a node out of begin: the
+    // loop asked each of these twenty at every candidate node (a prompt batch of Inkling 2 has 11,500 nodes, the
+    // reordering was 14 of the 18 ms its graph's allocation took on the 1920X)
+    std::vector<bool> start_cover(graph->n_nodes, false);
+    for (const auto * pat : { &topk_moe_early_softmax_norm, &topk_moe_sigmoid_norm_bias, &topk_moe_sigmoid_norm_bias_eps,
+                              &topk_moe_sqrt_softplus_norm_bias, &topk_moe_early_softmax, &topk_moe_late_softmax, &snake_pattern,
+                              &mm_scale_unary_pattern, &mm_unary_pattern, &depth_mix_pattern, &clip_rows_scale_pattern,
+                              &clip_rows_pattern, &ssm_conv_res_scale_pattern, &concat_rms_norm_pattern,
+                              &rms_norm_mul_add_mul_pattern, &rms_norm_mul_add_pattern, &rms_norm_mul_rope_view_set_rows_pattern,
+                              &rms_norm_view_set_rows_pattern, &rope_view_set_rows_pattern, &hc_post_gate_pattern }) {
+        const int len = (int) pat->size();
+        for (int s = 0; s + len <= graph->n_nodes; ++s) {
+            int k = 0;
+            while (k < len && graph->nodes[s + k]->op == pat->begin()[k]) {
+                ++k;
+            }
+            if (k == len) {
+                start_cover[s] = true;
+            }
+        }
+    }
 
     int first_unused = 0;
 
@@ -17727,6 +17749,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
             auto const &in_qsa_pattern = [&](int n) -> bool {
+                if (!qsa_cover[n]) {
+                    return false;
+                }
                 for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
                     if (n - o >= 0 && match_pattern(topk_qsa_pattern, n - o)) {
                         return true;
@@ -17746,8 +17771,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
-            if (in_conv_split_pattern(j) ||
-                match_pattern(topk_moe_early_softmax_norm, j) ||
+            if (in_conv_split_pattern(j) || in_ctrl_blend_pattern(j) || in_qsa_pattern(j)) {
+                continue;
+            }
+            // (start_cover: none of these can match where none of their ops do)
+            if (start_cover[j] &&
+               (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias_eps, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
@@ -17758,14 +17787,13 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 (match_pattern(mm_unary_pattern, j) && ggml_vk_is_mm_unary_at(graph, j)) ||
                 match_pattern(depth_mix_pattern, j) ||
                 match_pattern(clip_rows_scale_pattern, j) || match_pattern(clip_rows_pattern, j) ||
-                match_pattern(ssm_conv_res_scale_pattern, j) || in_ctrl_blend_pattern(j) || match_pattern(concat_rms_norm_pattern, j) ||
-                in_qsa_pattern(j) ||
+                match_pattern(ssm_conv_res_scale_pattern, j) || match_pattern(concat_rms_norm_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j))) {
                 continue;
             }
             bool ok = true;
