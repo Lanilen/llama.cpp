@@ -184,6 +184,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
     dt.enabled = getenv("LLAMA_WINDOW_TIMING") != nullptr;
+    dt.prompts = dt.enabled && atoi(getenv("LLAMA_WINDOW_TIMING")) == 2;
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -2576,10 +2577,13 @@ void llama_context::decode_timing::end(int64_t n_tokens, int64_t n_outputs) {
         return;
     }
     lap(EXTRACT);
-    if (n_outputs != n_tokens || n_tokens < 1) {
+    if (n_tokens < 1 || (n_outputs != n_tokens && !prompts)) {
         return;
     }
-    const int kind = std::min<int64_t>(n_tokens, N_KINDS) - 1;
+    const int kind = n_outputs != n_tokens ? N_KINDS : std::min<int64_t>(n_tokens, N_KINDS) - 1;
+    if (kind == N_KINDS) {
+        n_prompt_tokens += n_tokens;
+    }
     for (int i = 0; i < N_STEPS; ++i) {
         t_sum[kind][i] += t_cur[i];
     }
@@ -2588,11 +2592,21 @@ void llama_context::decode_timing::end(int64_t n_tokens, int64_t n_outputs) {
 }
 
 void llama_context::decode_timing::print(bool with_moe_cache) const {
-    for (int k = 0; k < N_KINDS; ++k) {
+    for (int k = 0; k <= N_KINDS; ++k) {
         if (n[k] == 0) {
             continue;
         }
         const auto ms = [&](step s) { return t_sum[k][s] / 1e3 / n[k]; };
+        if (k == N_KINDS) {
+            double total = 0;
+            for (int i = 0; i < N_STEPS; ++i) {
+                total += ms((step) i);
+            }
+            LLAMA_LOG_INFO("%s: decode timing, %s, batches that do not output all their tokens (%.0f tokens each): %" PRId64 " batches, %" PRId64 " graphs built; ms setup %.2f build %.2f alloc %.2f inputs %.2f before %.2f compute %.2f hidden %.2f update %.2f extract %.2f, total %.2f\n",
+                    __func__, with_moe_cache ? "MoE cache" : "no MoE cache", (double) n_prompt_tokens / n[k], n[k], n_built[k],
+                    ms(SETUP), ms(BUILD), ms(GRAPH), ms(INPUTS), ms(BEFORE), ms(COMPUTE), ms(HIDDEN), ms(UPDATE), ms(EXTRACT), total);
+            continue;
+        }
         double total = 0;
         for (int i = 0; i < N_STEPS; ++i) {
             total += ms((step) i);
