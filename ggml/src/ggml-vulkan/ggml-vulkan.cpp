@@ -16990,6 +16990,107 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         return;
     }
 
+    // Inkling 2's biased mask (bias_mask_pattern) is built as a chain of nine nodes, but other nodes can land between
+    // them: with recurrent rollback (n_rs_seq, which a drafter sets) the mask's own cast to F32 (the chain's ADD reads
+    // it) and the conv state stores' slot order (ARANGE, SCALE). The chain then no longer matches, the reorder
+    // below spreads it out further, and every attention layer runs its bias and mask unfused (a prompt batch 16%
+    // longer on the R9700). Here the nodes the chain does not read through its src[0] links are moved to just before
+    // it, where the chain finds their results: only nodes that read no node of the chain and whose own inputs come
+    // before it. GGML_VK_DISABLE_BIAS_MASK_HOIST=1 turns it off.
+    static const bool no_hoist = getenv("GGML_VK_DISABLE_BIAS_MASK_HOIST") != nullptr;
+    // only in graphs with recurrent rollback (their conv state stores build a slot order with ARANGE): without it the
+    // chains match as they are, and moving the nodes there moves the logits a little, which is still to explain
+    bool rollback = false;
+    for (int i = 0; i < graph->n_nodes && !rollback; ++i) {
+        rollback = graph->nodes[i]->op == GGML_OP_ARANGE;
+    }
+    if (!no_hoist && rollback) {
+        const int len = (int) bias_mask_pattern.size();
+        const int max_extra = 8;
+        for (int s = 0; s + len <= graph->n_nodes; ++s) {
+            if (graph->nodes[s]->op != GGML_OP_SUB) {
+                continue;
+            }
+            // follow the chain: each of its nodes reads the one before it as src[0] and has the pattern's next op
+            std::vector<int> chain = { s };
+            std::vector<int> other;
+            for (int j = s + 1; j < graph->n_nodes && (int) chain.size() < len && (int) other.size() <= max_extra; ++j) {
+                const ggml_tensor * t = graph->nodes[j];
+                if (t->op == bias_mask_pattern.begin()[chain.size()] && t->src[0] == graph->nodes[chain.back()]) {
+                    chain.push_back(j);
+                } else {
+                    other.push_back(j);
+                }
+            }
+            if ((int) chain.size() < len || other.empty() || (int) other.size() > max_extra) {
+                continue;
+            }
+            // none of the moved nodes may read a node of the chain, and a source of one computed between s and it must
+            // be moved too (it would end up after its reader otherwise)
+            std::set<const ggml_tensor *> chain_set, chain_reads, moved_set;
+            for (int c : chain) {
+                const ggml_tensor * t = graph->nodes[c];
+                chain_set.insert(t);
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (t->src[k] != nullptr) {
+                        chain_reads.insert(t->src[k]->view_src ? t->src[k]->view_src : t->src[k]);
+                    }
+                }
+            }
+            bool ok = true;
+            for (int o : other) {
+                const ggml_tensor * t = graph->nodes[o];
+                // a view-type node in the chain (the first layer's) is left where it is, and its chain unfused as before
+                if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
+                    t->op == GGML_OP_NONE) {
+                    ok = false;
+                    break;
+                }
+                // nor write, through a view, into what the chain reads (moving it before the chain would reverse that)
+                const bool writes_view = t->view_src != nullptr && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE &&
+                                         t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE && t->op != GGML_OP_NONE;
+                if (writes_view && chain_reads.count(t->view_src)) {
+                    ok = false;
+                    break;
+                }
+                for (int k = 0; k < GGML_MAX_SRC && ok; ++k) {
+                    const ggml_tensor * src = t->src[k];
+                    if (src == nullptr) {
+                        continue;
+                    }
+                    const ggml_tensor * base = src->view_src ? src->view_src : src;
+                    if (chain_set.count(src) || chain_set.count(base)) {
+                        ok = false;
+                    }
+                    for (int q = s; q < o && ok; ++q) {
+                        if ((graph->nodes[q] == src || graph->nodes[q] == base) && !moved_set.count(graph->nodes[q])) {
+                            ok = false;
+                        }
+                    }
+                }
+                if (!ok) {
+                    break;
+                }
+                moved_set.insert(t);
+            }
+            if (!ok) {
+                continue;
+            }
+            // rewrite [s, the chain's end]: the moved nodes first, in their order, then the chain
+            std::vector<ggml_tensor *> span;
+            for (int o : other) {
+                span.push_back(graph->nodes[o]);
+            }
+            for (int c : chain) {
+                span.push_back(graph->nodes[c]);
+            }
+            for (int i = 0; i < (int) span.size(); ++i) {
+                graph->nodes[s + i] = span[i];
+            }
+            s += (int) span.size() - 1;
+        }
+    }
+
     auto const &is_empty = [](const ggml_tensor * node) -> bool {
         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
