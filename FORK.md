@@ -360,6 +360,10 @@ cmake --build build-vk -j
 - **Ubuntu 24.04's `glslc`** (shaderc 2023.8) builds without the int8 dot product, bf16 and coopmat2 shaders, and
   doesn't say so. Point CMake at a newer one: `-DVulkan_GLSLC_EXECUTABLE=/path/to/glslc` (the lab uses shaderc 2026.4
   from a conda environment).
+- **Ubuntu 24.04's Vulkan headers** (libvulkan-dev 1.3.275) lack `VK_NV_cooperative_matrix2`, so on NVIDIA the build
+  leaves coopmat2 out without a word (the device line says `matrix cores: KHR_coopmat`). Point CMake at newer ones:
+  `-DVulkan_INCLUDE_DIR=/path/to/Vulkan-Headers/include` (the 14600KF + RTX 4070 Ti uses Khronos v1.4.354). There,
+  Qwen3.5-9B UD-Q4_K_XL reads prompts 27% faster (48% at a depth of 8,192), answers the same. AMD cards don't use it.
 - **ROCm beside Vulkan:** ROCm 6 and later fail to start when a GPU they don't support, such as Polaris (gfx803), is in
   the machine. [rocm-hide-gpus](https://github.com/Lanilen/rocm-hide-gpus) is a preload library that hides those GPUs
   from ROCm only, so one llama.cpp process can run the R9700 on ROCm and the RX 480s on Vulkan
