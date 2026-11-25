@@ -379,7 +379,9 @@ A mat-vec MUL_MAT followed by a SCALE and a SiLU or sigmoid runs as one dispatch
 mat-vec's store (`mm_post` in the shaders). Flash-Next has 97 of them a pass, the down projections of its
 hyper-connections. The fused path gives the same logits as the unfused one. On the 1920X + R9700 it saves 194 dispatch
 groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU's work is exposed (one submit per split).
-`GGML_VK_DISABLE_MM_POST=1` turns it off.
+`GGML_VK_DISABLE_MM_POST=1` turns it off. It fuses only where the plain mat-vec runs: up to 8 columns, or 4 with
+coopmat2 (NVIDIA), past which the matmul runs. Until 2026-11-25 the check took 8 on coopmat2 as well, so 5 to 8 columns
+lost the scale and the activation there.
 
 ### Inkling 2's small ops
 
@@ -1086,6 +1088,7 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `LLAMA_GRAPH_CACHE_TOKENS=N` | the longest batch that gets a graph of its own with `LLAMA_GRAPH_CACHE` (default 16) |
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
 | `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid or MUL_MAT → tanh/sigmoid in the mat-vec's store |
+| `GGML_VK_F32_ACC=1` | Vulkan: every matmul accumulates in f32 (by default quantized and f16 matmuls may accumulate in f16, always with coopmat2); `test-moe-cache` sets it, so that its fixtures' logits don't move with the ubatch size |
 | `GGML_VK_DISABLE_CLIP_ROWS=1` | Vulkan: no fused row clip ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_DEPTH_MIX=1` | Vulkan: no fused depth mix ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CTRL_BLEND=1` | Vulkan: no fused blend of Inkling 2's loop controllers ([Inkling 2's small ops](#inkling-2s-small-ops)) |
