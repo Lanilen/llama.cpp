@@ -14267,7 +14267,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
         for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
-            for (int64_t n : { 1, 3, 8 }) {
+            // 5 and 8: past coopmat2's mat-vec limit of 4 columns (the fusion must not take those)
+            for (int64_t n : { 1, 3, 5, 8 }) {
                 test_cases.emplace_back(new test_mul_mat_scale_unary(type, op, 320, n, 1024));
                 test_cases.emplace_back(new test_mul_mat_scale_unary(type, op, 64, n, 256));
             }
@@ -14275,7 +14276,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
         for (ggml_unary_op op : { GGML_UNARY_OP_TANH, GGML_UNARY_OP_SIGMOID }) {
-            for (int64_t n : { 1, 3 }) {
+            for (int64_t n : { 1, 3, 5, 8 }) {
                 test_cases.emplace_back(new test_mul_mat_unary(type, op, 2304, n, 64));
                 test_cases.emplace_back(new test_mul_mat_unary(type, op, 3072, n, 2304));
             }

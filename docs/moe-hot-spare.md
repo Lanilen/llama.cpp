@@ -379,7 +379,9 @@ A mat-vec MUL_MAT followed by a SCALE and a SiLU or sigmoid runs as one dispatch
 mat-vec's store (`mm_post` in the shaders). Flash-Next has 97 of them a pass, the down projections of its
 hyper-connections. The fused path gives the same logits as the unfused one. On the 1920X + R9700 it saves 194 dispatch
 groups a pass: within noise at the usual settings, and 1.5–2.7% where the GPU's work is exposed (one submit per split).
-`GGML_VK_DISABLE_MM_POST=1` turns it off.
+`GGML_VK_DISABLE_MM_POST=1` turns it off. It fuses only where the plain mat-vec runs: up to 8 columns, or 4 with
+coopmat2 (NVIDIA), past which the matmul runs. Until 2026-11-25 the check took 8 on coopmat2 as well, so 5 to 8 columns
+lost the scale and the activation there.
 
 ### Inkling 2's small ops
 
