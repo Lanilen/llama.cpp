@@ -3415,9 +3415,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
         if (bias_table) {
+            // the per-head mask while it is small: its fused build and the attention over it are faster than the indexed
+            // bias read in the attention (Vulkan: answers at 250k cells 33 tok/s against 24, prompts 3% at the same
+            // ubatch); the indexed bias when the mask would be large (long prompts: no per-head mask, larger ubatches).
+            // LLAMA_ATTN_BIAS_DENSE_MIB is the largest F32 per-head bias kept dense (default 1024, 0 = always indexed).
+            static const int64_t dense_max = [] {
+                const char * e = getenv("LLAMA_ATTN_BIAS_DENSE_MIB");
+                return (e ? std::max<int64_t>(0, atoll(e)) : 1024) << 20;
+            }();
+            const int64_t dense_bytes = bias_indices->ne[0] * bias_indices->ne[1] * q->ne[2] * (int64_t) sizeof(float);
             ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
             const auto dev = model.dev_layer(il);
-            if (!cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
+            if ((!kv_rows && dense_bytes <= dense_max) || !cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                 cur->src[3] = dense_bias_mask();
             } else if (kv_rows) {
