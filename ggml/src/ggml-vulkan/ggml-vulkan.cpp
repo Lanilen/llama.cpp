@@ -6903,6 +6903,10 @@ static bool ggml_vk_prec_allows_f16acc(ggml_prec prec) {
 }
 
 static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec acc_prec) {
+    // GGML_VK_F32_ACC=1: every matmul accumulates in f32, for checks that compare kernels of different shapes (coopmat2's
+    // f16 accumulation moves the logits of test-moe-cache's fixtures by up to 0.003 of their deviation between ubatch sizes)
+    static const bool f32acc = getenv("GGML_VK_F32_ACC") != nullptr;
+    if (f32acc) return false;
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     const bool prec_allows_f16 = ggml_vk_prec_allows_f16acc(acc_prec);
@@ -15506,7 +15510,7 @@ static bool ggml_vk_is_mm_unary_at(const struct ggml_cgraph * cgraph, int i) {
 
 // MUL_MAT -> SCALE -> SiLU or sigmoid (with_scale), or MUL_MAT -> tanh or sigmoid, done in the mat-vec's store: only
 // where ggml_vk_mul_mat takes the plain mat-vec path (contiguous weights, no M split, no Hadamard, one batch of up to
-// mul_mat_vec_max_cols columns); GGML_VK_DISABLE_MM_POST turns both off
+// ggml_vk_mul_mat_vec_max_cols columns); GGML_VK_DISABLE_MM_POST turns both off
 static bool ggml_vk_can_fuse_mm_post(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool with_scale = true) {
     static const bool disabled = getenv("GGML_VK_DISABLE_MM_POST") != nullptr;
     if (disabled) {
@@ -15536,7 +15540,8 @@ static bool ggml_vk_can_fuse_mm_post(const ggml_backend_vk_context * ctx, const 
         ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange || ggml_vk_can_use_fwht(ctx, src1, mm)) {
         return false;
     }
-    if (mm->ne[1] > mul_mat_vec_max_cols || mm->ne[2] != 1 || mm->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1) {
+    // the mat-vec's column limit is the device's: with coopmat2 more than 4 columns take the matmul, which has no such store
+    if (mm->ne[1] > ggml_vk_mul_mat_vec_max_cols(ctx->device) || mm->ne[2] != 1 || mm->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1) {
         return false;
     }
     if (mm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 ||

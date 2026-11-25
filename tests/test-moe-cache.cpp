@@ -62,6 +62,10 @@ static const float    FIX_STDEV    = 0.1f;
 // inkling2_loop's rounding follows the graph's order: in a one-token graph an ADD right before a one-row RMS_NORM gives
 // it partial sums in another order (GGML_VK_DISABLE_ADD_RMS_FUSION), and a node shared or dropped decides which ADDs
 // those are; between a cached run and its reference that is 0.0007 to 0.0021 (14600KF + RTX 4070 Ti, 2026-11-23).
+// F32_ACC: the reference and every scenario run with GGML_VK_F32_ACC=1. A scenario runs some tokens in other ubatches
+// than the reference (resize-split, the cache's small ubatches) or its experts in other kernels, and coopmat2 (NVIDIA)
+// accumulates quantized matmuls in f16: up to 0.0028 (qwen4exp) and 0.0031 (inkling2_loop) on the 14600KF + RTX 4070
+// Ti, over the bounds below; with f32 accumulation 0.0009 and 0.0018 (2026-11-25). Its coopmat1 path is the same either way.
 static float tol_logit(const llm_arch arch) {
     return arch == LLM_ARCH_GLM5_NEXT ? 0.1f : arch == LLM_ARCH_INKLING2_LOOP ? 0.003f : 0.002f;
 }
@@ -505,6 +509,7 @@ static void clean_env() {
     for (const std::string & name : names) {
         unsetenv(name.c_str());
     }
+    setenv("GGML_VK_F32_ACC", "1", 1); // see F32_ACC
 #endif
 }
 
@@ -1313,6 +1318,9 @@ int main(int argc, char ** argv) {
         }
         if (getenv("LLAMA_MOE_CACHE_VERIFY") == nullptr) { // see get_counters
             env.emplace_back("LLAMA_MOE_CACHE_VERIFY", "1");
+        }
+        if (getenv("GGML_VK_F32_ACC") == nullptr) { // the reference's, see F32_ACC
+            env.emplace_back("GGML_VK_F32_ACC", "1");
         }
         if (!env.empty()) {
             const int rc = run_self(std::vector<std::string>(argv + 1, argv + argc), env);
