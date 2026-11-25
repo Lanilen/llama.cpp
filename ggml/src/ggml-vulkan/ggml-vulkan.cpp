@@ -18739,8 +18739,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[5] != nullptr) {
                     return false;
                 }
-                if (ggml_flash_attn_ext_has_indexed_bias(op) &&
-                    ((uint64_t)ggml_nelements(op->src[6]) > UINT32_MAX || (uint64_t)ggml_nelements(op->src[7]) > UINT32_MAX)) {
+                // GGML_VK_DISABLE_FA_INDEXED_BIAS=1 declines the indexed bias, so the graph folds it into a per-head mask
+                static const bool no_indexed_bias = getenv("GGML_VK_DISABLE_FA_INDEXED_BIAS") != nullptr;
+                if (ggml_flash_attn_ext_has_indexed_bias(op) && (no_indexed_bias ||
+                    (uint64_t)ggml_nelements(op->src[6]) > UINT32_MAX || (uint64_t)ggml_nelements(op->src[7]) > UINT32_MAX)) {
                     return false;
                 }
                 bool coopmat2 = device->coopmat2;
