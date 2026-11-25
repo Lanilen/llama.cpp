@@ -1375,6 +1375,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // bonus anchor (SpecForge exports) when false: slot 0 is a bonus token, not a prediction slot
     bool sample_from_anchor = true;
 
+    // with --spec-draft-p-min: true when the draft has a confidence head (its cutoff), false when the drafter's own
+    // top-1 probability is the cutoff (Inkling 2's drafter has no head)
+    bool has_conf_head = true;
+
     // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
     // it comes back from the injection as h_nextn, kept for the last ctx_rows positions of each sequence
     bool has_markov_context = false;
@@ -1414,11 +1418,15 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
         if (this->params.p_min > 0.0f) {
             char buf[16] = {};
-            const bool has_conf =
+            has_conf_head =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf) {
-                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+            if (!has_conf_head) {
+                // the draft keeps its first token and stops before the first later one whose top-1 probability is
+                // below p_min (draft-simple's rule, without dropping the first token: a step whose draft would be
+                // empty still runs the whole drafter block, and on the R9700 keeping it was +4.6 points)
+                LOG_INF("%s: - no confidence head: --spec-draft-p-min %.2f stops a draft at the drafter's top-1 probability, after its first token\n",
+                        __func__, (double) this->params.p_min);
             }
         }
 
@@ -1579,6 +1587,12 @@ public:
                     const float * row = draws + (size_t) (beg + i) * n_embd_dec;
                     const int32_t n_cand = (int32_t) row[1];
 
+                    // without a confidence head: after the first token, stop where the most likely candidate (the
+                    // first, sorted) is below p_min
+                    if (!has_conf_head && params.p_min > 0.0f && !result.empty() && row[2 + n_cand] < params.p_min) {
+                        break;
+                    }
+
                     auto & q = dp.result_q->emplace_back();
                     q.reserve(n_cand);
                     for (int32_t k = 0; k < n_cand; ++k) {
@@ -1594,8 +1608,10 @@ public:
                 continue;
             }
 
-            // DSpark: read from the first draft slot, truncate below the confidence threshold
-            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            // DSpark: read from the first draft slot, truncate below the confidence threshold (its head, or else the
+            // drafter's top-1 probability)
+            const float * conf = params.p_min > 0.0f && has_conf_head ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            const bool stop_top1 = params.p_min > 0.0f && !has_conf_head;
             for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                 const int32_t idx = beg + i;
 
@@ -1614,6 +1630,22 @@ public:
                 }
 
                 const llama_token id = cur_p->data[0].id;
+
+                if (stop_top1 && !result.empty()) {
+                    // the candidates are the backend's top 10 by logit, their p not always filled: a softmax over them
+                    float lmax = cur_p->data[0].logit;
+                    for (size_t k = 1; k < cur_p->size; ++k) {
+                        lmax = std::max(lmax, cur_p->data[k].logit);
+                    }
+                    double z = 0.0;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        z += std::exp((double) cur_p->data[k].logit - lmax);
+                    }
+                    const double p_top = 1.0 / z; // the largest logit's share
+                    if (p_top < params.p_min) {
+                        break;
+                    }
+                }
 
                 common_sampler_accept(smpl, id, true);
 
@@ -3503,7 +3535,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         return nullptr;
     }
 
-    // the n-gram drafters ignore p_min, and DSpark uses it as the cutoff of its confidence head
+    // the n-gram drafters ignore p_min, and DSpark uses it as the cutoff of its confidence head or of its top-1 probability
     const bool uses_p_min = std::any_of(impls.begin(), impls.end(), [](const auto & impl) {
         switch (impl->type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:

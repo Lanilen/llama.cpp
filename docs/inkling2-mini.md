@@ -296,7 +296,7 @@ conversion](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) of the drafter (
 
 ```bash
 LLAMA_GRAPH_CACHE=8 llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf -ngl 99 -c 16384 \
-  -md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 4 -ngld 99
+  -md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-p-min 0.8 -ngld 99
 ```
 
 The drafter spans the target's devices (it reads their output head), so it takes no `-devd` of its own.
@@ -326,6 +326,28 @@ ARGMAX change below and the three-draft row before the prompt work, when the mod
   rounds a little differently from one token at a time.
 - **A graph per batch length** (`LLAMA_GRAPH_CACHE`) covers what that RX 9070 XT report found costly with drafts of
   varying length: the graph built again for each verify batch of another length.
+
+**Stopping a draft where the drafter is unsure** (`--spec-draft-p-min 0.8`). Inkling's drafter has no confidence head,
+which `--spec-draft-p-min` needed for DSpark; for a drafter without one the fork stops a draft at the drafter's own
+top-1 probability, as upstream's draft-simple does, but keeps the first token. On the R9700, UD-Q4_K_XL whole, temp 0:
+
+| drafts | 35 varied prompts (first turns of the predictor's traces, 300-token answers) | the three requests above (total time) | notes |
+| --- | --- | --- | --- |
+| up to 4, no stop | 64.5 tok/s | 48.4 s | 86.6 tok/s |
+| up to 4, `--spec-draft-p-min 0.8` | **69.1 (+7.1%)**, faster on 27 of 35 | **47.4 s (−2.1%)** | **88.9 (+2.7%)** |
+| up to 3, `--spec-draft-p-min 0.8` | 69.7 (+8.0%) | 47.8 s | 85.7 |
+| up to 3, no stop | 68.0 (+5.3%) | 47.3 s | 85.5 |
+
+- **The drafter pays for every position of its block,** whatever the stop keeps: its Markov head is a chain in the
+  graph, about 0.5 ms a position on the R9700 (blocks of 2 / 4 / 7: 2.4 / 3.5 / 5.1 ms). So the cap still matters:
+  with up to 7 drafts and the stop every step cost 4 ms more and the requests got slower.
+- **The first token is kept** because a draft that would stop there still runs the whole block, then checks one token;
+  dropping it gave +2.6% instead of +7.1% on the varied prompts.
+- **Text that accepts few drafts gains most,** and much of that is the shorter block (up to 3 without the stop:
+  +5.3%); only up to 4 with the stop also gains on prose that accepts long drafts (the notes request, the same text in
+  every run: +2.7%). The threshold matters little: 0.7 to 0.85 give the same within 0.2%.
+- **Tried and not kept:** a block length from the last few steps' acceptance (their mean plus 1 or 2) instead of a fixed
+  cap: +5–6%, never better than a fixed one.
 
 **A Vulkan ARGMAX for long rows** (branch `vk-argmax`). The drafter takes an ARGMAX over the vocabulary (200,058
 logits) at each of its Markov steps. Vulkan ran a row as one workgroup of 64 threads, each reading about 3,100 values
@@ -386,7 +408,12 @@ Ti setup from 4,541 dispatches to 2,652):
 - **A smaller draft vocabulary.** With the ARGMAX fixed, the output head and the Markov head's vocabulary matmul are
   24% and 20% of a draft step on the R9700. A set of the likely tokens, chosen from the prompt and then as the answer
   goes, would shrink both, and could raise acceptance if it leaves out tokens the drafter wrongly favours.
-- **Two drafts at a near tie:** checking the runner-up's branch too where the drafter is unsure early in a block.
+- **A learned stop:** a model of the drafter's probabilities along the block (rising, falling, a dip) in place of one
+  threshold, trained on logs of drafts and their acceptance. (Two drafts at a near tie were scoped and dropped: on the
+  R9700 a verified token costs about 4.9 ms, 11.5% of a step, twice what the runner-up's hits would pay for.)
+- **Reading a shared expert once in a verify batch:** the tokens of a batch share about half their experts, and the
+  dense mat-vec's extra columns are nearly free (1 / 2 / 8 columns: 74 / 74 / 128 µs); a first kernel lost to its own
+  overhead.
 - **A just-in-time upload for a looped layer's later passes in prompts,** where the misses are on the critical path.
 - **Why the indexed bias slows answers at depth** (24 against 33 tokens a second at 250k cells): one answer step's
   profile, and whether `-ub 1024` is the better middle at 256k.

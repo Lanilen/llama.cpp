@@ -918,7 +918,10 @@ merged into `polaris` as it stands, since it is upstream's own code and will com
 checks pass (all 23,429 op tests and the cache tests on an RX 460). Its taps of the hidden states share their slots
 with the expert predictor's: they agree for the first six layers and the loop's first pass, which is all Inkling's
 predictor reads (same hits, predictions and text with and without it, on an RX 480). A predictor reading a later
-layer of a looped model would collide.
+layer of a looped model would collide. The fork's own addition on top: for a drafter without a confidence head
+(Inkling's), `--spec-draft-p-min` stops a draft at the drafter's top-1 probability after its first token, where #32218
+refuses the option; with up to 4 drafts and 0.8, +7.1% on 35 varied prompts and +2.1% on the guide's three requests on
+the R9700 ([the table](docs/inkling2-mini.md#speculative-decoding-with-its-dspark-drafter)).
 
 **Taken before upstream merges it: flash attention with Inkling 2's position bias by index**
 ([#32898](https://github.com/ggml-org/llama.cpp/pull/32898) by 0cc4m, at `ce1e24697`, a draft, on upstream's merged
