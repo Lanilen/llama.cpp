@@ -19,6 +19,9 @@ What the fork adds for it:
 - **Speculative decoding with the model's own drafter** (DSpark), from upstream's open
   [#32218](https://github.com/ggml-org/llama.cpp/pull/32218) taken early, and a Vulkan ARGMAX fast enough for its
   vocabulary-sized rows ([DSpark](#speculative-decoding-with-its-dspark-drafter)).
+- **A 256k context on one R9700:** flash attention reads the model's position bias by index for long prompts, from
+  upstream's [#32740](https://github.com/ggml-org/llama.cpp/pull/32740) and the open
+  [#32898](https://github.com/ggml-org/llama.cpp/pull/32898) taken early ([Long context](#long-context)).
 
 ## Contents
 
@@ -26,6 +29,7 @@ What the fork adds for it:
 - [A 6–12 GB NVIDIA GPU: 14600KF + RTX 4070 Ti](#a-612-gb-nvidia-gpu-14600kf--rtx-4070-ti)
 - [One RX 480: 1920X + RX 480](#one-rx-480-1920x--rx-480)
 - [Whole on one GPU: 1920X + R9700](#whole-on-one-gpu-1920x--r9700)
+- [Long context](#long-context)
 - [Speculative decoding with its DSpark drafter](#speculative-decoding-with-its-dspark-drafter)
 - [What a token waits on](#what-a-token-waits-on)
 - [Tried and not kept](#tried-and-not-kept)
@@ -222,12 +226,10 @@ fork (the build of 2026-11-25) against upstream llama.cpp at `e300919cc` (2026-1
   1,883–1,909 tokens a second (+27%) for 3.6 GB more VRAM (21.4 GB); generation is the same. An expert's weights are
   walked once for the tokens it gets in a batch, so a larger batch gives each expert more of them: a 3.5k-token
   prompt alone reads at 1,547 with 512 and 2,017 with 2048.
-- **A larger context needs a smaller ubatch:** ubatch × context may not pass 2048 × 16384. The model adds a position
-  bias per attention head, a buffer of ubatch × context × heads, and past that product it is over Vulkan's 4 GiB a
-  buffer and runs on the CPU. Short prompts don't show it; at 64k with `-ub 2048` a 29k-token prompt reads at 270
-  tokens a second and a 60k one at 60, with 25 GiB of system memory. With the drafter and the two requests above:
-  16k with `-ub 2048` reads prompts at 2,020–2,065 tokens a second, 32k with `-ub 1024` at 1,725–1,790 (a 29k prompt
-  at 1,607), 64k with `-ub 512` at 1,455–1,520 (a 60k prompt at 1,199), in 22.4–24.0 GB of VRAM.
+- **A larger context with a larger ubatch:** before the indexed bias ([Long context](#long-context)) ubatch × context
+  could not pass 2048 × 16384 on Vulkan, so 32k took `-ub 1024` and 64k `-ub 512`. Now 32k takes `-ub 2048`: with the
+  drafter, the two requests above read at 2,003–2,026 tokens a second (1,705–1,797 with `-ub 1024`) and a 29k prompt at
+  1,661, in 23.4 GB.
 - **`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`** in the server's environment (glibc 2.35 and later, with transparent
   huge pages on `madvise` or `always`): the prompts read at 1,553–1,606 tokens a second (+7%), and at 2,054–2,087
   with `-ub 2048` (+9%). For a model with windowed attention and recurrent state the server saves two context
@@ -240,6 +242,48 @@ fork (the build of 2026-11-25) against upstream llama.cpp at `e300919cc` (2026-1
 - **Upstream's own fix for the SCALE of a view** (#32735, after the fork's base) took its Vulkan from 18.5 to 36.2
   tokens a second on the Q8_0. Before it, two scales a layer pass ran on the CPU, as they did in the fork until its own
   fix.
+
+## Long context
+
+Its GGUF gives a context of 1,048,576 tokens. Its full attention is 8 of the 48 layer passes a token (layers 5, 11
+and 17 in each of their passes, and 23); the others see a window of 1024. A cell of the full layers' K/V cache takes 32
+KiB in F16 for the 8 passes, so 262,144 cells take 8 GiB in F16 and 4.25 GiB in q8_0.
+
+**The position bias.** Each attention head adds a bias by the distance from the query to the cell (1024 learned
+distances, one more for all farther cells). Upstream builds it as a mask per head, ubatch × context × 24 heads in F32,
+and Vulkan allows 4 GiB a buffer (`maxBufferSize` on RADV and NVIDIA): at 262,144 cells the ubatch can be at most 170.
+Past that the bias runs on the CPU. The fork takes upstream's flash attention with an indexed bias: the attention reads
+the distances (one int32 a query and cell) and a small table per query and head, and the per-head mask is never built.
+- **The contract** is upstream's [#32740](https://github.com/ggml-org/llama.cpp/pull/32740) (merged), the **Vulkan
+  kernels** its open [#32898](https://github.com/ggml-org/llama.cpp/pull/32898) by 0cc4m (every path: scalar,
+  coopmat1 and its flip, coopmat2, Intel's), and the **graph side** pwilkin's, written for #32740 and moved out of it
+  before the merge.
+- **Small batches keep the mask.** The fork's fused mask is faster where it is small: with the indexed bias for every
+  batch, answers at 250k cells came at 24 tokens a second against 33, and prompts at the same ubatch 3% slower on the
+  R9700 (6% on an RX 480). The graph keeps the per-head mask while its F32 size is at most `LLAMA_ATTN_BIAS_DENSE_MIB`
+  (1024 by default; 0 takes the indexed bias always): every answer and draft check, and short prompts.
+- **The old path** in the same build: `GGML_VK_DISABLE_FA_INDEXED_BIAS=1`.
+- **The logits** against the per-head mask: mean KL divergence 0.0017–0.0036 (chunks of 4k and 16k, prose and code),
+  the same top token 98.2–98.9% of the time. The flip path adds the bias in F32 as the CPU's reference does; the mask
+  rounded mask and bias together to F16.
+
+Local Coder's preset on the R9700 with the drafter (`--spec-type draft-dspark --spec-draft-n-max 4`), UD-Q4_K_XL, the
+two everyday requests of the 4070 Ti section and prompts of the fork's own sources:
+
+| `-c 262144` | everyday prompts | everyday answers | prompts of 60k / 120k / 250k | answer at 250k | VRAM |
+| --- | --- | --- | --- | --- | --- |
+| per-head mask, `-ub 160`, q8_0 K/V | 875–897 tok/s | 67–77 tok/s | 775 / 629 / 445 | 32.9 tok/s | 27.2 GB |
+| indexed, `-ub 2048`, q8_0 | 1,906–1,918 | 68–84 | 1,333 / 908 / 525 | 33.1 | 28.0 GB |
+| indexed, `-ub 512`, q8_0 | 1,501–1,542 | 69–79 | – / – / 624 | 32.3 | 26.2 GB |
+| indexed, `-ub 512`, F16 | 1,481–1,534 | 65–82 | – / – / 589 | 36.5 | 28.5 GB |
+
+- **A 250k-token prompt** takes 6.7 minutes with `-ub 512` and q8_0 (9.4 before); the answer that follows comes at
+  32–37 tokens a second, against 68–84 near the start of the context.
+- **`-ub 2048` against 512:** 25% faster on everyday prompts, 16% slower on a 250k one (the distances, an int32 a query
+  and cell, are filled on the CPU and uploaded with each ubatch: 2 GiB at 2048 tokens of a full context).
+- **F16 K/V** answers at depth 13% faster than q8_0 and fits one R9700 at `-ub 512` with about 4 GiB to spare; at
+  `-ub 2048` it does not fit, and the card fell back to system memory and then reset.
+- **One R9700 is enough** for 256k; the second is not needed.
 
 ## Speculative decoding with its DSpark drafter
 
@@ -330,6 +374,8 @@ Ti setup from 4,541 dispatches to 2,652):
   costs 1.36× / 1.46× one: 0.95× / 0.89× the speed of plain decoding. Overlapping consecutive tokens' passes in one
   sweep of the loop (the passes share their weights), with such drafts, comes out below a trained drafter in a model of
   these cards' batch costs.
+- **Flash attention's indexed bias for every batch:** see [Long context](#long-context); small batches keep the
+  per-head mask.
 - **Upstream's n-gram drafts** (`ngram-simple`, `ngram-mod`) on the two everyday requests: 3–20% slower on the R9700
   and up to 12% on an RX 480. The answers copy too little of their prompts.
 
@@ -342,3 +388,7 @@ Ti setup from 4,541 dispatches to 2,652):
   goes, would shrink both, and could raise acceptance if it leaves out tokens the drafter wrongly favours.
 - **Two drafts at a near tie:** checking the runner-up's branch too where the drafter is unsure early in a block.
 - **A just-in-time upload for a looped layer's later passes in prompts,** where the misses are on the critical path.
+- **Why the indexed bias slows answers at depth** (24 against 33 tokens a second at 250k cells): one answer step's
+  profile, and whether `-ub 1024` is the better middle at 256k.
+- **The distances on the GPU:** they are a query's position minus a cell's, filled on the CPU and uploaded with every
+  ubatch.

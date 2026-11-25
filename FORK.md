@@ -916,6 +916,16 @@ with the expert predictor's: they agree for the first six layers and the loop's 
 predictor reads (same hits, predictions and text with and without it, on an RX 480). A predictor reading a later
 layer of a looped model would collide.
 
+**Taken before upstream merges it: flash attention with Inkling 2's position bias by index**
+([#32898](https://github.com/ggml-org/llama.cpp/pull/32898) by 0cc4m, at `ce1e24697`, a draft, on upstream's merged
+contract [#32740](https://github.com/ggml-org/llama.cpp/pull/32740); with the graph side pwilkin wrote for #32740 and
+moved out of it before the merge, `9cd1953`). It lifts Vulkan's limit of ubatch × context for Inkling 2 Mini: 256k of
+context on one R9700 with `-ub 2048` ([docs/inkling2-mini.md](docs/inkling2-mini.md#long-context)). Two changes of
+the fork's: the CPU's support for the op (upstream still declines it, so `test-backend-ops` skipped every indexed case
+as "not supported"), and the per-head mask kept for small batches (`LLAMA_ATTN_BIAS_DENSE_MIB`), where it is faster.
+With it, all 39 indexed cases pass against the CPU on every Vulkan path of the RTX 4070 Ti, the R9700 and an RX 480,
+and the whole flash-attention suite on each card.
+
 **Upstream's cache against the hot spare at the same memory.** The ladder's rung 1 gives upstream's cache what its own
 build can allocate. In the fork's build, which splits the cache's banks, it can take the hot spare's 20900 MiB on the
 R9700. There, with upstream's tuner picking its CPU share (0.9 on Q4, 0.95 on Q6) and the hot spare with the setup's
