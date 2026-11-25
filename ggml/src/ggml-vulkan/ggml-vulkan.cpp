@@ -6903,6 +6903,10 @@ static bool ggml_vk_prec_allows_f16acc(ggml_prec prec) {
 }
 
 static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec acc_prec) {
+    // GGML_VK_F32_ACC=1: every matmul accumulates in f32, for checks that compare kernels of different shapes (coopmat2's
+    // f16 accumulation moves the logits of test-moe-cache's fixtures by up to 0.003 of their deviation between ubatch sizes)
+    static const bool f32acc = getenv("GGML_VK_F32_ACC") != nullptr;
+    if (f32acc) return false;
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     const bool prec_allows_f16 = ggml_vk_prec_allows_f16acc(acc_prec);

@@ -1046,6 +1046,7 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `LLAMA_GRAPH_CACHE_TOKENS=N` | the longest batch that gets a graph of its own with `LLAMA_GRAPH_CACHE` (default 16) |
 | `GGML_VK_GRAPH_OPT_WINDOW=N` | Vulkan: how many nodes ahead the graph optimizer looks for independent work (default 20) |
 | `GGML_VK_DISABLE_MM_POST=1` | Vulkan: no fused MUL_MAT → SCALE → SiLU/sigmoid or MUL_MAT → tanh/sigmoid in the mat-vec's store |
+| `GGML_VK_F32_ACC=1` | Vulkan: every matmul accumulates in f32 (by default quantized and f16 matmuls may accumulate in f16, always with coopmat2); `test-moe-cache` sets it, so that its fixtures' logits don't move with the ubatch size |
 | `GGML_VK_DISABLE_CLIP_ROWS=1` | Vulkan: no fused row clip ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_DEPTH_MIX=1` | Vulkan: no fused depth mix ([Inkling 2's small ops](#inkling-2s-small-ops)) |
 | `GGML_VK_DISABLE_CTRL_BLEND=1` | Vulkan: no fused blend of Inkling 2's loop controllers ([Inkling 2's small ops](#inkling-2s-small-ops)) |
