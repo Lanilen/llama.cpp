@@ -222,6 +222,12 @@ fork (the build of 2026-11-25) against upstream llama.cpp at `e300919cc` (2026-1
   1,883–1,909 tokens a second (+27%) for 3.6 GB more VRAM (21.4 GB); generation is the same. An expert's weights are
   walked once for the tokens it gets in a batch, so a larger batch gives each expert more of them: a 3.5k-token
   prompt alone reads at 1,547 with 512 and 2,017 with 2048.
+- **A larger context needs a smaller ubatch:** ubatch × context may not pass 2048 × 16384. The model adds a position
+  bias per attention head, a buffer of ubatch × context × heads, and past that product it is over Vulkan's 4 GiB a
+  buffer and runs on the CPU. Short prompts don't show it; at 64k with `-ub 2048` a 29k-token prompt reads at 270
+  tokens a second and a 60k one at 60, with 25 GiB of system memory. With the drafter and the two requests above:
+  16k with `-ub 2048` reads prompts at 2,020–2,065 tokens a second, 32k with `-ub 1024` at 1,725–1,790 (a 29k prompt
+  at 1,607), 64k with `-ub 512` at 1,455–1,520 (a 60k prompt at 1,199), in 22.4–24.0 GB of VRAM.
 - **`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`** in the server's environment (glibc 2.35 and later, with transparent
   huge pages on `madvise` or `always`): the prompts read at 1,553–1,606 tokens a second (+7%), and at 2,054–2,087
   with `-ub 2048` (+9%). For a model with windowed attention and recurrent state the server saves two context
