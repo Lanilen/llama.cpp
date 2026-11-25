@@ -33,9 +33,10 @@ What the fork adds for it:
 
 ## The files
 
-**The model:** Unsloth's [Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), the files under
-`Mainline_Support/`, in the layout llama.cpp reads. They end in `.gguf_file`; rename them to `.gguf`. The files at the
-repository's top level are Unsloth's own looped layout, which neither this fork nor upstream loads.
+**The model:** Unsloth's [Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF). Since 2026-11-23
+its files are in the layout llama.cpp reads (the same files as under `Mainline_Support/`, where they end in
+`.gguf_file`). A file downloaded before that day is in Unsloth's own looped layout, now under `Old_Support/`, which
+neither this fork nor upstream loads: its UD-Q4_K_XL has 17,629,759,456 bytes, the current one 17,629,760,736.
 
 Every UD quant keeps the experts in NVFP4, as the model ships them, and keeps the dense weights (attention and the
 rest) at 8 bits. They differ in the few layers whose experts aren't NVFP4:
@@ -72,9 +73,9 @@ slower than without it: a continued document keeps its prompt's topic, so there 
 cache's own recent counts already hold its experts ([Raw completion](moe-predictor.md#raw-completion)). Leave out
 `--moe-cache-predictor` and `--moe-cache-predictor-start` there.
 
-**The drafter:** `dspark-Inkling-2-Mini-Q8_0.gguf_file` from the same repository's `Mainline_Support/` (0.50 GB,
-renamed to `.gguf`), Unsloth's conversion of the drafter Thinking Machines ship with the model (`mtp.safetensors`).
-The repository's top-level drafter is in Unsloth's own format.
+**The drafter:** `dspark-Inkling-2-Mini-Q8_0.gguf` from the same repository (0.50 GB), Unsloth's conversion of the
+drafter Thinking Machines ship with the model (`mtp.safetensors`). The 0.40 GB `dspark-Inkling-2-Mini-Q8_0_Old.gguf`
+beside it is in Unsloth's own format.
 
 ## A 6–12 GB NVIDIA GPU: 14600KF + RTX 4070 Ti
 
