@@ -14129,6 +14129,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1100, 256, 2, 33, false, true, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100,   7, 2, 33, false, true, GGML_TYPE_Q8_0));
+    // Inkling 2 Mini's own shape: 24 heads over 8 K/V heads, 1025 bins, causal, one stream; a prompt's 512 rows take the
+    // coopmat1 flip path with F16 K/V and the mask_opt tiles, the SWA cache's 1024 + ubatch cells
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 4096, nb, 1, 1025, false, true, type, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1536, 512, 1, 1025, false, true, GGML_TYPE_F16, true));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
