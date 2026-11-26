@@ -2927,8 +2927,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    // large ubatches do not use the hot spare, but their selections still count for its refresh
-    if (moe_cache != nullptr) {
+    // large ubatches do not use the hot spare, but their selections still count for its refresh (not with
+    // LLAMA_OFFLOAD_PREFETCH: the CPU's read of the picks drains the device at every layer)
+    static const bool prefetch = getenv("LLAMA_OFFLOAD_PREFETCH") && atoi(getenv("LLAMA_OFFLOAD_PREFETCH")) != 0;
+    if (moe_cache != nullptr && !prefetch) {
         if (ggml_tensor * picks = moe_cache->record(ctx0, il, selected_experts)) {
             ggml_backend_sched_set_tensor_backend(sched, picks, backend_cpu);
             cb(picks, "ffn_moe_picks", il);

@@ -475,6 +475,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * down_exps = layer.ffn_down_exps, * gate_up_exps = layer.ffn_gate_up_exps;
     {
         const auto & mi = static_cast<const llama_model_inkling2 &>(model);
+        mi.make_exps_alias();
         static const int64_t alias_min = getenv("LLAMA_LOOP_EXPS_COPY_MIN") ? atoll(getenv("LLAMA_LOOP_EXPS_COPY_MIN")) : 32;
         if (il < (int) mi.exps_alias.size() && cparams.op_offload && n_tokens >= alias_min) {
             gate_up_exps = mi.exps_alias[il][0] ? mi.exps_alias[il][0] : gate_up_exps;

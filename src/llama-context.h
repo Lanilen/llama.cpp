@@ -503,6 +503,34 @@ private:
 
     copy_experts_info copy_experts;
 
+    // LLAMA_OFFLOAD_PREFETCH=1: a released batch's host experts go whole into a ring of device slots of their own
+    // (outside the compute buffer, so no drain), the op reads them there; see sched_copy_experts
+    struct offload_prefetch_info {
+        bool init = false;
+        bool on   = false;
+        size_t slot_size = 0;
+        std::vector<ggml_backend_buffer_t> bufs;
+        std::vector<ggml_tensor *>         slots;
+        std::vector<ggml_backend_event_t>  events;
+        ggml_context * ctx = nullptr;
+        int64_t n = 0;           // the copies so far
+        int64_t j = 0;           // the copies since the slots were made (the ring's position)
+        int64_t n_fallback = 0;  // tensors it left to the other paths
+        int64_t t_wait_us = 0;   // waiting for a slot's last op
+        int64_t t_copy_us = 0;   // in the copies
+        const ggml_cgraph * cur_graph = nullptr; // the split whose inputs are being copied
+        bool   main_used = false;
+        size_t tail_used = 0;
+        void free_all() {
+            for (auto * e : events) { ggml_backend_event_free(e); }
+            for (auto * b : bufs)   { ggml_backend_buffer_free(b); }
+            if (ctx) { ggml_free(ctx); }
+            events.clear(); bufs.clear(); slots.clear(); ctx = nullptr;
+        }
+    };
+    offload_prefetch_info offload_prefetch;
+    bool prefetch_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+
     // the expert tensors of inkling2_loop that several layers run (its loop), see sched_copy_experts
     std::unordered_set<const ggml_tensor *> shared_exps;
     bool shared_exps_init = false;

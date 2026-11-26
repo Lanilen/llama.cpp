@@ -3193,7 +3193,7 @@ struct llama_moe_cache::impl {
     // the scheduler's copy of host experts (a large batch, the layer's experts run from that copy): through the staging
     // halves like the cache's own background uploads, so the copies to pinned memory run on the copy threads while the
     // other half uploads, instead of the backend's synchronous copy from memory that isn't pinned
-    bool offload_copy(ggml_backend_t backend, ggml_tensor * dst, const uint8_t * src, size_t offset, size_t size) {
+    bool offload_copy(ggml_backend_t backend, ggml_tensor * dst, const uint8_t * src, size_t offset, size_t size, bool drain) {
         device * dp = offload_device(backend);
         if (dp == nullptr) {
             return false;
@@ -3208,7 +3208,9 @@ struct llama_moe_cache::impl {
         // copy in the compute buffer, whose memory the graph's earlier tensors (the previous splits, still running) may
         // share: drain the backend first, as the backend's own copy from memory that isn't pinned does (without this
         // the copies overwrote tensors in use, and a greedy answer after a released prompt changed: fn-drift-ctx)
-        ggml_backend_synchronize(backend);
+        if (drain) {
+            ggml_backend_synchronize(backend);
+        }
         const size_t half_size = d.staging_size/2;
         static const size_t job_size = 16*1024*1024; // the copy threads take the copies in pieces of this size
         bool first = true;
@@ -3646,8 +3648,8 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
     return pimpl->copy_experts(backend, w, dst, e, last);
 }
 
-bool llama_moe_cache::offload_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t offset, size_t size) {
-    return pimpl->offload_copy(backend, dst, (const uint8_t *) src, offset, size);
+bool llama_moe_cache::offload_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t offset, size_t size, bool drain) {
+    return pimpl->offload_copy(backend, dst, (const uint8_t *) src, offset, size, drain);
 }
 
 void llama_moe_cache::offload_finish(ggml_backend_t backend) {

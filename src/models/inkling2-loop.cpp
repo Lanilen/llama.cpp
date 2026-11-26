@@ -67,26 +67,37 @@ void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
         layers[il] = layers[layer_phys(il)];
     }
-    if (getenv("LLAMA_LOOP_EXPS_COPY") && atoi(getenv("LLAMA_LOOP_EXPS_COPY")) != 0) {
-        const int n_alias = 2 * ((int) hparams.n_layer() - n_phys);
-        ggml_init_params ip = { (size_t) n_alias * ggml_tensor_overhead(), nullptr, true };
-        alias_ctx = ggml_init(ip);
-        exps_alias.assign(hparams.n_layer(), { nullptr, nullptr });
-        for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
-            ggml_tensor * src[2] = { layers[il].ffn_gate_up_exps, layers[il].ffn_down_exps };
-            for (int k = 0; k < 2; ++k) {
-                ggml_tensor * w = src[k];
-                if (!w || !w->buffer || !ggml_backend_buffer_is_host(w->buffer)) {
-                    continue; // experts on a device: nothing is copied
-                }
-                ggml_tensor * a = ggml_dup_tensor(alias_ctx, w);
-                ggml_format_name(a, "%s.slot%d", w->name, il);
-                GGML_ASSERT(ggml_backend_tensor_alloc(w->buffer, a, w->data) == GGML_STATUS_SUCCESS);
-                exps_alias[il][k] = a;
-            }
-        }
-        LLAMA_LOG_INFO("%s: LLAMA_LOOP_EXPS_COPY: the looped passes read their experts through %d aliases\n", __func__, n_alias);
+}
+
+void llama_model_inkling2_loop::make_exps_alias() const {
+    if (alias_tried) {
+        return;
     }
+    alias_tried = true;
+    if (!getenv("LLAMA_LOOP_EXPS_COPY") || atoi(getenv("LLAMA_LOOP_EXPS_COPY")) == 0) {
+        return;
+    }
+    const int n_alias = 2 * ((int) hparams.n_layer() - n_phys);
+    ggml_init_params ip = { (size_t) n_alias * ggml_tensor_overhead(), nullptr, true };
+    alias_ctx = ggml_init(ip);
+    exps_alias.assign(hparams.n_layer(), { nullptr, nullptr });
+    int n_made = 0;
+    for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
+        ggml_tensor * src[2] = { layers[il].ffn_gate_up_exps, layers[il].ffn_down_exps };
+        for (int k = 0; k < 2; ++k) {
+            ggml_tensor * w = src[k];
+            if (!w || !w->buffer || !ggml_backend_buffer_is_host(w->buffer)) {
+                continue; // experts on a device: nothing is copied
+            }
+            ggml_tensor * a = ggml_dup_tensor(alias_ctx, w);
+            ggml_format_name(a, "%s.slot%d", w->name, il);
+            a->buffer = w->buffer; // the same bytes as w (tensor_alloc's check counts padding past an mmapped buffer's end)
+            a->data   = w->data;
+            exps_alias[il][k] = a;
+            n_made++;
+        }
+    }
+    LLAMA_LOG_INFO("%s: LLAMA_LOOP_EXPS_COPY: %d of %d aliases made (the looped passes' host experts)\n", __func__, n_made, n_alias);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
