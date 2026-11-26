@@ -741,9 +741,36 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
 // Preserves the target distribution exactly, and accepts more often than matching does when the
 // draft samples instead of taking its argmax.
+// LLAMA_SPEC_REJECT_TIMING=1: the host time of rejection verification by part, averaged per call, printed every 500 calls
+struct spec_reject_timing {
+    bool   enabled = getenv("LLAMA_SPEC_REJECT_TIMING") != nullptr;
+    double t_sample = 0, t_accept = 0, t_residual = 0;
+    long   calls = 0, positions = 0, rejections = 0;
+    static double now() { return ggml_time_us() / 1000.0; }
+    void report() {
+        if (enabled && calls % 500 == 0) {
+            LOG_INF("spec reject timing: %ld calls, %ld positions, %ld rejections; per call: target sampling %.3f ms, accept test %.3f ms, residual %.3f ms\n",
+                    calls, positions, rejections, t_sample / calls, t_accept / calls, t_residual / calls);
+        }
+    }
+};
+
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+    static spec_reject_timing tm;
+    tm.calls++;
+    double tt = tm.enabled ? spec_reject_timing::now() : 0.0;
+    const auto lap = [&](double & acc) {
+        if (tm.enabled) {
+            const double t = spec_reject_timing::now();
+            acc += t - tt;
+            tt = t;
+        }
+    };
+    // q as a dense array over the vocabulary (set for the draft's candidates, cleared after): the residual looks each
+    // candidate's q up at once instead of scanning q (vocabulary x |q| before)
+    static thread_local std::vector<float> q_dense;
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -757,8 +784,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        tm.positions++;
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        lap(tm.t_sample);
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
         const auto & q     = draft_q[i];
@@ -803,17 +832,40 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            lap(tm.t_accept);
             continue;
         }
+        lap(tm.t_accept);
+        tm.rejections++;
 
         // rejected: tokens outside q's support keep all of p
+        llama_token max_id = 0;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            max_id = std::max(max_id, cur_p->data[k].id);
+        }
+        for (const auto & e : q) {
+            max_id = std::max(max_id, e.id);
+        }
+        if (q_dense.size() <= (size_t) max_id) {
+            q_dense.resize((size_t) max_id + 1, 0.0f);
+        }
+        for (const auto & e : q) {
+            if (e.id >= 0) {
+                q_dense[e.id] += e.p; // as prob_of: the first entry of an id; q holds each id once
+            }
+        }
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const float r = p_of(k) - q_dense[cur_p->data[k].id];
             if (r > 0.0f) {
                 residual.push_back({ cur_p->data[k].id, 0.0f, r });
                 sum += r;
+            }
+        }
+        for (const auto & e : q) {
+            if (e.id >= 0) {
+                q_dense[e.id] = 0.0f;
             }
         }
 
@@ -832,6 +884,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
+        lap(tm.t_residual);
 
         break;
     }
@@ -842,8 +895,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+        lap(tm.t_sample);
     }
 
+    tm.report();
     return result;
 }
 
