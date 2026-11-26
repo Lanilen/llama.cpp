@@ -3,6 +3,8 @@
 // copied as they are into tensors of their own on the head's device, K = the fixed tokens + reserve slots; the graph
 // (dflash.cpp build_logits, dspark.cpp's Markov head) multiplies by those and scatters the logits back to the
 // vocabulary through the slots' token ids, -inf elsewhere, so sampling and the host see the whole vocabulary as before.
+// DSpark's Markov chain stays in slot space (its TOP_K / ARGMAX over the K slots, the picks mapped to token ids through
+// mod_ids_f) and scatters once, for the sampler.
 // Free reserve slots hold a copy of slot 0 (the same token, the same logit). One dictionary a drafter model.
 
 #include "llama-impl.h"
@@ -13,6 +15,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +31,7 @@ struct llama_mod_dict {
     int32_t n_fixed = 0;
     int32_t n_slots = 0;
     int32_t n_used  = 0;
+    llama_token sink = 0; // the token of a free slot: one no dictionary can hold (past the Markov head's rows), -inf anyway
 
     std::unordered_map<llama_token, int32_t> slot_of;
     std::vector<uint8_t> row0_head, row0_w2; // slot 0's rows, to clear the reserve
@@ -66,6 +70,10 @@ static void mod_set_slot(llama_mod_dict & d, const llama_model & m, int32_t slot
     }
     const int64_t id = tok;
     ggml_backend_tensor_set(m.mod_ids, &id, (size_t) slot * sizeof(int64_t), sizeof(int64_t));
+    const float idf = (float) tok;
+    ggml_backend_tensor_set(m.mod_ids_f, &idf, (size_t) slot * sizeof(float), sizeof(float));
+    const float zero = 0.0f;
+    ggml_backend_tensor_set(m.mod_mask, &zero, (size_t) slot * sizeof(float), sizeof(float));
     GGML_UNUSED(d);
 }
 
@@ -96,20 +104,27 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
         return -1;
     }
     const int32_t K = (int32_t) fixed.size() + std::max(0, n_reserve);
+    // free slots map to a sink token past the rows a dictionary can take, so their scatter never lands on a real row
+    // (without one, slot 0's token: the old way, harmless while the free slots copy slot 0 and are not masked)
+    const llama_token sink = (int64_t) m.vocab.n_tokens() > n_vocab ? (llama_token) m.vocab.n_tokens() - 1 : fixed[0];
 
     auto d = std::make_shared<llama_mod_dict>();
-    ggml_init_params ip = { 5 * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params ip = { 7 * ggml_tensor_overhead(), nullptr, true };
     d->ctx = ggml_init(ip);
     ggml_tensor * t_head = ggml_new_tensor_2d(d->ctx, head->type, head->ne[0], K);
     ggml_tensor * t_w2   = ggml_new_tensor_2d(d->ctx, w2->type, w2->ne[0], K);
     ggml_tensor * t_b    = m.dspark_markov_w2_b ? ggml_new_tensor_1d(d->ctx, GGML_TYPE_F32, K) : nullptr;
     ggml_tensor * t_ids  = ggml_new_tensor_1d(d->ctx, GGML_TYPE_I64, K);
+    ggml_tensor * t_idf  = ggml_new_tensor_2d(d->ctx, GGML_TYPE_F32, 1, K);
+    ggml_tensor * t_mask = ggml_new_tensor_1d(d->ctx, GGML_TYPE_F32, K);
     ggml_set_name(t_head, "mod_head");
     ggml_set_name(t_w2, "mod_w2");
     if (t_b) {
         ggml_set_name(t_b, "mod_w2_b");
     }
     ggml_set_name(t_ids, "mod_ids");
+    ggml_set_name(t_idf, "mod_ids_f");
+    ggml_set_name(t_mask, "mod_mask");
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head->buffer);
     d->buf = ggml_backend_alloc_ctx_tensors_from_buft(d->ctx, buft);
     if (!d->buf) {
@@ -130,6 +145,8 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
     std::vector<uint8_t> g_head((size_t) K * t_head->nb[1]), g_w2((size_t) K * t_w2->nb[1]);
     std::vector<float>   g_b(t_b ? K : 0);
     std::vector<int64_t> g_ids(K);
+    std::vector<float>   g_idf(K);
+    std::vector<float>   g_mask(K, 0.0f);
     for (int32_t s = 0; s < K; ++s) {
         const llama_token t = fixed[s < (int32_t) fixed.size() ? s : 0]; // the reserve: copies of slot 0
         memcpy(g_head.data() + (size_t) s * t_head->nb[1], all_head.data() + (size_t) t * head->nb[1], t_head->nb[1]);
@@ -137,7 +154,9 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
         if (t_b) {
             g_b[s] = all_b[t];
         }
-        g_ids[s] = t;
+        g_ids[s] = s < (int32_t) fixed.size() ? t : sink;
+        g_idf[s] = (float) g_ids[s];
+        g_mask[s] = s < (int32_t) fixed.size() ? 0.0f : -INFINITY;
     }
     ggml_backend_tensor_set(t_head, g_head.data(), 0, g_head.size());
     ggml_backend_tensor_set(t_w2,   g_w2.data(),   0, g_w2.size());
@@ -145,6 +164,8 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
         ggml_backend_tensor_set(t_b, g_b.data(), 0, g_b.size() * sizeof(float));
     }
     ggml_backend_tensor_set(t_ids, g_ids.data(), 0, g_ids.size() * sizeof(int64_t));
+    ggml_backend_tensor_set(t_idf, g_idf.data(), 0, g_idf.size() * sizeof(float));
+    ggml_backend_tensor_set(t_mask, g_mask.data(), 0, g_mask.size() * sizeof(float));
 
     d->src_head = head;
     d->src_w2   = w2;
@@ -152,6 +173,7 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
     d->n_fixed  = (int32_t) fixed.size();
     d->n_slots  = K;
     d->n_used   = d->n_fixed;
+    d->sink     = sink;
     d->slot_of  = std::move(slot_of);
     d->row0_head.assign(g_head.begin(), g_head.begin() + t_head->nb[1]);
     d->row0_w2.assign(g_w2.begin(), g_w2.begin() + t_w2->nb[1]);
@@ -161,6 +183,8 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
     m.mod_w2   = t_w2;
     m.mod_w2_b = t_b;
     m.mod_ids  = t_ids;
+    m.mod_ids_f = t_idf;
+    m.mod_mask  = t_mask;
     m.mod      = d;
 
     ctx->graph_invalidate();
@@ -216,7 +240,7 @@ void llama_dspark_dict_reset(llama_context * ctx) {
         return;
     }
     // the used reserve slots back to copies of slot 0, and out of the map
-    const int64_t id0 = [&] { int64_t v; ggml_backend_tensor_get(m.mod_ids, &v, 0, sizeof(v)); return v; }();
+    const int64_t id0 = d.sink;
     for (auto it = d.slot_of.begin(); it != d.slot_of.end(); ) {
         if (it->second >= d.n_fixed) {
             it = d.slot_of.erase(it);
@@ -238,5 +262,9 @@ void llama_dspark_dict_reset(llama_context * ctx) {
         ggml_backend_tensor_set(m.mod_w2_b, b.data(), (size_t) d.n_fixed * sizeof(float), b.size() * sizeof(float));
     }
     ggml_backend_tensor_set(m.mod_ids, ids.data(), (size_t) d.n_fixed * sizeof(int64_t), ids.size() * sizeof(int64_t));
+    std::vector<float> idf(n, (float) id0);
+    ggml_backend_tensor_set(m.mod_ids_f, idf.data(), (size_t) d.n_fixed * sizeof(float), idf.size() * sizeof(float));
+    std::vector<float> mask(n, -INFINITY);
+    ggml_backend_tensor_set(m.mod_mask, mask.data(), (size_t) d.n_fixed * sizeof(float), mask.size() * sizeof(float));
     d.n_used = d.n_fixed;
 }

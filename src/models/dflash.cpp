@@ -554,11 +554,17 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
     return cur;
 }
 
-ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
+ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur, bool mod_slots) {
     const auto [output, output_s] = get_lm_head(*this, model);
     if (model.mod_head) {
         // MoD: the head's rows of the dictionary, the logits scattered back to the vocabulary (-inf elsewhere)
         cur = build_lora_mm(model.mod_head, cur, output_s);
+        if (mod_slots) {
+            cb(cur, "result_output_slots", -1);
+            res->t_logits = cur;
+            return cur;
+        }
+        cur = ggml_add(ctx0, cur, model.mod_mask); // free slots -inf (they scatter to the sink token)
         const int64_t n_slots   = cur->ne[0];
         const int64_t n_outputs = cur->ne[1];
         const int64_t n_vocab   = (int64_t) model.vocab.n_tokens();

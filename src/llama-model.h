@@ -944,6 +944,8 @@ struct llama_model {
     struct ggml_tensor * mod_w2   = nullptr;  // [rank, K], the type of the Markov head's vocabulary matrix
     struct ggml_tensor * mod_w2_b = nullptr;  // [K], or none
     struct ggml_tensor * mod_ids  = nullptr;  // [K] I64, the token of each slot
+    struct ggml_tensor * mod_ids_f = nullptr; // [1, K] F32, the same ids as floats (exact below 2^24), for get_rows from slot indices
+    struct ggml_tensor * mod_mask  = nullptr; // [K] F32, 0 on a used slot, -inf on a free reserve slot (slot space only)
     std::shared_ptr<struct llama_mod_dict> mod; // the buffer and the host's view of the slots
 
     // dspark

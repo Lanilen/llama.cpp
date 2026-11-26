@@ -245,9 +245,32 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const bool is_rnn = model.dspark_joint_proj != nullptr;
     GGML_ASSERT(!is_rnn || hidden != nullptr);
 
-    ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
-    const int64_t n_vocab = base->ne[0];
+    ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens], or [K, n_tokens] over a MoD dictionary's slots
     const int64_t n_tok   = base->ne[1];
+
+    // MoD in slot space: the chain's columns, TOP_K and ARGMAX are over the K slots, a pick maps to its token through
+    // mod_ids_f, and the logits are scattered to the vocabulary (-inf elsewhere) once, at the end
+    const bool    slots   = model.mod_ids_f && base->ne[0] == model.mod_ids_f->ne[1] && base->ne[0] != (int64_t) model.vocab.n_tokens();
+    const int64_t n_vocab = base->ne[0]; // the columns' rows: the vocabulary, or the K slots
+    const auto to_vocab = [&](ggml_tensor * x) { // [K, n] slot logits -> [n_vocab, n]
+        if (!slots) {
+            return x;
+        }
+        const int64_t n_full = (int64_t) model.vocab.n_tokens();
+        const int64_t n      = x->ne[1];
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_full, n), -INFINITY);
+        full = ggml_set_rows(ctx0, full,
+                ggml_reshape_3d(ctx0, x,             1,       n_vocab, n),
+                ggml_reshape_3d(ctx0, model.mod_ids, n_vocab, 1,       1));
+        return ggml_reshape_2d(ctx0, full, n_full, n);
+    };
+    if (slots) {
+        // the free reserve slots (copies of slot 0) out of the chain's TOP_K / ARGMAX
+        base = ggml_add(ctx0, base, model.mod_mask);
+    }
+    const auto slot_tokens = [&](ggml_tensor * idx) { // I32 slot indices (any shape, contiguous) -> [1, n] F32 token ids
+        return slots ? ggml_get_rows(ctx0, model.mod_ids_f, ggml_reshape_1d(ctx0, idx, ggml_nelements(idx))) : nullptr;
+    };
 
     const auto it = model.gguf_kv.find("dflash.block_size");
     GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
@@ -264,6 +287,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
     const int64_t block_drafts = n_tok / n_blocks;
     if (block_drafts > block_size) {
+        res->t_logits = to_vocab(base);
         return;
     }
 
@@ -316,9 +340,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_tensor * n_over = ggml_sum_rows(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), state_rows(1, 0, i))));
         ggml_tensor * idx    = ggml_cast(ctx0, ggml_scale_bias(ctx0, ggml_clamp(ctx0, n_over, 1.0f, (float) n_cand), -1.0f, (float) n_cand), GGML_TYPE_I32);
 
-        ggml_tensor * ids_f  = ggml_cast(ctx0, ids, GGML_TYPE_F32);
+        // MoD: the candidates' slots to their tokens
+        ggml_tensor * ids_f  = slots ? ggml_reshape_2d(ctx0, slot_tokens(ids), n_cand, n_blocks) : ggml_cast(ctx0, ids, GGML_TYPE_F32);
         ggml_tensor * drawn  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids_f, 1, n_cand, n_blocks), idx), 1, n_blocks);
-        ggml_tensor * argmax = ggml_reshape_2d(ctx0, ggml_cast(ctx0, ggml_argmax(ctx0, col), GGML_TYPE_F32), 1, n_blocks);
+        ggml_tensor * argmax = slots ? ggml_reshape_2d(ctx0, slot_tokens(ggml_argmax(ctx0, col)), 1, n_blocks)
+                                     : ggml_reshape_2d(ctx0, ggml_cast(ctx0, ggml_argmax(ctx0, col), GGML_TYPE_F32), 1, n_blocks);
 
         // greedy keeps the exact argmax
         ggml_tensor * tok = ggml_add(ctx0, drawn, ggml_mul(ctx0, is_greedy, ggml_sub(ctx0, argmax, drawn)));
@@ -383,7 +409,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (model.dspark_markov_w2_b) {
             bias = ggml_add(ctx0, bias, model.mod_w2 ? model.mod_w2_b : model.dspark_markov_w2_b);
         }
-        if (model.mod_w2) {
+        if (model.mod_w2 && slots) {
+            // MoD in slot space: the bias is already over the slots
+        } else if (model.mod_w2) {
             // MoD: the dictionary's slots scattered to their tokens (base is -inf on the others)
             const int64_t n_slots = bias->ne[0];
             ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), 0.0f);
@@ -430,7 +458,8 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * packed = draw(col, i, prev);
             cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
         } else if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            prev = slots ? ggml_cast(ctx0, ggml_reshape_1d(ctx0, slot_tokens(ggml_argmax(ctx0, col)), n_blocks), GGML_TYPE_I32)
+                         : ggml_argmax(ctx0, col);
         }
     }
 
@@ -446,6 +475,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
     out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
     out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+    out = to_vocab(out);
 
     if (has_conf) {
         ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
@@ -494,7 +524,8 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
 
     ggml_tensor * cur = build_layers(inp_tokens);
 
-    build_logits(cur);
+    // MoD: the logits stay over the dictionary's slots when the Markov head runs (it scatters them at its end)
+    build_logits(cur, model.mod_head && (!hparams.dspark_f_rnn || rnn_state));
 
     // bias the draft logits with the Markov head
     if (!hparams.dspark_f_rnn) {
