@@ -470,11 +470,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
+    // LLAMA_LOOP_EXPS_COPY: a batch the scheduler offloads (from 32 tokens, past the cache's batch limit) reads a later
+    // pass's experts through their aliases (see llama_model_inkling2::exps_alias)
+    ggml_tensor * down_exps = layer.ffn_down_exps, * gate_up_exps = layer.ffn_gate_up_exps;
+    {
+        const auto & mi = static_cast<const llama_model_inkling2 &>(model);
+        static const int64_t alias_min = getenv("LLAMA_LOOP_EXPS_COPY_MIN") ? atoll(getenv("LLAMA_LOOP_EXPS_COPY_MIN")) : 32;
+        if (il < (int) mi.exps_alias.size() && cparams.op_offload && n_tokens >= alias_min) {
+            gate_up_exps = mi.exps_alias[il][0] ? mi.exps_alias[il][0] : gate_up_exps;
+            down_exps    = mi.exps_alias[il][1] ? mi.exps_alias[il][1] : down_exps;
+        }
+    }
     cur = build_moe_ffn(cur,
             layer.ffn_gate_inp,
             nullptr,
             nullptr,
-            layer.ffn_down_exps,
+            down_exps,
             layer.ffn_exp_probs_b,
             hparams.n_expert,
             hparams.n_expert_used(il),
@@ -483,7 +494,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
             il,
             nullptr,
-            layer.ffn_gate_up_exps);
+            gate_up_exps);
 
     cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
     cb(cur, "ffn_out", il);

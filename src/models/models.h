@@ -5,6 +5,7 @@
 #include "llama-model-loader.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
+#include <array>
 #include <cmath>
 #include <map>
 
@@ -2511,6 +2512,13 @@ struct llama_model_inkling2 : public llama_model_base {
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // LLAMA_LOOP_EXPS_COPY=1 (inkling2_loop, op offload): the second and later passes of a looped layer read its experts
+    // through tensors of their own on the same host data, so the scheduler makes a device copy a pass and frees each
+    // after its pass, instead of one copy kept alive across the loop (6.9 GB for Inkling 2 Mini); [cache slot]: gate_up, down
+    std::vector<std::array<ggml_tensor *, 2>> exps_alias;
+    ggml_context * alias_ctx = nullptr;
+    ~llama_model_inkling2() override { if (alias_ctx) { ggml_free(alias_ctx); } }
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
