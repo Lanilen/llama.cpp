@@ -789,7 +789,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         lap(tm.t_sample);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        // unsorted: the test, the residual and its draw need no order (a sort of the vocabulary's candidates at every
+        // position was ~23 ms a verify on the 1920X, more than the step itself)
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
