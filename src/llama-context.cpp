@@ -3924,6 +3924,8 @@ bool llama_context::prefetch_copy(ggml_backend_t backend, const ggml_tensor * sr
                 }
             }
         }
+        // the tail starts here: aligned for any binding (a misaligned scale tripped the Vulkan backend's check)
+        pf.slot_size = GGML_PAD(pf.slot_size, 4096);
         const int n_slots = getenv("LLAMA_OFFLOAD_PREFETCH_SLOTS") ? std::max(2, atoi(getenv("LLAMA_OFFLOAD_PREFETCH_SLOTS"))) : 3;
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);

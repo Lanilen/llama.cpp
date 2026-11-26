@@ -78,7 +78,7 @@ void llama_model_inkling2_loop::make_exps_alias() const {
         return;
     }
     const int n_alias = 2 * ((int) hparams.n_layer() - n_phys);
-    ggml_init_params ip = { (size_t) n_alias * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params ip = { (size_t) 2 * n_alias * ggml_tensor_overhead(), nullptr, true }; // the experts and their scales
     alias_ctx = ggml_init(ip);
     exps_alias.assign(hparams.n_layer(), { nullptr, nullptr });
     int n_made = 0;
@@ -93,6 +93,15 @@ void llama_model_inkling2_loop::make_exps_alias() const {
             ggml_format_name(a, "%s.slot%d", w->name, il);
             a->buffer = w->buffer; // the same bytes as w (tensor_alloc's check counts padding past an mmapped buffer's end)
             a->data   = w->data;
+            // a weight's scale (NVFP4's per-expert scales) is found by the weight's tensor (w_scales): the alias gets an
+            // alias of the scale too, so that each pass also has a copy of its own (without it the passes ran unscaled)
+            if (ggml_tensor * ws = get_w_scale(w)) {
+                ggml_tensor * as = ggml_dup_tensor(alias_ctx, ws);
+                ggml_format_name(as, "%s.slot%d", ws->name, il);
+                as->buffer = ws->buffer;
+                as->data   = ws->data;
+                const_cast<std::unordered_map<const ggml_tensor *, ggml_tensor *> &>(w_scales).emplace(a, as);
+            }
             exps_alias[il][k] = a;
             n_made++;
         }
