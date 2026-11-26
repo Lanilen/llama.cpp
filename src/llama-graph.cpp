@@ -1543,6 +1543,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_ids  = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -4945,6 +4946,23 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            // MoD: the chain ran over the dictionary's slots, its ids map back to tokens
+            if (res->t_logits_ids) {
+                const auto to_tokens = [&](ggml_tensor * ids) {
+                    ggml_tensor * f = ggml_get_rows(ctx0, res->t_logits_ids, ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids)));
+                    return ggml_reshape(ctx0, ggml_cast(ctx0, f, GGML_TYPE_I32), ids);
+                };
+                if (data.sampled) {
+                    data.sampled = to_tokens(data.sampled);
+                }
+                if (data.candidates) {
+                    data.candidates = to_tokens(data.candidates);
+                } else if (data.logits && data.logits->ne[0] == res->t_logits_ids->ne[1]) {
+                    // the whole row is left: its ids are the slots' tokens
+                    data.candidates = ggml_cast(ctx0, ggml_reshape_1d(ctx0, res->t_logits_ids, res->t_logits_ids->ne[1]), GGML_TYPE_I32);
+                }
+            }
 
             if (data.sampled     != nullptr) { res->t_sampling_all.push_back(data.sampled);     }
             if (data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }

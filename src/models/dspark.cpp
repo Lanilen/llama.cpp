@@ -479,7 +479,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
     out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
     out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
-    out = to_vocab(out);
+    // MoD: the backend sampler's TOP_K runs over the slots and maps its ids back (t_logits_ids), with no scatter to the
+    // vocabulary; LLAMA_MOD_FULL_LOGITS=1 keeps the scatter (the full-vocabulary logits, for checks)
+    static const bool full_logits = getenv("LLAMA_MOD_FULL_LOGITS") != nullptr;
+    if (slots && !full_logits) {
+        res->t_logits_ids = model.mod_ids_f;
+    } else {
+        out = to_vocab(out);
+    }
 
     if (has_conf) {
         ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);

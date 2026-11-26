@@ -1027,6 +1027,9 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    // MoD (the fork): t_logits over a dictionary's K slots, the slots' token ids as floats [1, K]; the backend sampler
+    // maps its candidate and sampled ids through it (raw logits are not extracted from such a graph)
+    ggml_tensor * t_logits_ids  = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm

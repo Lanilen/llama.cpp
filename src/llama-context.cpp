@@ -3016,6 +3016,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            GGML_ASSERT(!res->t_logits_ids && "MoD: raw logits are over the dictionary's slots; every output needs a backend sampler");
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
