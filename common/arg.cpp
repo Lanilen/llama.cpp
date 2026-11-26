@@ -4437,6 +4437,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-dict"}, "FNAME",
+        "MoD (Mixture of Dictionaries, DSpark drafters): draft over this dictionary of token ids (one a line, or a JSON list) "
+        "plus the prompt's and the answer's tokens, instead of the whole vocabulary; the target verifies with the whole vocabulary",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.dict_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT"));
+    add_opt(common_arg(
+        {"--spec-draft-dict-reserve"}, "N",
+        string_format("MoD: slots for the prompt's and the answer's tokens outside the dictionary, emptied for each request (default: %d)", params.speculative.draft.dict_reserve),
+        [](common_params & params, int value) {
+            params.speculative.draft.dict_reserve = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT_RESERVE"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",

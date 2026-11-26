@@ -1379,6 +1379,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // top-1 probability is the cutoff (Inkling 2's drafter has no head)
     bool has_conf_head = true;
 
+    // MoD (--spec-draft-dict): the dictionary is on, and how much of each sequence's tokens are already in its slots
+    bool                 mod_on = false;
+    std::vector<size_t>  mod_seen;
+
     // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
     // it comes back from the injection as h_nextn, kept for the last ctx_rows positions of each sequence
     bool has_markov_context = false;
@@ -1428,6 +1432,26 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                 LOG_INF("%s: - no confidence head: --spec-draft-p-min %.2f stops a draft at the drafter's top-1 probability, after its first token\n",
                         __func__, (double) this->params.p_min);
             }
+        }
+
+        if (!this->params.dict_path.empty()) {
+            std::vector<llama_token> ids;
+            std::ifstream f(this->params.dict_path);
+            std::string tok;
+            while (f >> tok) {
+                tok.erase(std::remove_if(tok.begin(), tok.end(), [](char c) { return c == '[' || c == ']' || c == ','; }), tok.end());
+                if (!tok.empty()) {
+                    ids.push_back((llama_token) std::stol(tok));
+                }
+            }
+            const int32_t n = llama_dspark_dict_init(this->params.ctx_dft, ids.data(), (int32_t) ids.size(), this->params.dict_reserve);
+            if (n <= 0) {
+                throw std::runtime_error("--spec-draft-dict: no dictionary from " + this->params.dict_path);
+            }
+            mod_on = true;
+            mod_seen.assign(n_seq, 0);
+            LOG_INF("%s: - MoD: %d tokens from %s, %d slots for the prompt's and the answer's\n", __func__, n,
+                    this->params.dict_path.c_str(), this->params.dict_reserve);
         }
 
         LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
@@ -1480,6 +1504,14 @@ public:
             draw_seed[seq_id] = -1;
         }
 
+        if (mod_on && seq_id >= 0 && (size_t) seq_id < mod_seen.size()) {
+            // a new request: its prompt into the slots (one dictionary for every sequence: the slots of the others go too)
+            llama_dspark_dict_reset(params.ctx_dft);
+            llama_dspark_dict_add(params.ctx_dft, prompt.data(), (int32_t) prompt.size());
+            std::fill(mod_seen.begin(), mod_seen.end(), 0);
+            mod_seen[seq_id] = prompt.size();
+        }
+
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
     }
 
@@ -1519,6 +1551,20 @@ public:
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
+
+            if (mod_on && dp.prompt) {
+                // the answer so far (and the last committed token) into the dictionary's slots
+                const auto & toks = *dp.prompt;
+                size_t & seen = mod_seen[seq_id];
+                if (seen > toks.size()) {
+                    seen = 0;
+                }
+                if (toks.size() > seen) {
+                    llama_dspark_dict_add(ctx_dft, toks.data() + seen, (int32_t) (toks.size() - seen));
+                    seen = toks.size();
+                }
+                llama_dspark_dict_add(ctx_dft, &dp.id_last, 1);
+            }
 
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);

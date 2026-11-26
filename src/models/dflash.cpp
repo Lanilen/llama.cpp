@@ -556,6 +556,21 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
     const auto [output, output_s] = get_lm_head(*this, model);
+    if (model.mod_head) {
+        // MoD: the head's rows of the dictionary, the logits scattered back to the vocabulary (-inf elsewhere)
+        cur = build_lora_mm(model.mod_head, cur, output_s);
+        const int64_t n_slots   = cur->ne[0];
+        const int64_t n_outputs = cur->ne[1];
+        const int64_t n_vocab   = (int64_t) model.vocab.n_tokens();
+        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, cur,            1,       n_slots, n_outputs),
+                ggml_reshape_3d(ctx0, model.mod_ids,  n_slots, 1,       1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        return cur;
+    }
     cur = build_lora_mm(output, cur, output_s);
 
     // a padded lm head (e.g. shared from the target): drop the rows past the vocabulary

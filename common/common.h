@@ -349,6 +349,9 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    std::string dict_path;           // MoD: a DSpark drafter drafts over this dictionary of tokens (one id a line or a JSON list)
+    int32_t     dict_reserve = 2048; // MoD: free slots for the prompt's and the answer's tokens outside the dictionary
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match

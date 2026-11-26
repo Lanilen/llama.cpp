@@ -718,6 +718,15 @@ extern "C" {
     // (the packed lattice also holds the top_k x top_k pairwise transition scores); 0 if the model has no selector head
     LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
+    // MoD, the fork's Mixture of Dictionaries: a DSpark drafter drafts over a dictionary of tokens instead of the whole
+    // vocabulary (its output head and Markov head read only the dictionary's rows; the target always verifies with the
+    // whole vocabulary). init takes the dictionary's fixed tokens and keeps n_reserve free slots for add (the prompt's
+    // and the answer's tokens, say); reset empties those slots. They return the number of tokens taken, or -1 when the
+    // context's model is not a DSpark drafter (init) or has no dictionary (add). ctx is the drafter's context.
+    LLAMA_API int32_t llama_dspark_dict_init (struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_reserve);
+    LLAMA_API int32_t llama_dspark_dict_add  (struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
+    LLAMA_API void    llama_dspark_dict_reset(struct llama_context * ctx);
+
     // returns pointer to the target-model layer indices
     LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
     // returns the number of extracted layers from target model

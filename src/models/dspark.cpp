@@ -379,11 +379,19 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             markov = ggml_tanh(ctx0, chunk(2));
         }
 
-        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        ggml_tensor * bias = g.build_lora_mm(model.mod_w2 ? model.mod_w2 : w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft or K, n_blocks]
         if (model.dspark_markov_w2_b) {
-            bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+            bias = ggml_add(ctx0, bias, model.mod_w2 ? model.mod_w2_b : model.dspark_markov_w2_b);
         }
-        if (model.d2t) {
+        if (model.mod_w2) {
+            // MoD: the dictionary's slots scattered to their tokens (base is -inf on the others)
+            const int64_t n_slots = bias->ne[0];
+            ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), 0.0f);
+            bias = ggml_set_rows(ctx0, full,
+                    ggml_reshape_3d(ctx0, bias,          1,       n_slots, n_blocks),
+                    ggml_reshape_3d(ctx0, model.mod_ids, n_slots, 1,       1));
+            bias = ggml_reshape_2d(ctx0, bias, n_vocab, n_blocks);
+        } else if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
             ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), 0.0f);

@@ -937,6 +937,15 @@ struct llama_model {
     struct ggml_tensor * fc_in_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // MoD (the fork's Mixture of Dictionaries, set by llama_dspark_dict_init on a DSpark drafter): the head's and the
+    // Markov head's rows of K dictionary tokens, gathered as they are; the logits are scattered back to the
+    // vocabulary through mod_ids (I64) as with d2t, -inf elsewhere
+    struct ggml_tensor * mod_head = nullptr;  // [n_embd, K], the type of the head
+    struct ggml_tensor * mod_w2   = nullptr;  // [rank, K], the type of the Markov head's vocabulary matrix
+    struct ggml_tensor * mod_w2_b = nullptr;  // [K], or none
+    struct ggml_tensor * mod_ids  = nullptr;  // [K] I64, the token of each slot
+    std::shared_ptr<struct llama_mod_dict> mod; // the buffer and the host's view of the slots
+
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;

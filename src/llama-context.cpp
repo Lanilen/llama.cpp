@@ -936,6 +936,11 @@ void llama_context::resize_to_small() {
     sched_reserve();
 }
 
+void llama_context::graph_invalidate() {
+    synchronize();
+    sched_need_reserve = true;
+}
+
 void llama_context::release_scratch() {
     for (auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());

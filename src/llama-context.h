@@ -61,6 +61,9 @@ struct llama_context {
 
     void synchronize();
 
+    // drops the reserved and cached graphs, so the next ubatch builds and reserves them again (MoD's dictionary)
+    void graph_invalidate();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
