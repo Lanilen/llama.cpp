@@ -230,7 +230,8 @@ public:
     // dst through the cache's pinned staging memory and background uploads, the copies to the staging memory on the copy
     // threads, one half filling while the other uploads; false if this backend can't, then the caller uploads itself.
     // offload_finish makes the next graph of the backend wait on the device for the uploads so far
-    bool offload_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t offset, size_t size);
+    // drain = false: dst shares no memory with tensors the backend's queued work may use (LLAMA_OFFLOAD_PREFETCH's slots)
+    bool offload_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t offset, size_t size, bool drain = true);
     void offload_finish(ggml_backend_t backend);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;

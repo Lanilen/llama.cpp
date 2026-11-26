@@ -1267,6 +1267,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+    ggml_backend_sched_copy_callback callback_copy_early;
+    void * callback_copy_early_user_data;
 
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
@@ -2208,6 +2210,11 @@ static ggml_backend_t ggml_backend_sched_copy_input(ggml_backend_sched_t sched, 
         return NULL;
     }
 
+    if (sched->callback_copy_early != NULL && ggml_backend_sched_is_host_weight(input) &&
+        sched->callback_copy_early(split_backend, input, input_cpy, &split->graph, sched->callback_copy_early_user_data)) {
+        return NULL;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2307,6 +2314,8 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
         ggml_backend_event_record(sched->prefetch_events[backend_id], backend);
     }
 }
+
+static void ggml_backend_sched_print_timing(ggml_backend_sched_t sched, const struct ggml_backend_sched_timing * only);
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
@@ -2438,6 +2447,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (tm) {
         tm->n_graphs++;
         tm->t_total_us += ggml_time_us() - t_graph_us;
+        static const int each = getenv("GGML_SCHED_TIMING_EACH") ? atoi(getenv("GGML_SCHED_TIMING_EACH")) : 0;
+        if (each > 0 && tm->n_splits >= each) {
+            ggml_backend_sched_print_timing(sched, tm);
+            const int ns = tm->n_splits, nn = tm->n_nodes;
+            memset(tm, 0, sizeof(*tm));
+            tm->n_splits = ns;
+            tm->n_nodes  = nn;
+        }
     }
     sched->cur_timing = NULL;
 
@@ -2526,12 +2543,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
-void ggml_backend_sched_free(ggml_backend_sched_t sched) {
-    if (sched == NULL) {
-        return;
-    }
+static void ggml_backend_sched_print_timing(ggml_backend_sched_t sched, const struct ggml_backend_sched_timing * only) {
     for (int i = 0; i < sched->n_timing; i++) {
         const struct ggml_backend_sched_timing * tm = &sched->timings[i];
+        if (only != NULL && tm != only) {
+            continue;
+        }
         if (tm->n_graphs == 0) {
             continue;
         }
@@ -2556,6 +2573,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             }
         }
     }
+}
+
+void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+    if (sched == NULL) {
+        return;
+    }
+    ggml_backend_sched_print_timing(sched, NULL);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2692,6 +2716,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_callback_early(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy_early = callback;
+    sched->callback_copy_early_user_data = user_data;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

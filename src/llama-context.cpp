@@ -700,6 +700,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (offload_prefetch.n > 0) {
+        LLAMA_LOG_INFO("%s: LLAMA_OFFLOAD_PREFETCH: %" PRId64 " expert tensors through the slots, %" PRId64 " left to the other copies, %.2f s waiting for slots, %.2f s copying\n",
+            __func__, offload_prefetch.n, offload_prefetch.n_fallback, offload_prefetch.t_wait_us/1e6, offload_prefetch.t_copy_us/1e6);
+    }
+    offload_prefetch.free_all();
 
     dt.print(moe_cache != nullptr);
     if (n_graph_slots_made > 0) {
@@ -869,6 +874,15 @@ ggml_backend_sched_ptr llama_context::make_sched(size_t max_nodes, bool parallel
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, op_offload));
 
     ggml_backend_sched_set_copy_callback(s.get(), sched_copy_experts, this);
+    // LLAMA_OFFLOAD_PREFETCH=1: a released batch's host experts go into slots of their own before the scheduler's wait
+    // for the device (see prefetch_copy); a looped model needs LLAMA_LOOP_EXPS_COPY (each pass its own copy)
+    static const bool prefetch = getenv("LLAMA_OFFLOAD_PREFETCH") && atoi(getenv("LLAMA_OFFLOAD_PREFETCH")) != 0;
+    static const bool loop_alias = getenv("LLAMA_LOOP_EXPS_COPY") && atoi(getenv("LLAMA_LOOP_EXPS_COPY")) != 0;
+    if (prefetch && moe_cache && (model.arch != LLM_ARCH_INKLING2_LOOP || loop_alias)) {
+        ggml_backend_sched_set_copy_callback_early(s.get(), [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * ud) {
+            return static_cast<llama_context *>(ud)->prefetch_copy(backend, src, dst, graph);
+        }, this);
+    }
     ggml_backend_sched_set_realloc_callback(s.get(), sched_graph_realloc, this);
     return s;
 }
@@ -2822,6 +2836,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // yet may go to host memory
                 sched_drop();
                 release_scratch();
+                // LLAMA_OFFLOAD_PREFETCH's slots go with the large batches' buffers, before the cache takes the memory back
+                if (offload_prefetch.init) {
+                    offload_prefetch.free_all();
+                    offload_prefetch.init = false;
+                    offload_prefetch.on   = false;
+                }
                 if (moe_cache) {
                     moe_cache->restore();
                 }
@@ -3882,6 +3902,109 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         cst.us += ggml_time_us() - t_copy_start_us;
     }
 
+    return true;
+}
+
+bool llama_context::prefetch_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    // only in a released batch, only the experts (and their scales): nothing else of the model is a host weight then
+    if (!moe_resize_large || moe_cache == nullptr || strstr(ggml_get_name(src), "_exps") == nullptr) {
+        return false;
+    }
+    auto & pf = offload_prefetch;
+    static const size_t tail_size = 32u*1024*1024; // a split's smaller expert tensors (the scales)
+    if (!pf.init) {
+        pf.init = true;
+        pf.j = 0;
+        pf.cur_graph = nullptr;
+        // a slot holds the largest host expert tensor, and a tail
+        for (const auto & layer : model.layers) {
+            for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                    pf.slot_size = std::max(pf.slot_size, ggml_nbytes(t));
+                }
+            }
+        }
+        const int n_slots = getenv("LLAMA_OFFLOAD_PREFETCH_SLOTS") ? std::max(2, atoi(getenv("LLAMA_OFFLOAD_PREFETCH_SLOTS"))) : 3;
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_init_params ip = { (size_t) n_slots * ggml_tensor_overhead(), nullptr, true };
+        pf.ctx = ggml_init(ip);
+        pf.on = pf.slot_size > 0 && dev != nullptr;
+        for (int i = 0; i < n_slots && pf.on; ++i) {
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, pf.slot_size + tail_size);
+            ggml_backend_event_t  e = ggml_backend_event_new(dev);
+            if (b == nullptr || e == nullptr) {
+                if (b) { ggml_backend_buffer_free(b); }
+                if (e) { ggml_backend_event_free(e); }
+                pf.on = false;
+                break;
+            }
+            ggml_tensor * t = ggml_new_tensor_1d(pf.ctx, GGML_TYPE_I8, (int64_t) (pf.slot_size + tail_size));
+            ggml_format_name(t, "offload_prefetch_slot%d", i);
+            GGML_ASSERT(ggml_backend_tensor_alloc(b, t, ggml_backend_buffer_get_base(b)) == GGML_STATUS_SUCCESS);
+            pf.bufs.push_back(b);
+            pf.events.push_back(e);
+            pf.slots.push_back(t);
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_OFFLOAD_PREFETCH: %s, %d slots of %.1f MiB on %s\n", __func__, pf.on ? "on" : "OFF (no memory or events)",
+            (int) pf.slots.size(), (pf.slot_size + tail_size)/1048576.0, ggml_backend_name(backend));
+        if (!pf.on) {
+            pf.free_all();
+        }
+    }
+    const size_t nbytes = ggml_nbytes(src);
+    if (!pf.on || nbytes > pf.slot_size || src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) ||
+        dst->buffer == nullptr || ggml_backend_buffer_get_type(dst->buffer) != ggml_backend_buffer_get_type(pf.bufs[0])) {
+        pf.n_fallback++;
+        return false;
+    }
+    const int64_t n_slots = (int64_t) pf.slots.size();
+    if (graph != pf.cur_graph) {
+        // a new split: the next slot, once its last split has been computed (that split's ops were submitted before the
+        // event recorded at the start of the split n_slots - 1 later)
+        if (pf.cur_graph != nullptr) {
+            pf.j++;
+        }
+        pf.cur_graph = graph;
+        const int64_t j = pf.j;
+        if (j - n_slots + 1 >= 0) {
+            const int64_t t0 = ggml_time_us();
+            ggml_backend_event_synchronize(pf.events[(j + 1) % n_slots]);
+            pf.t_wait_us += ggml_time_us() - t0;
+        }
+        // marks the ops submitted so far, those of the earlier splits
+        ggml_backend_event_record(pf.events[j % n_slots], backend);
+        pf.main_used = false;
+        pf.tail_used = 0;
+    }
+    const int64_t s = pf.j % n_slots;
+    size_t off;
+    if (nbytes > tail_size || !pf.main_used) {
+        if (pf.main_used) {
+            pf.n_fallback++;
+            return false;
+        }
+        off = 0;
+        pf.main_used = true;
+    } else {
+        if (pf.tail_used + nbytes > tail_size) {
+            pf.n_fallback++;
+            return false;
+        }
+        off = pf.slot_size + pf.tail_used;
+        pf.tail_used += GGML_PAD(nbytes, 256);
+    }
+    const int64_t t0 = ggml_time_us();
+    if (!moe_cache->offload_copy(backend, pf.slots[s], src->data, off, nbytes, /*drain =*/ false)) {
+        pf.n_fallback++;
+        return false;
+    }
+    moe_cache->offload_finish(backend);
+    pf.t_copy_us += ggml_time_us() - t0;
+    // the op reads the slot (its copy in the compute buffer is left unused)
+    dst->buffer = pf.bufs[s];
+    dst->data   = (char *) ggml_backend_buffer_get_base(pf.bufs[s]) + off;
+    pf.n++;
     return true;
 }
 
