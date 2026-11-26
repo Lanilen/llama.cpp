@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "lgbm-tiny.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1379,6 +1380,92 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // top-1 probability is the cutoff (Inkling 2's drafter has no head)
     bool has_conf_head = true;
 
+    // --spec-draft-exit-model: the learned exit, its inputs as inkling-spec/exit_export.py builds them from the oracle
+    // logs (33: the position's 15, the request's history 17, the temperature)
+    lgbm_tiny exit_model;
+    bool      exit_on = false;
+    struct exit_hist {
+        std::vector<int> acc;            // the drafts accepted at each step of the request
+        std::string      text;           // the request's committed text after its first token
+        float            p1_last = 0.9f; // the last draft's first top-1 probability
+        size_t           last_total = 0; // the committed tokens (prompt + the last one) at the last draft, 0: none yet
+    };
+    std::vector<exit_hist> exit_h;
+
+    // a text's kind, as predictors2.kind on Python strings: newline, leading space, a digit, a letter, punctuation (not
+    // alphanumeric, not space), its characters; an invalid UTF-8 byte is one replacement character (punctuation)
+    static void exit_kind(const std::string & s, double * o) {
+        bool nl = false, sp = false, dig = false, alpha = false, punct = false;
+        int n = 0;
+        for (size_t i = 0; i < s.size();) {
+            const unsigned char c = s[i];
+            uint32_t cp = c;
+            int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+            bool ok = len > 0 && i + len <= s.size();
+            for (int k = 1; ok && k < len; ++k) {
+                ok = ((unsigned char) s[i + k] >> 6) == 2;
+            }
+            if (!ok) {
+                punct = true;
+                ++n;
+                ++i;
+                continue;
+            }
+            if (len > 1) {
+                cp = c & (0x7f >> len);
+                for (int k = 1; k < len; ++k) {
+                    cp = (cp << 6) | ((unsigned char) s[i + k] & 0x3f);
+                }
+            }
+            ++n;
+            if (cp == '\n') {
+                nl = true;
+            }
+            if (n == 1 && cp == ' ') {
+                sp = true;
+            }
+            if (cp < 0x80) {
+                if (cp >= '0' && cp <= '9') {
+                    dig = true;
+                } else if ((cp | 0x20) >= 'a' && (cp | 0x20) <= 'z') {
+                    alpha = true;
+                } else if (!(cp == ' ' || (cp >= 9 && cp <= 13))) {
+                    punct = true;
+                }
+            } else {
+                const bool space = cp == 0xa0 || cp == 0x3000 || (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f;
+                const bool sym = (cp >= 0xa1 && cp <= 0xbf) || cp == 0xd7 || cp == 0xf7 || (cp >= 0x2010 && cp <= 0x2bff) ||
+                                 (cp >= 0x3001 && cp <= 0x303f) || (cp >= 0xff01 && cp <= 0xff0f) || (cp >= 0xff1a && cp <= 0xff20) ||
+                                 (cp >= 0xff3b && cp <= 0xff40) || (cp >= 0xff5b && cp <= 0xff65) || cp >= 0x1f000 || cp == 0xfffd;
+                if (!space) {
+                    (sym ? punct : alpha) = true;
+                }
+            }
+            i += len;
+        }
+        o[0] = nl; o[1] = sp; o[2] = dig; o[3] = alpha; o[4] = punct; o[5] = n;
+    }
+
+    // the last n characters (code points) of s
+    static std::string exit_tail(const std::string & s, size_t n) {
+        size_t i = s.size(), k = 0;
+        while (i > 0 && k < n) {
+            --i;
+            if (((unsigned char) s[i] >> 6) != 2) {
+                ++k;
+            }
+        }
+        return s.substr(i);
+    }
+
+    static size_t exit_chars(const std::string & s) {
+        size_t k = 0;
+        for (unsigned char c : s) {
+            k += (c >> 6) != 2;
+        }
+        return k;
+    }
+
     // MoD (--spec-draft-dict): the dictionary is on, and how much of each sequence's tokens are already in its slots
     bool                 mod_on = false;
     std::vector<size_t>  mod_seen;
@@ -1496,6 +1583,18 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
                     this->params.dict_path.c_str(), this->params.dict_reserve);
         }
 
+        if (!this->params.exit_model.empty()) {
+            std::string err;
+            if (!exit_model.load(this->params.exit_model, err) || exit_model.n_features != 33 || !exit_model.sigmoid) {
+                throw std::runtime_error("--spec-draft-exit-model " + this->params.exit_model + ": " +
+                        (err.empty() ? "not a binary model of the 33 exit inputs" : err));
+            }
+            exit_on = true;
+            exit_h.assign(n_seq, exit_hist());
+            LOG_INF("%s: - exit model %s: %zu trees, a draft stops before a later position whose probability is below %.2f\n", __func__,
+                    this->params.exit_model.c_str(), exit_model.trees.size(), (double) this->params.exit_th);
+        }
+
         LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
                 sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false");
 
@@ -1544,6 +1643,10 @@ public:
         // the markov context draws: reseed per request rather than per round, or two identical requests differ
         if (has_markov_context && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             draw_seed[seq_id] = -1;
+        }
+
+        if (exit_on && seq_id >= 0 && (size_t) seq_id < exit_h.size()) {
+            exit_h[seq_id] = exit_hist();
         }
 
         if (mod_on && seq_id >= 0 && (size_t) seq_id < mod_seen.size()) {
@@ -1704,7 +1807,51 @@ public:
             // DSpark: read from the first draft slot, truncate below the confidence threshold (its head, or else the
             // drafter's top-1 probability)
             const float * conf = params.p_min > 0.0f && has_conf_head ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-            const bool stop_top1 = params.p_min > 0.0f && !has_conf_head;
+            const bool stop_top1 = params.p_min > 0.0f && !has_conf_head && !exit_on;
+
+            // the learned exit: the request's history first (the tokens committed since the last draft: the accepted
+            // drafts and the target's correction), then the position's inputs as each token is drafted
+            double ex[33] = {};
+            std::vector<double> ex_top1; // each drafted position's top-1 probability
+            exit_hist * eh = exit_on && dp.prompt && (size_t) seq_id < exit_h.size() ? &exit_h[seq_id] : nullptr;
+            if (eh) {
+                const auto & toks = *dp.prompt;
+                const size_t total = toks.size() + 1;
+                if (eh->last_total > 0 && total > eh->last_total) {
+                    eh->acc.push_back((int) (total - eh->last_total) - 1);
+                    for (size_t t = eh->last_total; t < total; ++t) {
+                        eh->text += common_token_to_piece(ctx_dft, t < toks.size() ? toks[t] : dp.id_last);
+                    }
+                }
+                eh->last_total = total;
+                const std::vector<int> a = eh->acc.empty() ? std::vector<int>{ 3 } : eh->acc;
+                const auto mean_last = [&](size_t n) {
+                    const size_t m = std::min(n, a.size());
+                    double s = 0.0;
+                    for (size_t k = a.size() - m; k < a.size(); ++k) {
+                        s += a[k];
+                    }
+                    return s / m;
+                };
+                double * h = ex + 15;
+                h[0] = a.back();
+                h[1] = mean_last(3);
+                h[2] = mean_last(8);
+                h[3] = *std::min_element(a.end() - std::min<size_t>(3, a.size()), a.end());
+                // h[4..7]: the target's confidence, not available at draft time (zeros, as in training)
+                h[8] = eh->p1_last;
+                size_t fences = 0;
+                for (size_t pos = eh->text.find("```"); pos != std::string::npos; pos = eh->text.find("```", pos + 3)) {
+                    ++fences;
+                }
+                h[9] = (double) (fences % 2);
+                const std::string last = exit_tail(eh->text, 200);
+                const size_t nl = last.rfind('\n');
+                h[10] = (double) std::min<size_t>(200, nl == std::string::npos ? exit_chars(last) : exit_chars(last.substr(nl + 1)));
+                exit_kind(eh->text.empty() ? std::string(" ") : exit_tail(eh->text, 8), h + 11);
+                ex[32] = dp.temp > 0.0f ? 1.0 : 0.0;
+            }
+
             for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                 const int32_t idx = beg + i;
 
@@ -1723,6 +1870,52 @@ public:
                 }
 
                 const llama_token id = cur_p->data[0].id;
+
+                if (eh) {
+                    // the position's inputs (predictors2.pos_feats): the candidates' softmax (sorted by logit), the
+                    // earlier positions' top-1, the position, the drafted token's kind
+                    std::vector<double> l(cur_p->size);
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        l[k] = cur_p->data[k].logit;
+                    }
+                    std::sort(l.begin(), l.end(), std::greater<double>());
+                    double z = 0.0;
+                    for (double v : l) {
+                        z += std::exp(v - l[0]);
+                    }
+                    double ent = 0.0;
+                    for (double v : l) {
+                        const double q = std::exp(v - l[0]) / z;
+                        ent -= q > 0.0 ? q * std::log(q) : 0.0;
+                    }
+                    const double p0 = 1.0 / z, p1 = l.size() > 1 ? std::exp(l[1] - l[0]) / z : 0.0;
+                    const int32_t j = (int32_t) result.size();
+                    if (j >= 1) {
+                        double mn = 1.0, lp = 0.0;
+                        for (double q : ex_top1) {
+                            mn = std::min(mn, q);
+                            lp += std::log(std::max(q, 1e-6));
+                        }
+                        ex[0] = p0; ex[1] = p0 - p1; ex[2] = ent; ex[3] = l[0]; ex[4] = l.size() > 1 ? l[0] - l[1] : 10.0;
+                        ex[5] = mn; ex[6] = lp; ex[7] = ex_top1.back(); ex[8] = j;
+                        exit_kind(common_token_to_piece(ctx_dft, id), ex + 9);
+                        const double q = exit_model.predict(ex);
+                        // DIAG: LLAMA_SPEC_EXIT_LOG=FILE, a line a decision (pos0, j, the 33 inputs, the probability)
+                        static FILE * exit_log = [] { const char * f = getenv("LLAMA_SPEC_EXIT_LOG"); return f ? fopen(f, "a") : nullptr; }();
+                        if (exit_log) {
+                            fprintf(exit_log, "%d %d", (int) dp.pos0, j);
+                            for (double v : ex) {
+                                fprintf(exit_log, " %.9g", v);
+                            }
+                            fprintf(exit_log, " %.9g\n", q);
+                            fflush(exit_log);
+                        }
+                        if (q < params.exit_th) {
+                            break;
+                        }
+                    }
+                    ex_top1.push_back(p0);
+                }
 
                 if (stop_top1 && !result.empty()) {
                     // the candidates are the backend's top 10 by logit, their p not always filled: a softmax over them
@@ -1743,6 +1936,10 @@ public:
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
+            }
+
+            if (eh && !ex_top1.empty()) {
+                eh->p1_last = (float) ex_top1[0];
             }
 
             if (result.size() < (size_t) params.n_min) {

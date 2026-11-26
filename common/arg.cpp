@@ -4445,6 +4445,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT"));
     add_opt(common_arg(
+        {"--spec-draft-exit-model"}, "FNAME",
+        "DSpark without a confidence head: a learned exit, a LightGBM text model of P(the drafted token is accepted) on the "
+        "drafter's candidates, the token's kind and the request's history (the fork's inkling-spec exit_export.py), in "
+        "place of the --spec-draft-p-min stop; the first token is always kept",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.exit_model = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_EXIT_MODEL"));
+    add_opt(common_arg(
+        {"--spec-draft-exit-threshold"}, "P",
+        string_format("with --spec-draft-exit-model: stop a draft before the first later position whose probability is below P (default: %.2f)", (double) params.speculative.draft.exit_th),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.exit_th = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_EXIT_THRESHOLD"));
+    add_opt(common_arg(
         {"--spec-draft-dict-families"}, "FNAME",
         "MoD: the family of each token (line i holds token i's family id, -1 for none, e.g. clusters of the output head's "
         "rows): a prompt or answer token outside the dictionary brings its whole family into the reserve slots",
