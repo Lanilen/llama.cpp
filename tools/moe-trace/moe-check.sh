@@ -13,6 +13,8 @@
 # check's output is in BUILD/moe-check/NAME.log. Exit code 1 if any check failed.
 # MOE_CHECK_PREDICTORS: "file:vectors ..." for llama-moe-predictor-check (default: the published files in ~/moe-pred)
 # MOE_CHECK_PYTHON: a Python environment with numpy and torch, for the type checker (default: ~/moe-pred/venv)
+# MOE_CHECK_TEST_MODEL: the model of upstream's model tests (LLAMACPP_TEST_MODELFILE, e.g. test-backend-sampler), default
+#   upstream CI's Qwen3-0.6B Q4_0 at /mnt/md0/models/qwen3-0.6b/Qwen3-0.6B-Q4_0.gguf; without one those tests skip
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD=$ROOT/build; QUICK=; NOBUILD=; DEV=Vulkan0
@@ -164,14 +166,20 @@ else skip docs "no FORK.md on this branch"; fi
 # after a merge: upstream's own tests, and the op tests started above
 if [ -z "$QUICK" ]; then
   t0=$(date +%s)
+  # the model tests need a model (they pass silently without one); upstream CI runs them on Qwen3-0.6B Q4_0, and a toy
+  # model fails test_logit_bias / test_penalties (their thresholds assume a real model)
+  TEST_MODEL=${MOE_CHECK_TEST_MODEL:-/mnt/md0/models/qwen3-0.6b/Qwen3-0.6B-Q4_0.gguf}
+  if [ -z "${LLAMACPP_TEST_MODELFILE:-}" ] && [ -f "$TEST_MODEL" ]; then export LLAMACPP_TEST_MODELFILE=$TEST_MODEL; fi
+  if [ -n "${LLAMACPP_TEST_MODELFILE:-}" ]; then model_note="; the model tests on $(basename "$LLAMACPP_TEST_MODELFILE")"
+  else model_note="; the model tests skipped (no MOE_CHECK_TEST_MODEL file)"; fi
   ctest --test-dir "$BUILD" -LE moe -j 8 > "$OUT/upstream.log" 2>&1
   sum=$(grep -E "tests passed" "$OUT/upstream.log" | tail -1); bad=; env_only=
   for t in $(grep -E "\*\*\*(Failed|Timeout|Exception|Not Run)" "$OUT/upstream.log" | sed -E 's/.*Test +#[0-9]+: ([^ ]+) .*/\1/'); do
     # a Python test without its modules on this machine is not the build's failure
     if ctest --test-dir "$BUILD" -R "^$t\$" --output-on-failure 2>&1 | grep -q "ModuleNotFoundError"; then env_only="$env_only $t"; else bad="$bad $t"; fi
   done
-  if [ -n "$sum" ] && [ -z "$bad" ]; then note PASS upstream $(( $(date +%s) - t0 )) "ctest -LE moe: $sum${env_only:+; not run for a missing Python module:$env_only}"
-  else note FAIL upstream $(( $(date +%s) - t0 )) "ctest -LE moe: ${sum:-did not run}; failed:${bad:- ?} (see $OUT/upstream.log)"; fi
+  if [ -n "$sum" ] && [ -z "$bad" ]; then note PASS upstream $(( $(date +%s) - t0 )) "ctest -LE moe: $sum${env_only:+; not run for a missing Python module:$env_only}$model_note"
+  else note FAIL upstream $(( $(date +%s) - t0 )) "ctest -LE moe: ${sum:-did not run}; failed:${bad:- ?}$model_note (see $OUT/upstream.log)"; fi
 
   wait $OPS_PID; rc=$?
   line=$(grep -a "tests passed" "$OUT/ops-all.log" | tail -1 | tr -s ' ')

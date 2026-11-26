@@ -32,7 +32,7 @@ the canary mode; the branch with every part also the documents' check and the sp
 | `tuner-server` | two tuner stages on the real server and a tiny model | the server no longer takes an option the tuner passes, or the tuner no longer reads a line of the server's log |
 | `canary-mode` | the drift tool's canary mode on a tiny model, twice | the tool the lab canary runs is broken: fix it before going to the lab |
 | `docs` | `check-docs.py` | a document names an option or a variable the code does not have (renamed or removed by the merge) |
-| `upstream` | `ctest -LE moe`, upstream's own cases | as upstream; a Python case without its modules on the machine is listed, not failed |
+| `upstream` | `ctest -LE moe`, upstream's own cases, the model cases (test-backend-sampler, ...) on upstream CI's Qwen3-0.6B Q4_0 (`MOE_CHECK_TEST_MODEL`, default `/mnt/md0/models/qwen3-0.6b/Qwen3-0.6B-Q4_0.gguf`; without the file they skip and the line says so) | as upstream; a Python case without its modules on the machine is listed, not failed |
 
 ## The scenarios on tiny models
 
