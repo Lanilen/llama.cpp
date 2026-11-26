@@ -351,6 +351,7 @@ struct common_params_speculative_draft {
 
     std::string dict_path;           // MoD: a DSpark drafter drafts over this dictionary of tokens (one id a line or a JSON list)
     int32_t     dict_reserve = 2048; // MoD: free slots for the prompt's and the answer's tokens outside the dictionary
+    std::string dict_families;       // MoD: the family of each token (line i: token i's), a missed token loads its family
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

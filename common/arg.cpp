@@ -4445,6 +4445,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT"));
     add_opt(common_arg(
+        {"--spec-draft-dict-families"}, "FNAME",
+        "MoD: the family of each token (line i holds token i's family id, -1 for none, e.g. clusters of the output head's "
+        "rows): a prompt or answer token outside the dictionary brings its whole family into the reserve slots",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.dict_families = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT_FAMILIES"));
+    add_opt(common_arg(
         {"--spec-draft-dict-reserve"}, "N",
         string_format("MoD: slots for the prompt's and the answer's tokens outside the dictionary, emptied for each request (default: %d)", params.speculative.draft.dict_reserve),
         [](common_params & params, int value) {

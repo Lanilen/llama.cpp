@@ -1382,6 +1382,28 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // MoD (--spec-draft-dict): the dictionary is on, and how much of each sequence's tokens are already in its slots
     bool                 mod_on = false;
     std::vector<size_t>  mod_seen;
+    // MoD families: a token outside the dictionary brings its family (fam_tokens[fam_of[t]]) once a request
+    std::vector<int32_t>                   fam_of;
+    std::vector<std::vector<llama_token>>  fam_tokens;
+    std::vector<bool>                      fam_loaded;
+    int32_t                                fam_loads = 0;
+
+    // the tokens into the dictionary's slots; with families, each token that was outside brings its family
+    void mod_add(llama_context * ctx, const llama_token * toks, size_t n) {
+        if (fam_of.empty()) {
+            llama_dspark_dict_add(ctx, toks, (int32_t) n);
+            return;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const llama_token t = toks[i];
+            if (llama_dspark_dict_add(ctx, &t, 1) == 1 && t >= 0 && (size_t) t < fam_of.size() && fam_of[t] >= 0 && !fam_loaded[fam_of[t]]) {
+                fam_loaded[fam_of[t]] = true;
+                const auto & f = fam_tokens[fam_of[t]];
+                llama_dspark_dict_add(ctx, f.data(), (int32_t) f.size());
+                ++fam_loads;
+            }
+        }
+    }
 
     // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
     // it comes back from the injection as h_nextn, kept for the last ctx_rows positions of each sequence
@@ -1450,6 +1472,26 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             }
             mod_on = true;
             mod_seen.assign(n_seq, 0);
+            if (!this->params.dict_families.empty()) {
+                std::ifstream ff(this->params.dict_families);
+                std::string line;
+                while (std::getline(ff, line)) {
+                    fam_of.push_back(line.empty() ? -1 : (int32_t) std::stol(line));
+                }
+                const int32_t n_fam = fam_of.empty() ? 0 : *std::max_element(fam_of.begin(), fam_of.end()) + 1;
+                if (n_fam <= 0) {
+                    throw std::runtime_error("--spec-draft-dict-families: no families in " + this->params.dict_families);
+                }
+                fam_tokens.assign(n_fam, {});
+                for (size_t t = 0; t < fam_of.size(); ++t) {
+                    if (fam_of[t] >= 0) {
+                        fam_tokens[fam_of[t]].push_back((llama_token) t);
+                    }
+                }
+                fam_loaded.assign(n_fam, false);
+                LOG_INF("%s: - MoD: %d token families from %s (a token outside the dictionary brings its family)\n", __func__,
+                        n_fam, this->params.dict_families.c_str());
+            }
             LOG_INF("%s: - MoD: %d tokens from %s, %d slots for the prompt's and the answer's\n", __func__, n,
                     this->params.dict_path.c_str(), this->params.dict_reserve);
         }
@@ -1507,7 +1549,12 @@ public:
         if (mod_on && seq_id >= 0 && (size_t) seq_id < mod_seen.size()) {
             // a new request: its prompt into the slots (one dictionary for every sequence: the slots of the others go too)
             llama_dspark_dict_reset(params.ctx_dft);
-            llama_dspark_dict_add(params.ctx_dft, prompt.data(), (int32_t) prompt.size());
+            if (!fam_loaded.empty()) {
+                LOG_DBG("%s: MoD: %d families loaded in the last request\n", __func__, fam_loads);
+                std::fill(fam_loaded.begin(), fam_loaded.end(), false);
+                fam_loads = 0;
+            }
+            mod_add(params.ctx_dft, prompt.data(), prompt.size());
             std::fill(mod_seen.begin(), mod_seen.end(), 0);
             mod_seen[seq_id] = prompt.size();
         }
@@ -1560,10 +1607,10 @@ public:
                     seen = 0;
                 }
                 if (toks.size() > seen) {
-                    llama_dspark_dict_add(ctx_dft, toks.data() + seen, (int32_t) (toks.size() - seen));
+                    mod_add(ctx_dft, toks.data() + seen, toks.size() - seen);
                     seen = toks.size();
                 }
-                llama_dspark_dict_add(ctx_dft, &dp.id_last, 1);
+                mod_add(ctx_dft, &dp.id_last, 1);
             }
 
             const int32_t n_draft = params.n_max;
