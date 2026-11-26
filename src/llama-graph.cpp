@@ -4908,7 +4908,11 @@ void llm_graph_context::build_sampling() const {
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
     // the padding row gives the chains without a row of the ubatch a valid input, even with no output at all
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    // the columns are padded to 64 floats so every row's view starts on a 256-byte boundary: a backend binds a view at
+    // its storage-buffer alignment (Vulkan on NVIDIA: 16 bytes), and a vocabulary like Inkling 2's drafter's (200,058)
+    // put every odd row off it; the views cover the real columns only
+    const int64_t n_cols   = res->t_logits->ne[0];
+    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, (64 - n_cols % 64) % 64, 1, 0, 0);
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -4929,7 +4933,7 @@ void llm_graph_context::build_sampling() const {
             const uint32_t row    = active ? rows[i] : 0;
             const int      i_out  = active ? 1       : 0;
 
-            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, n_cols, row * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {
