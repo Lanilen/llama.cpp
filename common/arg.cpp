@@ -4454,6 +4454,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_EXIT_MODEL"));
     add_opt(common_arg(
+        {"--spec-draft-cap-model"}, "FNAME",
+        "DSpark: a learned cap, a LightGBM text model of the drafts the next step accepts from the request's history "
+        "(the fork's inkling-spec cap_export.py): each step drafts its prediction + --spec-draft-cap-delta tokens, 1 to "
+        "--spec-draft-n-max; with the exit model or the --spec-draft-p-min stop inside that cap",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.cap_model = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CAP_MODEL"));
+    add_opt(common_arg(
+        {"--spec-draft-cap-delta"}, "N",
+        string_format("with --spec-draft-cap-model: a step's cap = the model's prediction + N (default: %d)", params.speculative.draft.cap_delta),
+        [](common_params & params, int value) {
+            params.speculative.draft.cap_delta = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CAP_DELTA"));
+    add_opt(common_arg(
         {"--spec-draft-exit-threshold"}, "P",
         string_format("with --spec-draft-exit-model: stop a draft before the first later position whose probability is below P (default: %.2f)", (double) params.speculative.draft.exit_th),
         [](common_params & params, const std::string & value) {

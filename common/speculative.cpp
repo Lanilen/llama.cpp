@@ -12,6 +12,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1391,6 +1392,48 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         size_t           last_total = 0; // the committed tokens (prompt + the last one) at the last draft, 0: none yet
     };
     std::vector<exit_hist> exit_h;
+    // --spec-draft-cap-model: the step's cap from the request's history alone (inkling-spec cap_export.py's 19 inputs:
+    // the exit's history 17, the steps so far, the temperature), round-half-even(prediction) + --spec-draft-cap-delta
+    lgbm_tiny cap_model;
+    bool      cap_on = false;
+    std::vector<std::array<double, 17>> hist_x; // the history inputs of each sequence's current draft
+
+    // the request's history (predictors2.Hist.feats without the target's confidence) from the tokens committed since
+    // the last draft (the accepted drafts and the target's correction): once a draft, before it
+    void hist_update(exit_hist & eh, const llama_tokens & toks, llama_token id_last, double * h) {
+        const size_t total = toks.size() + 1;
+        if (eh.last_total > 0 && total > eh.last_total) {
+            eh.acc.push_back((int) (total - eh.last_total) - 1);
+            for (size_t t = eh.last_total; t < total; ++t) {
+                eh.text += common_token_to_piece(params.ctx_dft, t < toks.size() ? toks[t] : id_last);
+            }
+        }
+        eh.last_total = total;
+        const std::vector<int> a = eh.acc.empty() ? std::vector<int>{ 3 } : eh.acc;
+        const auto mean_last = [&](size_t n) {
+            const size_t m = std::min(n, a.size());
+            double s = 0.0;
+            for (size_t k = a.size() - m; k < a.size(); ++k) {
+                s += a[k];
+            }
+            return s / m;
+        };
+        h[0] = a.back();
+        h[1] = mean_last(3);
+        h[2] = mean_last(8);
+        h[3] = *std::min_element(a.end() - std::min<size_t>(3, a.size()), a.end());
+        h[4] = h[5] = h[6] = h[7] = 0.0; // the target's confidence, not available at draft time (zeros, as in training)
+        h[8] = eh.p1_last;
+        size_t fences = 0;
+        for (size_t pos = eh.text.find("```"); pos != std::string::npos; pos = eh.text.find("```", pos + 3)) {
+            ++fences;
+        }
+        h[9] = (double) (fences % 2);
+        const std::string last = exit_tail(eh.text, 200);
+        const size_t nl = last.rfind('\n');
+        h[10] = (double) std::min<size_t>(200, nl == std::string::npos ? exit_chars(last) : exit_chars(last.substr(nl + 1)));
+        exit_kind(eh.text.empty() ? std::string(" ") : exit_tail(eh.text, 8), h + 11);
+    }
 
     // a text's kind, as predictors2.kind on Python strings: newline, leading space, a digit, a letter, punctuation (not
     // alphanumeric, not space), its characters; an invalid UTF-8 byte is one replacement character (punctuation)
@@ -1572,8 +1615,24 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             }
             exit_on = true;
             exit_h.assign(n_seq, exit_hist());
+            hist_x.assign(n_seq, {});
             LOG_INF("%s: - exit model %s: %zu trees, a draft stops before a later position whose probability is below %.2f\n", __func__,
                     this->params.exit_model.c_str(), exit_model.trees.size(), (double) this->params.exit_th);
+        }
+
+        if (!this->params.cap_model.empty()) {
+            std::string err;
+            if (!cap_model.load(this->params.cap_model, err) || cap_model.n_features != 19 || cap_model.sigmoid) {
+                throw std::runtime_error("--spec-draft-cap-model " + this->params.cap_model + ": " +
+                        (err.empty() ? "not a regression model of the 19 cap inputs" : err));
+            }
+            cap_on = true;
+            if (exit_h.empty()) {
+                exit_h.assign(n_seq, exit_hist());
+                hist_x.assign(n_seq, {});
+            }
+            LOG_INF("%s: - cap model %s: %zu trees, a step's cap = its prediction + %d, 1 to %d\n", __func__,
+                    this->params.cap_model.c_str(), cap_model.trees.size(), this->params.cap_delta, this->params.n_max);
         }
 
         LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
@@ -1626,7 +1685,7 @@ public:
             draw_seed[seq_id] = -1;
         }
 
-        if (exit_on && seq_id >= 0 && (size_t) seq_id < exit_h.size()) {
+        if ((exit_on || cap_on) && seq_id >= 0 && (size_t) seq_id < exit_h.size()) {
             exit_h[seq_id] = exit_hist();
         }
 
@@ -1696,7 +1755,28 @@ public:
                 mod_add(ctx_dft, &dp.id_last, 1, true);
             }
 
-            const int32_t n_draft = params.n_max;
+            int32_t n_draft = params.n_max;
+            if ((exit_on || cap_on) && dp.prompt && (size_t) seq_id < exit_h.size()) {
+                hist_update(exit_h[seq_id], *dp.prompt, dp.id_last, hist_x[seq_id].data());
+                if (cap_on) {
+                    double cx[19];
+                    std::copy(hist_x[seq_id].begin(), hist_x[seq_id].end(), cx);
+                    cx[17] = (double) exit_h[seq_id].acc.size();
+                    cx[18] = dp.temp > 0.0f ? 1.0 : 0.0;
+                    const double q = cap_model.predict(cx);
+                    n_draft = std::max(1, std::min(params.n_max, (int32_t) std::nearbyint(q) + params.cap_delta));
+                    // DIAG: LLAMA_SPEC_CAP_LOG=FILE, a line a draft (pos0, the 19 inputs, the prediction, the cap)
+                    static FILE * cap_log = [] { const char * f = getenv("LLAMA_SPEC_CAP_LOG"); return f ? fopen(f, "a") : nullptr; }();
+                    if (cap_log) {
+                        fprintf(cap_log, "%d", (int) dp.pos0);
+                        for (double v : cx) {
+                            fprintf(cap_log, " %.9g", v);
+                        }
+                        fprintf(cap_log, " %.9g %d\n", q, n_draft);
+                        fflush(cap_log);
+                    }
+                }
+            }
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
 
             // all blocks share one decode: a block that does not fit in the draft context fails every sequence's draft
@@ -1793,42 +1873,9 @@ public:
             // drafts and the target's correction), then the position's inputs as each token is drafted
             double ex[33] = {};
             std::vector<double> ex_top1; // each drafted position's top-1 probability
-            exit_hist * eh = exit_on && dp.prompt && (size_t) seq_id < exit_h.size() ? &exit_h[seq_id] : nullptr;
+            exit_hist * eh = (exit_on || cap_on) && dp.prompt && (size_t) seq_id < exit_h.size() ? &exit_h[seq_id] : nullptr;
             if (eh) {
-                const auto & toks = *dp.prompt;
-                const size_t total = toks.size() + 1;
-                if (eh->last_total > 0 && total > eh->last_total) {
-                    eh->acc.push_back((int) (total - eh->last_total) - 1);
-                    for (size_t t = eh->last_total; t < total; ++t) {
-                        eh->text += common_token_to_piece(ctx_dft, t < toks.size() ? toks[t] : dp.id_last);
-                    }
-                }
-                eh->last_total = total;
-                const std::vector<int> a = eh->acc.empty() ? std::vector<int>{ 3 } : eh->acc;
-                const auto mean_last = [&](size_t n) {
-                    const size_t m = std::min(n, a.size());
-                    double s = 0.0;
-                    for (size_t k = a.size() - m; k < a.size(); ++k) {
-                        s += a[k];
-                    }
-                    return s / m;
-                };
-                double * h = ex + 15;
-                h[0] = a.back();
-                h[1] = mean_last(3);
-                h[2] = mean_last(8);
-                h[3] = *std::min_element(a.end() - std::min<size_t>(3, a.size()), a.end());
-                // h[4..7]: the target's confidence, not available at draft time (zeros, as in training)
-                h[8] = eh->p1_last;
-                size_t fences = 0;
-                for (size_t pos = eh->text.find("```"); pos != std::string::npos; pos = eh->text.find("```", pos + 3)) {
-                    ++fences;
-                }
-                h[9] = (double) (fences % 2);
-                const std::string last = exit_tail(eh->text, 200);
-                const size_t nl = last.rfind('\n');
-                h[10] = (double) std::min<size_t>(200, nl == std::string::npos ? exit_chars(last) : exit_chars(last.substr(nl + 1)));
-                exit_kind(eh->text.empty() ? std::string(" ") : exit_tail(eh->text, 8), h + 11);
+                std::copy(hist_x[seq_id].begin(), hist_x[seq_id].end(), ex + 15); // computed before the draft
                 ex[32] = dp.temp > 0.0f ? 1.0 : 0.0;
             }
 
@@ -1870,7 +1917,7 @@ public:
                     }
                     const double p0 = 1.0 / z, p1 = l.size() > 1 ? std::exp(l[1] - l[0]) / z : 0.0;
                     const int32_t j = (int32_t) result.size();
-                    if (j >= 1) {
+                    if (exit_on && j >= 1) {
                         double mn = 1.0, lp = 0.0;
                         for (double q : ex_top1) {
                             mn = std::min(mn, q);

@@ -355,6 +355,8 @@ struct common_params_speculative_draft {
     int32_t     dict_fam_slots = 8192; // MoD: slots for the families, in blocks of 256 (least recently used out)
     std::string exit_model;          // DSpark: a learned exit (LightGBM text model, lgbm-tiny.h) in place of the top-1 stop
     float       exit_th = 0.5f;      // DSpark: stop a draft before a position whose exit-model probability is below this
+    std::string cap_model;           // DSpark: a learned cap (LightGBM text model) of each step's draft length, up to n_max
+    int32_t     cap_delta = 2;       // DSpark: the cap = the cap model's prediction (rounded) + this
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
