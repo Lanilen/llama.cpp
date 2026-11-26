@@ -4,7 +4,8 @@
 // (dflash.cpp build_logits, dspark.cpp's Markov head) multiplies by those and scatters the logits back to the
 // vocabulary through the slots' token ids, -inf elsewhere, so sampling and the host see the whole vocabulary as before.
 // DSpark's Markov chain stays in slot space (its TOP_K / ARGMAX over the K slots, the picks mapped to token ids through
-// mod_ids_f) and scatters once, for the sampler.
+// mod_ids_f) and scatters once, for the sampler. Free slots are -inf (mod_mask) and scatter to a sink row past the
+// vocabulary that every scatter drops.
 // Free reserve slots hold a copy of slot 0 (the same token, the same logit). One dictionary a drafter model.
 
 #include "llama-impl.h"
@@ -31,7 +32,7 @@ struct llama_mod_dict {
     int32_t n_fixed = 0;
     int32_t n_slots = 0;
     int32_t n_used  = 0;
-    llama_token sink = 0; // the token of a free slot: one no dictionary can hold (past the Markov head's rows), -inf anyway
+    llama_token sink = 0; // the row of a free slot: one past the vocabulary, every scatter has that row and drops it
 
     std::unordered_map<llama_token, int32_t> slot_of;
     std::vector<uint8_t> row0_head, row0_w2; // slot 0's rows, to clear the reserve
@@ -104,9 +105,10 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
         return -1;
     }
     const int32_t K = (int32_t) fixed.size() + std::max(0, n_reserve);
-    // free slots map to a sink token past the rows a dictionary can take, so their scatter never lands on a real row
-    // (without one, slot 0's token: the old way, harmless while the free slots copy slot 0 and are not masked)
-    const llama_token sink = (int64_t) m.vocab.n_tokens() > n_vocab ? (llama_token) m.vocab.n_tokens() - 1 : fixed[0];
+    // free slots map to a sink row one past the vocabulary: every scatter writes into n_vocab + 1 rows and keeps the
+    // first n_vocab, so a free slot never shares a row with a real token (with -inf in a free slot and a logit in
+    // slot 0, which write lands on a shared row is up to the GPU)
+    const llama_token sink = (llama_token) m.vocab.n_tokens();
 
     auto d = std::make_shared<llama_mod_dict>();
     ggml_init_params ip = { 7 * ggml_tensor_overhead(), nullptr, true };

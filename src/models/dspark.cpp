@@ -258,11 +258,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
         const int64_t n_full = (int64_t) model.vocab.n_tokens();
         const int64_t n      = x->ne[1];
-        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_full, n), -INFINITY);
+        // one row past the vocabulary for the free slots' sink, dropped by the view
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_full + 1, n), -INFINITY);
         full = ggml_set_rows(ctx0, full,
                 ggml_reshape_3d(ctx0, x,             1,       n_vocab, n),
                 ggml_reshape_3d(ctx0, model.mod_ids, n_vocab, 1,       1));
-        return ggml_reshape_2d(ctx0, full, n_full, n);
+        full = ggml_reshape_2d(ctx0, full, n_full + 1, n);
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, full, n_full, n, full->nb[1], 0));
     };
     if (slots) {
         // the free reserve slots (copies of slot 0) out of the chain's TOP_K / ARGMAX
@@ -414,11 +416,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         } else if (model.mod_w2) {
             // MoD: the dictionary's slots scattered to their tokens (base is -inf on the others)
             const int64_t n_slots = bias->ne[0];
-            ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), 0.0f);
+            // one row past the vocabulary for the free slots' sink, dropped by the view
+            ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab + 1, n_blocks), 0.0f);
             bias = ggml_set_rows(ctx0, full,
                     ggml_reshape_3d(ctx0, bias,          1,       n_slots, n_blocks),
                     ggml_reshape_3d(ctx0, model.mod_ids, n_slots, 1,       1));
-            bias = ggml_reshape_2d(ctx0, bias, n_vocab, n_blocks);
+            bias = ggml_reshape_2d(ctx0, bias, n_vocab + 1, n_blocks);
+            bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, n_vocab, n_blocks, bias->nb[1], 0));
         } else if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
