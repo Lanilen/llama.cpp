@@ -349,7 +349,6 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
 
     // --moe-cache-resize: the compute buffers are reserved for large batches (prompts) with the MoE cache released,
     // or for the small batches of generation with the cache in device memory
@@ -591,4 +590,9 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // the MoE cache uses the backends and the scheduler (its background uploads, at exit), so it is declared last: the
+    // members go in reverse order, and when the constructor throws (a compute buffer that does not fit) the destructor's
+    // body, which resets it first, does not run; declared before the backends it was destroyed after them (a crash)
+    llama_moe_cache_ptr moe_cache;
 };
