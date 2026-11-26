@@ -350,8 +350,9 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     std::string dict_path;           // MoD: a DSpark drafter drafts over this dictionary of tokens (one id a line or a JSON list)
-    int32_t     dict_reserve = 2048; // MoD: free slots for the prompt's and the answer's tokens outside the dictionary
-    std::string dict_families;       // MoD: the family of each token (line i: token i's), a missed token loads its family
+    int32_t     dict_reserve = 2048; // MoD: slots for single tokens outside the dictionary (a ring, the oldest out)
+    std::string dict_families;       // MoD: the family of each token (line i: token i's), an answer token loads its family
+    int32_t     dict_fam_slots = 8192; // MoD: slots for the families, in blocks of 256 (least recently used out)
     std::string exit_model;          // DSpark: a learned exit (LightGBM text model, lgbm-tiny.h) in place of the top-1 stop
     float       exit_th = 0.5f;      // DSpark: stop a draft before a position whose exit-model probability is below this
 

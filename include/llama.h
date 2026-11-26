@@ -720,12 +720,17 @@ extern "C" {
 
     // MoD, the fork's Mixture of Dictionaries: a DSpark drafter drafts over a dictionary of tokens instead of the whole
     // vocabulary (its output head and Markov head read only the dictionary's rows; the target always verifies with the
-    // whole vocabulary). init takes the dictionary's fixed tokens and keeps n_reserve free slots for add (the prompt's
-    // and the answer's tokens, say); reset empties those slots. They return the number of tokens taken, or -1 when the
-    // context's model is not a DSpark drafter (init) or has no dictionary (add). ctx is the drafter's context.
-    LLAMA_API int32_t llama_dspark_dict_init (struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_reserve);
-    LLAMA_API int32_t llama_dspark_dict_add  (struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
-    LLAMA_API void    llama_dspark_dict_reset(struct llama_context * ctx);
+    // whole vocabulary). init takes the dictionary's fixed tokens and keeps n_reserve free slots; add puts tokens
+    // outside the dictionary into them, a ring of single tokens whose oldest go first when it is full. families gives
+    // n_slots of the reserve (in blocks of block slots) to token families (fam_of[t]: token t's, -1 none): with
+    // families set, add loads the family of a token it meets into the least recently used block. reset empties every
+    // slot past the fixed tokens. init, families and add return the number of tokens (units for families) taken, or
+    // -1 when the context's model is not a DSpark drafter (init) or has no dictionary. ctx is the drafter's context.
+    LLAMA_API int32_t llama_dspark_dict_init    (struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_reserve);
+    LLAMA_API int32_t llama_dspark_dict_families(struct llama_context * ctx, const int32_t * fam_of, int32_t n_fam_of, int32_t n_slots, int32_t block);
+    LLAMA_API int32_t llama_dspark_dict_add     (struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, bool families);
+    LLAMA_API int32_t llama_dspark_dict_n_loads (const struct llama_context * ctx); // family loads since init
+    LLAMA_API void    llama_dspark_dict_reset   (struct llama_context * ctx);
 
     // returns pointer to the target-model layer indices
     LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);

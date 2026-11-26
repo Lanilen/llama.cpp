@@ -4463,18 +4463,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-dict-families"}, "FNAME",
         "MoD: the family of each token (line i holds token i's family id, -1 for none, e.g. clusters of the output head's "
-        "rows): a prompt or answer token outside the dictionary brings its whole family into the reserve slots",
+        "rows): an answer token outside the dictionary brings its family's tokens into a block of the family slots, the "
+        "least recently used family out",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.dict_families = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT_FAMILIES"));
     add_opt(common_arg(
         {"--spec-draft-dict-reserve"}, "N",
-        string_format("MoD: slots for the prompt's and the answer's tokens outside the dictionary, emptied for each request (default: %d)", params.speculative.draft.dict_reserve),
+        string_format("MoD: slots for single tokens of the prompt and the answer outside the dictionary, the oldest out when they are full (default: %d)", params.speculative.draft.dict_reserve),
         [](common_params & params, int value) {
             params.speculative.draft.dict_reserve = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT_RESERVE"));
+    add_opt(common_arg(
+        {"--spec-draft-dict-family-slots"}, "N",
+        string_format("MoD: slots for token families with --spec-draft-dict-families, in blocks of 256 (default: %d)", params.speculative.draft.dict_fam_slots),
+        [](common_params & params, int value) {
+            params.speculative.draft.dict_fam_slots = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DICT_FAMILY_SLOTS"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

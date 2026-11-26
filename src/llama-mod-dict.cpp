@@ -6,7 +6,11 @@
 // DSpark's Markov chain stays in slot space (its TOP_K / ARGMAX over the K slots, the picks mapped to token ids through
 // mod_ids_f) and scatters once, for the sampler. Free slots are -inf (mod_mask) and scatter to a sink row past the
 // vocabulary that every scatter drops.
-// Free reserve slots hold a copy of slot 0 (the same token, the same logit). One dictionary a drafter model.
+// Slots: [0, n_fixed) the fixed tokens; then a ring of single tokens (the prompt's and the answer's tokens outside the
+// dictionary, the oldest overwritten when it is full); then, with families (llama_dspark_dict_families), blocks of a
+// family's tokens outside the fixed ones, loaded when the answer meets a token of the family and evicted least recently
+// used first (a token of a loaded family that is used again keeps its block). A token is in one slot at most.
+// Free slots hold a copy of slot 0's rows, -inf in the mask and the sink as their id. One dictionary a drafter model.
 
 #include "llama-impl.h"
 #include "llama-context.h"
@@ -17,8 +21,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_mod_dict {
@@ -31,7 +37,20 @@ struct llama_mod_dict {
 
     int32_t n_fixed = 0;
     int32_t n_slots = 0;
-    int32_t n_used  = 0;
+    // the ring of single tokens: slots [ring_beg, ring_beg + ring_n), the next write at ring_pos
+    int32_t ring_beg = 0, ring_n = 0, ring_pos = 0;
+    std::vector<llama_token> ring_tok;
+    // the family blocks: slots [fam_beg, fam_beg + n_blocks * block); a unit is a family's tokens outside the fixed
+    // ones, cut into pieces of at most block tokens
+    int32_t fam_beg = 0, block = 0, n_blocks = 0;
+    std::vector<int32_t>                  unit_of;     // token -> unit, -1 none
+    std::vector<std::vector<llama_token>> unit_tokens;
+    std::vector<int32_t>                  unit_block;  // unit -> block, -1 not loaded
+    std::vector<int32_t>                  block_unit;  // block -> unit, -1 free
+    std::vector<llama_token>              block_tok;   // block * block + i -> token, -1 free
+    std::vector<uint64_t>                 block_tick;  // last use
+    uint64_t tick    = 0;
+    int32_t  n_loads = 0;
     llama_token sink = 0; // the row of a free slot: one past the vocabulary, every scatter has that row and drops it
 
     std::unordered_map<llama_token, int32_t> slot_of;
@@ -177,7 +196,10 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
     d->src_w2_b = m.dspark_markov_w2_b;
     d->n_fixed  = (int32_t) fixed.size();
     d->n_slots  = K;
-    d->n_used   = d->n_fixed;
+    d->ring_beg = d->n_fixed;
+    d->ring_n   = K - d->n_fixed;
+    d->fam_beg  = K;
+    d->ring_tok.assign(d->ring_n, -1);
     d->sink     = sink;
     d->slot_of  = std::move(slot_of);
     d->row0_head.assign(g_head.begin(), g_head.begin() + t_head->nb[1]);
@@ -202,58 +224,224 @@ int32_t llama_dspark_dict_init(llama_context * ctx, const llama_token * tokens, 
     return d->n_fixed;
 }
 
-int32_t llama_dspark_dict_add(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {
+// slots [s0, s0 + k) to the tokens toks (-1: a free slot), one upload a tensor from the host copies of the rows
+static void mod_write(llama_mod_dict & d, const llama_model & m, int32_t s0, const llama_token * toks, int32_t k) {
+    if (k <= 0) {
+        return;
+    }
+    const size_t rh = m.mod_head->nb[1], rw = m.mod_w2->nb[1];
+    std::vector<uint8_t> h((size_t) k * rh), w((size_t) k * rw);
+    std::vector<float>   b(k), idf(k), mask(k);
+    std::vector<int64_t> ids(k);
+    for (int32_t i = 0; i < k; ++i) {
+        const llama_token t = toks[i];
+        if (t >= 0) {
+            memcpy(h.data() + (size_t) i * rh, d.host_head.data() + (size_t) t * d.src_head->nb[1], rh);
+            memcpy(w.data() + (size_t) i * rw, d.host_w2.data()   + (size_t) t * d.src_w2->nb[1],   rw);
+            b[i]    = d.host_b.empty() ? 0.0f : d.host_b[t];
+            ids[i]  = t;
+            mask[i] = 0.0f;
+        } else {
+            memcpy(h.data() + (size_t) i * rh, d.row0_head.data(), rh);
+            memcpy(w.data() + (size_t) i * rw, d.row0_w2.data(),   rw);
+            b[i]    = d.row0_b;
+            ids[i]  = d.sink;
+            mask[i] = -INFINITY;
+        }
+        idf[i] = (float) ids[i];
+    }
+    const size_t o = (size_t) s0;
+    ggml_backend_tensor_set(m.mod_head, h.data(), o * rh, h.size());
+    ggml_backend_tensor_set(m.mod_w2,   w.data(), o * rw, w.size());
+    if (m.mod_w2_b) {
+        ggml_backend_tensor_set(m.mod_w2_b, b.data(), o * sizeof(float), b.size() * sizeof(float));
+    }
+    ggml_backend_tensor_set(m.mod_ids,   ids.data(),  o * sizeof(int64_t), ids.size() * sizeof(int64_t));
+    ggml_backend_tensor_set(m.mod_ids_f, idf.data(),  o * sizeof(float),   idf.size() * sizeof(float));
+    ggml_backend_tensor_set(m.mod_mask,  mask.data(), o * sizeof(float),   mask.size() * sizeof(float));
+}
+
+static void mod_drop(llama_mod_dict & d, llama_token t, int32_t slot) {
+    if (t < 0) {
+        return;
+    }
+    auto it = d.slot_of.find(t);
+    if (it != d.slot_of.end() && it->second == slot) {
+        d.slot_of.erase(it);
+    }
+}
+
+// the tokens into the ring, the oldest out: at most two uploads a tensor (the ring wraps once at most)
+static int32_t mod_ring_add(llama_mod_dict & d, const llama_model & m, std::vector<llama_token> & add) {
+    if (d.ring_n <= 0 || add.empty()) {
+        return 0;
+    }
+    if ((int32_t) add.size() > d.ring_n) {
+        add.erase(add.begin(), add.end() - d.ring_n); // the latest ring_n
+    }
+    const int32_t p0 = d.ring_pos, k = (int32_t) add.size();
+    for (int32_t i = 0; i < k; ++i) {
+        const int32_t p = (p0 + i) % d.ring_n, slot = d.ring_beg + p;
+        mod_drop(d, d.ring_tok[p], slot);
+        d.ring_tok[p] = add[i];
+        d.slot_of[add[i]] = slot;
+    }
+    d.ring_pos = (p0 + k) % d.ring_n;
+    const int32_t k1 = std::min(k, d.ring_n - p0);
+    mod_write(d, m, d.ring_beg + p0, d.ring_tok.data() + p0, k1);
+    mod_write(d, m, d.ring_beg, d.ring_tok.data(), k - k1);
+    return k;
+}
+
+// unit u into the least recently used block (its old unit out); tokens in slots already or waiting for the ring stay
+// where they are
+static int32_t mod_load_unit(llama_mod_dict & d, const llama_model & m, int32_t u, const std::unordered_set<llama_token> & pending) {
+    int32_t b = 0;
+    for (int32_t i = 1; i < d.n_blocks; ++i) {
+        if (d.block_tick[i] < d.block_tick[b]) {
+            b = i;
+        }
+    }
+    llama_token * bt = d.block_tok.data() + (size_t) b * d.block;
+    const int32_t s0 = d.fam_beg + b * d.block;
+    if (d.block_unit[b] >= 0) {
+        d.unit_block[d.block_unit[b]] = -1;
+    }
+    for (int32_t i = 0; i < d.block; ++i) {
+        mod_drop(d, bt[i], s0 + i);
+        bt[i] = -1;
+    }
+    int32_t k = 0;
+    for (const llama_token t : d.unit_tokens[u]) {
+        if (!d.slot_of.count(t) && !pending.count(t)) {
+            bt[k] = t;
+            d.slot_of[t] = s0 + k;
+            ++k;
+        }
+    }
+    mod_write(d, m, s0, bt, d.block);
+    d.block_unit[b] = u;
+    d.unit_block[u] = b;
+    d.block_tick[b] = ++d.tick;
+    ++d.n_loads;
+    return k;
+}
+
+int32_t llama_dspark_dict_add(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, bool families) {
     llama_model & m = const_cast<llama_model &>(ctx->get_model());
     if (!m.mod) {
         return -1;
     }
     llama_mod_dict & d = *m.mod;
     const int64_t n_vocab = std::min<int64_t>({ (int64_t) m.vocab.n_tokens(), d.src_head->ne[1], d.src_w2->ne[1] });
-    // the new tokens, once each, into the next free slots (consecutive): one upload a tensor from the host copies
-    std::vector<llama_token> add;
+    std::vector<llama_token> ring;
+    std::unordered_set<llama_token> pending;
+    int32_t n_new = 0;
     for (int32_t i = 0; i < n_tokens; ++i) {
         const llama_token t = tokens[i];
-        if (t < 0 || t >= n_vocab || d.slot_of.count(t)) {
+        if (t < 0 || t >= n_vocab) {
             continue;
         }
-        if (d.n_used + (int32_t) add.size() >= d.n_slots) {
-            static bool warned = false;
-            if (!warned) {
-                LLAMA_LOG_WARN("%s: MoD: the %d reserve slots are full, later tokens stay out until a reset\n", __func__, d.n_slots - d.n_fixed);
-                warned = true;
+        auto it = d.slot_of.find(t);
+        if (it != d.slot_of.end()) {
+            if (it->second >= d.fam_beg && d.n_blocks > 0) {
+                d.block_tick[(it->second - d.fam_beg) / d.block] = ++d.tick; // its family is in use
             }
-            break;
+            continue;
         }
-        d.slot_of.emplace(t, d.n_used + (int32_t) add.size());
-        add.push_back(t);
+        if (pending.count(t)) {
+            continue;
+        }
+        if (families && d.n_blocks > 0 && (size_t) t < d.unit_of.size() && d.unit_of[t] >= 0 && d.unit_block[d.unit_of[t]] < 0) {
+            n_new += mod_load_unit(d, m, d.unit_of[t], pending);
+            if (d.slot_of.count(t)) {
+                continue;
+            }
+        }
+        pending.insert(t);
+        ring.push_back(t);
     }
-    const int32_t k = (int32_t) add.size();
-    if (k == 0) {
-        return 0;
+    n_new += mod_ring_add(d, m, ring);
+    static const bool check = getenv("LLAMA_MOD_CHECK") != nullptr;
+    if (check) {
+        // DIAG: the slots on the device against the host's map: every token in one slot at most, free slots masked
+        std::vector<int64_t> ids(d.n_slots);
+        std::vector<float>   mask(d.n_slots), idf(d.n_slots);
+        ggml_backend_tensor_get(m.mod_ids,   ids.data(),  0, ids.size() * sizeof(int64_t));
+        ggml_backend_tensor_get(m.mod_mask,  mask.data(), 0, mask.size() * sizeof(float));
+        ggml_backend_tensor_get(m.mod_ids_f, idf.data(),  0, idf.size() * sizeof(float));
+        std::unordered_set<int64_t> seen;
+        size_t n_live = 0;
+        for (int32_t s = 0; s < d.n_slots; ++s) {
+            const bool live = ids[s] != d.sink;
+            GGML_ASSERT(live == (mask[s] == 0.0f) && (float) ids[s] == idf[s]);
+            if (live) {
+                GGML_ASSERT(seen.insert(ids[s]).second && "MoD: a token in two slots");
+                auto it = d.slot_of.find((llama_token) ids[s]);
+                GGML_ASSERT(it != d.slot_of.end() && it->second == s);
+                ++n_live;
+            }
+        }
+        GGML_ASSERT(n_live == d.slot_of.size());
+        static int n_checks = 0;
+        if (++n_checks % 200 == 0) {
+            LLAMA_LOG_INFO("%s: MoD check %d: %zu live slots of %d, %d family loads\n", __func__, n_checks, n_live, d.n_slots, d.n_loads);
+        }
     }
-    const size_t rh = m.mod_head->nb[1], rw = m.mod_w2->nb[1];
-    std::vector<uint8_t> h((size_t) k * rh), w((size_t) k * rw);
-    std::vector<float>   b(k), idf(k), mask(k, 0.0f);
-    std::vector<int64_t> ids(k);
-    for (int32_t i = 0; i < k; ++i) {
-        const llama_token t = add[i];
-        memcpy(h.data() + (size_t) i * rh, d.host_head.data() + (size_t) t * d.src_head->nb[1], rh);
-        memcpy(w.data() + (size_t) i * rw, d.host_w2.data()   + (size_t) t * d.src_w2->nb[1],   rw);
-        b[i]   = d.host_b.empty() ? 0.0f : d.host_b[t];
-        ids[i] = t;
-        idf[i] = (float) t;
+    return n_new;
+}
+
+int32_t llama_dspark_dict_families(llama_context * ctx, const int32_t * fam_of, int32_t n_fam_of, int32_t n_slots, int32_t block) {
+    llama_model & m = const_cast<llama_model &>(ctx->get_model());
+    if (!m.mod || block <= 0) {
+        return -1;
     }
-    const size_t s0 = (size_t) d.n_used;
-    ggml_backend_tensor_set(m.mod_head, h.data(), s0 * rh, h.size());
-    ggml_backend_tensor_set(m.mod_w2,   w.data(), s0 * rw, w.size());
-    if (m.mod_w2_b) {
-        ggml_backend_tensor_set(m.mod_w2_b, b.data(), s0 * sizeof(float), b.size() * sizeof(float));
+    llama_mod_dict & d = *m.mod;
+    llama_dspark_dict_reset(ctx);
+    const int32_t n_res = d.n_slots - d.n_fixed;
+    const int32_t n_blocks = std::min(n_slots, n_res) / block;
+    if (n_blocks <= 0) {
+        return -1;
     }
-    ggml_backend_tensor_set(m.mod_ids,   ids.data(),  s0 * sizeof(int64_t), ids.size() * sizeof(int64_t));
-    ggml_backend_tensor_set(m.mod_ids_f, idf.data(),  s0 * sizeof(float),   idf.size() * sizeof(float));
-    ggml_backend_tensor_set(m.mod_mask,  mask.data(), s0 * sizeof(float),   mask.size() * sizeof(float));
-    d.n_used += k;
-    return k;
+    // the units: each family's tokens outside the fixed ones, in pieces of at most block tokens
+    int32_t n_fam = 0;
+    for (int32_t t = 0; t < n_fam_of; ++t) {
+        n_fam = std::max(n_fam, fam_of[t] + 1);
+    }
+    std::vector<std::vector<llama_token>> fam(n_fam);
+    for (int32_t t = 0; t < n_fam_of; ++t) {
+        if (fam_of[t] >= 0 && !d.slot_of.count(t)) {
+            fam[fam_of[t]].push_back(t);
+        }
+    }
+    d.unit_of.assign(n_fam_of, -1);
+    d.unit_tokens.clear();
+    for (const auto & f : fam) {
+        for (size_t i = 0; i < f.size(); i += block) {
+            d.unit_tokens.emplace_back(f.begin() + i, f.begin() + std::min(f.size(), i + block));
+            for (const llama_token t : d.unit_tokens.back()) {
+                d.unit_of[t] = (int32_t) d.unit_tokens.size() - 1;
+            }
+        }
+    }
+    d.block      = block;
+    d.n_blocks   = n_blocks;
+    d.ring_n     = n_res - n_blocks * block;
+    d.fam_beg    = d.ring_beg + d.ring_n;
+    d.ring_pos   = 0;
+    d.ring_tok.assign(d.ring_n, -1);
+    d.unit_block.assign(d.unit_tokens.size(), -1);
+    d.block_unit.assign(n_blocks, -1);
+    d.block_tok.assign((size_t) n_blocks * block, -1);
+    d.block_tick.assign(n_blocks, 0);
+    LLAMA_LOG_INFO("%s: MoD: %d families in %zu units, %d blocks of %d slots, %d slots for single tokens\n", __func__,
+        n_fam, d.unit_tokens.size(), n_blocks, block, d.ring_n);
+    return (int32_t) d.unit_tokens.size();
+}
+
+int32_t llama_dspark_dict_n_loads(const llama_context * ctx) {
+    const llama_model & m = ctx->get_model();
+    return m.mod ? m.mod->n_loads : -1;
 }
 
 void llama_dspark_dict_reset(llama_context * ctx) {
@@ -262,11 +450,7 @@ void llama_dspark_dict_reset(llama_context * ctx) {
         return;
     }
     llama_mod_dict & d = *m.mod;
-    if (d.n_used == d.n_fixed) {
-        return;
-    }
-    // the used reserve slots back to copies of slot 0, and out of the map
-    const int64_t id0 = d.sink;
+    // every slot past the fixed tokens free, and out of the map
     for (auto it = d.slot_of.begin(); it != d.slot_of.end(); ) {
         if (it->second >= d.n_fixed) {
             it = d.slot_of.erase(it);
@@ -274,23 +458,12 @@ void llama_dspark_dict_reset(llama_context * ctx) {
             ++it;
         }
     }
-    const int32_t n = d.n_used - d.n_fixed;
-    std::vector<uint8_t> h((size_t) n * m.mod_head->nb[1]), w((size_t) n * m.mod_w2->nb[1]);
-    std::vector<float>   b(n, d.row0_b);
-    std::vector<int64_t> ids(n, id0);
-    for (int32_t i = 0; i < n; ++i) {
-        memcpy(h.data() + (size_t) i * m.mod_head->nb[1], d.row0_head.data(), m.mod_head->nb[1]);
-        memcpy(w.data() + (size_t) i * m.mod_w2->nb[1],   d.row0_w2.data(),   m.mod_w2->nb[1]);
-    }
-    ggml_backend_tensor_set(m.mod_head, h.data(), (size_t) d.n_fixed * m.mod_head->nb[1], h.size());
-    ggml_backend_tensor_set(m.mod_w2,   w.data(), (size_t) d.n_fixed * m.mod_w2->nb[1],   w.size());
-    if (m.mod_w2_b) {
-        ggml_backend_tensor_set(m.mod_w2_b, b.data(), (size_t) d.n_fixed * sizeof(float), b.size() * sizeof(float));
-    }
-    ggml_backend_tensor_set(m.mod_ids, ids.data(), (size_t) d.n_fixed * sizeof(int64_t), ids.size() * sizeof(int64_t));
-    std::vector<float> idf(n, (float) id0);
-    ggml_backend_tensor_set(m.mod_ids_f, idf.data(), (size_t) d.n_fixed * sizeof(float), idf.size() * sizeof(float));
-    std::vector<float> mask(n, -INFINITY);
-    ggml_backend_tensor_set(m.mod_mask, mask.data(), (size_t) d.n_fixed * sizeof(float), mask.size() * sizeof(float));
-    d.n_used = d.n_fixed;
+    std::vector<llama_token> none(d.n_slots - d.n_fixed, -1);
+    mod_write(d, m, d.n_fixed, none.data(), (int32_t) none.size());
+    d.ring_pos = 0;
+    std::fill(d.ring_tok.begin(), d.ring_tok.end(), -1);
+    std::fill(d.unit_block.begin(), d.unit_block.end(), -1);
+    std::fill(d.block_unit.begin(), d.block_unit.end(), -1);
+    std::fill(d.block_tok.begin(), d.block_tok.end(), -1);
+    std::fill(d.block_tick.begin(), d.block_tick.end(), 0);
 }
