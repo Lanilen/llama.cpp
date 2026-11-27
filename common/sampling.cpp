@@ -125,6 +125,27 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // a backend sampler's token leaves cur_p unfilled: copying its probabilities (the whole vocabulary when nothing
+    // filters it, 200k for Inkling) cost ~0.4 ms a verified position; get_candidates fills it from here when asked,
+    // before the context's next decode
+    struct llama_context * lazy_ctx = nullptr;
+    int                    lazy_idx = -1;
+    llama_token            lazy_id  = LLAMA_TOKEN_NULL;
+
+    void fill_lazy() {
+        if (lazy_ctx == nullptr) {
+            return;
+        }
+        set_logits(lazy_ctx, lazy_idx);
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            if (cur_p.data[i].id == lazy_id) {
+                cur_p.selected = i;
+                break;
+            }
+        }
+        lazy_ctx = nullptr;
+    }
+
     void reset() {
         prev.clear();
 
@@ -524,7 +545,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * res = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -534,6 +555,11 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
     };
+    res->cur_p.data = gsmpl->cur_p.data ? res->cur.data() : nullptr; // re-point to the clone's buffer
+    res->lazy_ctx = gsmpl->lazy_ctx;
+    res->lazy_idx = gsmpl->lazy_idx;
+    res->lazy_id  = gsmpl->lazy_id;
+    return res;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -554,6 +580,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    dst->lazy_ctx   = src->lazy_ctx;
+    dst->lazy_idx   = src->lazy_idx;
+    dst->lazy_id    = src->lazy_id;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -624,10 +653,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
     // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
+    // return that token id directly (its candidates are filled only if asked for, see fill_lazy).
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
@@ -637,16 +664,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
-                }
-            }
+            gsmpl->lazy_ctx = ctx;
+            gsmpl->lazy_idx = idx;
+            gsmpl->lazy_id  = id;
 
             return id;
         }
     }
+
+    gsmpl->lazy_ctx = nullptr;
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -789,10 +816,113 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         lap(tm.t_sample);
 
+        const auto & q = draft_q[i];
+
+        // the target sampled on the backend (-bs): its probabilities and candidates are read where they are, without
+        // the copy into the candidate array (the whole vocabulary when nothing filters it: ~0.4 ms a position) and
+        // without walking the vocabulary for the residual (~1 ms a rejection at 200k)
+        if (gsmpl->lazy_ctx == ctx && gsmpl->lazy_idx == idxs[i]) {
+            const float       * bp = llama_get_sampled_probs_ith(ctx, idxs[i]);
+            const llama_token * bc = llama_get_sampled_candidates_ith(ctx, idxs[i]);
+            const uint32_t      bn = bp ? llama_get_sampled_probs_count_ith(ctx, idxs[i]) : 0;
+            if (bp != nullptr && bc != nullptr && bn > 0) {
+                // the unfiltered vocabulary comes in id order; a filtered one (top-k ...) is short
+                const auto p_tok = [&](llama_token t) -> float {
+                    if (t >= 0 && (uint32_t) t < bn && bc[t] == t) {
+                        return bp[t];
+                    }
+                    for (uint32_t k = 0; k < bn; ++k) {
+                        if (bc[k] == t) {
+                            return bp[k];
+                        }
+                    }
+                    return 0.0f;
+                };
+                const float q_x = prob_of(q.data(), q.size(), draft[i]);
+                const float p_x = p_tok(draft[i]);
+                if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+                    common_sampler_accept(gsmpl, draft[i], true);
+                    result.push_back(draft[i]);
+                    lap(tm.t_accept);
+                    continue;
+                }
+                lap(tm.t_accept);
+                tm.rejections++;
+
+                // the residual max(0, p - q), normalized: inside q's support from q's list; outside it p itself, whose
+                // mass is 1 - p(support). Outside, the backend's own draw from p is taken when it landed there, else
+                // p is walked without the support: P(x) = p_x + P(draw in support) p_x / s_out = p_x / s_out, exact
+                static thread_local std::vector<float> r_in;
+                r_in.assign(q.size(), 0.0f);
+                float s_in = 0.0f, p_supp = 0.0f;
+                bool tgt_in_supp = false;
+                for (size_t k = 0; k < q.size(); ++k) {
+                    if (q[k].id < 0) {
+                        continue;
+                    }
+                    const float pe = p_tok(q[k].id);
+                    p_supp += pe;
+                    r_in[k] = std::max(0.0f, pe - q[k].p);
+                    s_in += r_in[k];
+                    tgt_in_supp = tgt_in_supp || q[k].id == id_tgt;
+                }
+                const float s_out = std::max(0.0f, 1.0f - p_supp);
+
+                llama_token id = id_tgt;
+                if (s_in + s_out > 0.0f) {
+                    float u = uni(gsmpl->rng) * (s_in + s_out);
+                    if (u < s_in) {
+                        for (size_t k = 0; k < q.size(); ++k) {
+                            if (r_in[k] > 0.0f) {
+                                id = q[k].id;
+                                u -= r_in[k];
+                                if (u <= 0.0f) {
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (tgt_in_supp) {
+                        static thread_local std::vector<uint8_t> in_q;
+                        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+                        if ((int32_t) in_q.size() < n_vocab) {
+                            in_q.assign(n_vocab, 0);
+                        }
+                        for (const auto & e : q) {
+                            if (e.id >= 0 && e.id < n_vocab) {
+                                in_q[e.id] = 1;
+                            }
+                        }
+                        float u2 = uni(gsmpl->rng) * s_out;
+                        for (uint32_t k = 0; k < bn; ++k) {
+                            const llama_token t = bc[k];
+                            if (t < 0 || t >= n_vocab || in_q[t]) {
+                                continue;
+                            }
+                            id = t;
+                            u2 -= bp[k];
+                            if (u2 <= 0.0f) {
+                                break;
+                            }
+                        }
+                        for (const auto & e : q) {
+                            if (e.id >= 0 && e.id < n_vocab) {
+                                in_q[e.id] = 0;
+                            }
+                        }
+                    }
+                }
+
+                common_sampler_accept(gsmpl, id, true);
+                result.push_back(id);
+                lap(tm.t_residual);
+
+                break;
+            }
+        }
+
         // unsorted: the test, the residual and its draw need no order (a sort of the vocabulary's candidates at every
         // position was ~23 ms a verify on the 1920X, more than the step itself)
         const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
-        const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
         if (masked) {
@@ -929,6 +1059,8 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
     const auto tm = gsmpl->tm();
+
+    gsmpl->fill_lazy();
 
     auto * res = &gsmpl->cur_p;
 
