@@ -10975,16 +10975,18 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     const bool kv_rows;     // all streams read one K/V cache of 2*kv rows through kv_rows
     const bool sinks;
     const ggml_type type_KV;
-    const bool causal;      // prefix of 0 per query, -inf after, distance bins
-    const int64_t n_kv_max; // sparse hint
     const float logit_softcap;
     const bool mask_row;    // query 0 of each stream sees no key
+    const bool causal;      // prefix of 0 per query, -inf after, distance bins
+    const int64_t n_kv_max; // sparse hint
+    const bool causal;      // prefix of 0 per query, -inf after, distance bins
+    const int64_t n_kv_max; // sparse hint
 
     std::vector<int32_t> rows;
     std::vector<int64_t> visible;
 
     std::string vars() override {
-        return VARS_TO_STR14(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, causal, n_kv_max, logit_softcap, mask_row);
+        return VARS_TO_STR14(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, logit_softcap, mask_row, causal, n_kv_max);
     }
 
     double max_nmse_err() override {
@@ -10993,9 +10995,9 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
 
     test_flash_attn_ext_indexed_bias(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 3, int64_t kv = 768, int64_t nb = 7, int64_t n_stream = 2,
                                      int64_t n_bins = 17, bool kv_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16,
-                                     bool causal = false, int64_t n_kv_max = 0, float logit_softcap = 0.0f, bool mask_row = false)
+                                     float logit_softcap = 0.0f, bool mask_row = false, bool causal = false, int64_t n_kv_max = 0)
         : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_bins(n_bins), kv_rows(kv_rows), sinks(sinks), type_KV(type_KV),
-          causal(causal), n_kv_max(n_kv_max), logit_softcap(logit_softcap), mask_row(mask_row) {}
+          logit_softcap(logit_softcap), mask_row(mask_row), causal(causal), n_kv_max(n_kv_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -11053,6 +11055,15 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
             }
         }
 
+        visible.assign(nb*n_stream, kv);
+        if (causal) {
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t j = 0; j < nb; ++j) {
+                    visible[s*nb + j] = kv/2 + (j + 1)*(kv/2)/nb - 37*s;
+                }
+            }
+        }
+
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "r") == 0) {
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
@@ -11068,13 +11079,13 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
                             visible[s*nb + j] = kv/2 + (j + 1)*(kv/2)/nb - 37*s;
                         }
                         for (int64_t i = 0; i < kv; ++i) {
-                            const bool pad = kv_rows && rows[s*kv + i] < 0;
+                            const bool masked = (kv_rows && rows[s*kv + i] < 0) || (mask_row && j == 0);
                             if (causal) {
-                                f[(s*nb + j)*kv + i] = pad || i >= visible[s*nb + j] ? -INFINITY : 0.0f;
+                                f[(s*nb + j)*kv + i] = masked || i >= visible[s*nb + j] ? -INFINITY : 0.0f;
                                 continue;
                             }
-                            const bool drop = (i + 3*j + 5*s) % 11 == 0 || (mask_row && j == 0);
-                            f[(s*nb + j)*kv + i] = pad || drop ? -INFINITY : dis(gen);
+                            const bool drop = (i + 3*j + 5*s) % 11 == 0;
+                            f[(s*nb + j)*kv + i] = masked || drop ? -INFINITY : dis(gen);
                         }
                     }
                 }
@@ -15413,17 +15424,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (int64_t nb : {1, 7}) {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 700, nb, 2, 17, kv_rows));
-            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, true,  GGML_TYPE_F16, false, 0, 10.0f));
-            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, false, GGML_TYPE_F16, false, 0, 0.0f, true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, true,  GGML_TYPE_F16, 10.0f));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, nb, 2, 17, kv_rows, false, GGML_TYPE_F16, 0.0f, true));
         }
     }
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
         for (int64_t nb : {1, 4, 64}) {
-            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 2048, nb, 2, 33, false, true, type, true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 2048, nb, 2, 33, false, true, type, 0.0f, false, true));
         }
     }
     for (int64_t nb : {1, 4}) {
-        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 4096, nb, 2, 33, false, true, GGML_TYPE_F16, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 4096, nb, 2, 33, false, true, GGML_TYPE_F16, 0.0f, false, false, 512));
     }
     test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(256, 2, 3, 768, 65, 2, 17));
     for (int64_t hs : {128, 256}) {
@@ -15431,16 +15442,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(hs, 2, 3, 1000, nb, 2, 17));
         }
     }
-    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1100, 256, 2, 33, false, true, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1100, 256, 2, 33, false, true, GGML_TYPE_F16, 0.0f, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100,   7, 2, 33, false, true, GGML_TYPE_Q8_0));
     // Inkling 2 Mini's own shape: 24 heads over 8 K/V heads, 1025 bins, causal, one stream; a prompt's 512 rows take the
     // coopmat1 flip path with F16 K/V and the mask_opt tiles, the SWA cache's 1024 + ubatch cells
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (int64_t nb : {1, 4, 512}) {
-            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 4096, nb, 1, 1025, false, true, type, true));
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 4096, nb, 1, 1025, false, true, type, 0.0f, false, true));
         }
     }
-    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1536, 512, 1, 1025, false, true, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1536, 512, 1, 1025, false, true, GGML_TYPE_F16, 0.0f, false, true));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
