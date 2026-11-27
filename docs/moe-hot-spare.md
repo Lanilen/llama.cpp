@@ -783,6 +783,36 @@ GiB, uploads and waits.
 **On the ladder** (rung 6, with the split) the 18.6k-token prompt, which releases the cache, goes from 223 to 208 s on
 the 1920X + RX480x2, and from 41.8 to 35.4 s (Q4) and from 50.9 to 40.0 s (Q6) on the 1920X + R9700.
 
+### Released prompts: the prefetch into slots
+
+*Built on `polaris` (branch `ti-prefill`).*
+
+The fast copies still wait at every expert tensor: the scheduler waits for the split's backend to finish before it
+copies an input (a full synchronize when there are no pipeline events), the copy reads the router's picks back to
+copy only the experts used, the fast copy drains the backend because its destination shares the compute buffer, and
+the hot spare records each layer's picks on the CPU (a CPU split that waits for the GPU at every layer). So a layer's
+upload never runs while the GPU computes. `LLAMA_OFFLOAD_PREFETCH=1` removes those waits for a released batch:
+- the scheduler calls a new early copy hook (`ggml_backend_sched_set_copy_callback_early`) for a host weight before
+  its wait for the backend;
+- each expert tensor goes whole into the next of a ring of device slots of its own (`LLAMA_OFFLOAD_PREFETCH_SLOTS`,
+  3, each the size of the largest expert tensor, with a tail for the tensor's scales), through the cache's staging
+  and background uploads, and the operation reads it there; the host waits only for the slot's previous tensor's
+  operation to finish, on an event;
+- the batch doesn't record the picks;
+- the slots go with the large batches' buffers, before the cache comes back.
+
+A looped model's expert tensors serve several passes, so the scheduler made one copy of each for the whole graph and
+kept it across the loop (6.9 GB of Inkling 2 Mini's 7.9 GB prompt buffer), and the prefetch's slots would be reused
+under it. With `LLAMA_LOOP_EXPS_COPY=1` the passes after the first read their experts, and their NVFP4 scales,
+through aliases of the same host data, each with a copy of its own; `LLAMA_LOOP_EXPS_COPY_MIN=N` uses them from N
+tokens a batch (above `--moe-cache-batch`, so that kept batches still find the cache's experts). Inkling 2 Mini's
+prompt buffer goes from 7.9 to 1.7 GB.
+
+On the 14600KF + RTX 4070 Ti, Inkling 2 Mini UD-Q4_K_XL with the cache released above 512 tokens at `-ub 2048`: the
+review's 3.6k-token prompt reads at 712–726 tok/s with the prefetch and the aliases, 466–472 without them; the
+perplexity of released batches is the same to the last digit with and without them
+([Inkling 2 Mini's guide](inkling2-mini.md#released-prompts-and-the-drafter-on-the-rtx-4070-ti)).
+
 ## Speculative decoding with MTP
 
 Models with a multi-token prediction head draft tokens with it (`--spec-type draft-mtp`), for example
@@ -1024,6 +1054,7 @@ and the other options.
 | Variable | Effect |
 | --- | --- |
 | `GGML_SCHED_TIMING=1` | at exit, time per graph in each backend's copies (and how long they waited for each other backend) and computes |
+| `GGML_SCHED_TIMING_EACH=N` | with `GGML_SCHED_TIMING=1`: print each graph of N splits or more as it ends, and start its count again |
 | `GGML_VK_HOST_TIMING=1` | Vulkan: host time of each graph_compute by phase, and its queue submits |
 | `GGML_VK_PERF_LOGGER=1` | Vulkan (upstream): GPU time of each operation; it adds a barrier per operation, so short operations look longer than they are |
 | `LLAMA_MOE_TRACE_OFF=1` | `llama-moe-trace` runs without recording, to time the same run |
@@ -1116,6 +1147,10 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `LLAMA_MOE_CACHE_VERIFY=1` | read every resident expert back at exit and before each release, once every upload is done, and compare it with the host weights; prints the count to stderr (slow) |
 | `LLAMA_OFFLOAD_FAST_CHECK=1` | with `LLAMA_OFFLOAD_FAST=1`: wait for the fast copies' uploads, read every part back and compare it with the host weights, report at exit (slow) |
 | `LLAMA_OFFLOAD_COPY_STATS=1` | at exit, the time the scheduler's expert copies took and the GiB they uploaded |
+| `LLAMA_OFFLOAD_PREFETCH=1` | a released batch's host experts go whole into a ring of device slots of their own, without the copies' waits ([The prefetch into slots](#released-prompts-the-prefetch-into-slots)) |
+| `LLAMA_OFFLOAD_PREFETCH_SLOTS=N` | with the prefetch: the slots in the ring (default 3) |
+| `LLAMA_LOOP_EXPS_COPY=1` | a looped model's later passes read their experts and scales through aliases, each pass its own copy (needed by the prefetch on such a model) |
+| `LLAMA_LOOP_EXPS_COPY_MIN=N` | with `LLAMA_LOOP_EXPS_COPY`: from N tokens a batch (default 32) |
 | `GGML_CPU_OP_STATS=1` | at exit, per batch size, each CPU op's wall time, its threads' work, and MUL_MAT_ID's experts and GB/s by weight type |
 | `GGML_CPU_MMID_PREFETCH=R` | the CPU's MUL_MAT_ID prefetches its weights R rows ahead; slower on the 1920X, kept to measure other CPUs |
 

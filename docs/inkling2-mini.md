@@ -31,6 +31,7 @@ What the fork adds for it:
 - [Whole on one GPU: 1920X + R9700](#whole-on-one-gpu-1920x--r9700)
 - [Long context](#long-context)
 - [Speculative decoding with its DSpark drafter](#speculative-decoding-with-its-dspark-drafter)
+  - [The Draft Kit: a dictionary and a learned exit](#the-draft-kit-a-dictionary-and-a-learned-exit)
 - [What a token waits on](#what-a-token-waits-on)
 - [Tried and not kept](#tried-and-not-kept)
 - [Still to measure](#still-to-measure)
@@ -103,7 +104,7 @@ second in 10.4 GB.**
 | setting | why |
 | --- | --- |
 | `-ngl 99 -ot _exps=CPU` | attention and the rest on the GPU, the experts in system memory |
-| `--no-op-offload` | **needed on NVIDIA.** Without it, a prompt's ubatch reserves 8.5–10 GB for whole copies of the looped layers' experts, which the driver refuses ([Looped models](moe-hot-spare.md#looped-models)); with it, the compute buffer is 0.65 GB |
+| `--no-op-offload` | **needed on NVIDIA when prompts keep the cache,** as here. Without it, a prompt's ubatch reserves 8.5–10 GB for whole copies of the looped layers' experts beside the cache, which the driver refuses ([Looped models](moe-hot-spare.md#looped-models)); with it, the compute buffer is 0.65 GB. Not needed for [released prompts](#released-prompts-and-the-drafter-on-the-rtx-4070-ti) |
 | `-t 6` | the performance cores. More threads put work on the efficiency cores, and every expert op waits for the slowest thread (below) |
 | `-b 512 -ub 512`, `--moe-cache-batch 16384` | prompts keep the hot spare: the cache is released for a batch larger than `--moe-cache-batch`, judged on the whole batch the server hands over |
 | `--moe-cache-mib 3500` | the hot spare's size (below) |
@@ -147,6 +148,43 @@ in either mode, and the whole requests take 100 s and 75 s (3500), 78 s and 49 s
 
 **Threads** (the requantized Q4_K_M, the same settings with `--moe-cache-jit 8`): 6 threads read prompts at 118 tokens
 a second and generate at 31–32; 8 threads 82 and 28; 12 threads 101 and 28; 14 threads 99 and 23–27.
+
+### Released prompts and the drafter on the RTX 4070 Ti
+
+The settings above keep the cache for every prompt, so its misses run on the CPU and a 3.6k-token prompt reads at
+about 60 tokens a second. Prompts above 512 tokens can instead release the cache and run on the GPU with op offload, and
+with the prefetch (`LLAMA_OFFLOAD_PREFETCH=1`) their experts upload while the GPU computes the layers before
+([Released prompts](moe-hot-spare.md#released-prompts-the-prefetch-into-slots)). With the drafter and
+[the Draft Kit](#the-draft-kit-a-dictionary-and-a-learned-exit):
+
+```bash
+GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 LLAMA_GRAPH_CACHE=8 \
+LLAMA_OFFLOAD_FAST=1 LLAMA_LOOP_EXPS_COPY=1 LLAMA_LOOP_EXPS_COPY_MIN=513 LLAMA_OFFLOAD_PREFETCH=1 \
+llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  -ngl 99 -ot _exps=CPU -t 6 -c 16384 -b 2048 -ub 2048 \
+  --moe-cache-mode hot-spare --moe-cache-mib 6900 --moe-cache-resize --moe-cache-batch 512 \
+  --moe-cache-predictor inkling2-pred-v5.moepred --moe-cache-predictor-start inkling2-start-v5.moepred \
+  --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8 \
+  -md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 4 -ngld 99 \
+  --spec-draft-dict inkling2-dict-24k.txt --spec-draft-dict-families inkling2-families-1024.txt \
+  --spec-draft-exit-model inkling2-exit-v1.txt -bs
+```
+
+The two everyday requests, warm, two passes, the build of 2026-11-27 with a 6900 MiB cache (a 0.55 GB desktop on the
+card):
+
+| | review: answer, prompt | notes: answer, prompt | VRAM at peak |
+| --- | --- | --- | --- |
+| prompts kept (the settings above, no drafter) | 25.2–25.6, 59–61 tok/s | 24.3–25.2, 94–95 | 10.3 GB |
+| released, without the prefetch, no drafter | 23.0–25.3, 466–472 | 23.5–25.0, 412–425 | 10.7 GB |
+| released with the prefetch, no drafter | 23.9, 719 | 23.8, 653 | 10.4 GB |
+| + the shipped drafter | 32.5, 700 | 38.4, 635 | 11.3 GB |
+| + the drafter with the Draft Kit and `-bs` | **39.4, 687** | **42.1, 635** | 11.4 GB |
+
+At the model's sampling (temperature 1.0, top-p 1.0, top-k 0; medians of five passes): 22.9 / 28.7 / **34.6** tok/s on
+the review and 23.4 / 29.4 / **34.4** on the notes, without a drafter / with the shipped one / with the kit.
+`--no-op-offload` is left out: with the cache released, op offload's buffers fit. A 12 GB card with a minimal desktop
+may take a larger cache with the drafter; 11.4 GB at 6900 MiB leaves about 0.9 GB.
 
 ## One RX 480: 1920X + RX 480
 
@@ -362,6 +400,45 @@ the first 18 layer visits (the first six layers and the first pass). Inkling's p
 and on one RX 480 with the hot spare and the predictor, the build with the drafter's support gives the same hits,
 predictions and text as the build without it. A predictor that read a later layer would collide with the drafter's
 taps.
+
+### The Draft Kit: a dictionary and a learned exit
+
+Two additions to the DSpark drafter, in [Inkling-2-Mini-Draft-Kit](https://huggingface.co/Lanilen/Inkling-2-Mini-Draft-Kit)
+on Hugging Face ([FORK.md](../FORK.md#drafting-over-a-dictionary-with-a-learned-exit) has the options). The target still
+verifies every drafted token over its whole vocabulary, so the answers are the model's own.
+- **The dictionary** (`--spec-draft-dict inkling2-dict-24k.txt --spec-draft-dict-families inkling2-families-1024.txt`):
+  the drafter drafts over about 35k tokens instead of 200k: the 24,576 most frequent tokens of Inkling's answers, a
+  ring of 2,048 for the prompt's and the answer's other tokens, and 32 blocks of 256 for token families (clusters of
+  the output head's rows) that an answer token outside the dictionary loads, the least recently used out. The
+  drafter's graph goes from 3.04 to 1.49 ms on the R9700 at 4 drafts; across seven kinds of text, four of them other
+  languages, the drafts accepted are the same within a fraction of a percent.
+- **The learned exit** (`--spec-draft-exit-model inkling2-exit-v1.txt`, in place of `--spec-draft-p-min`): a LightGBM
+  model (300 trees, 33 inputs: the drafter's candidates at each position, the token's kind, and the request's recent
+  acceptance) stops a draft before the first token it predicts rejected, at a probability of 0.5. The first token is
+  kept. Over the 0.8 stop: +1.9% at temperature 0, +2.2% at 1.0 on 35 varied prompts.
+- **`-bs`** (the target's sampling on the GPU, an upstream option): +5.4% at temperature 0 and +4.5% at 1.0 on the
+  same prompts, with the same answers at temperature 0. It reads prompts about 6% slower, from graph reallocations that
+  grow request by request, still to fix.
+
+Checks: `LLAMA_MOD_CHECK=1` reads the dictionary's slots back after each change and compares them with the host's map;
+`LLAMA_MOD_FULL_LOGITS=1` scatters the drafter's logits to the whole vocabulary as before the slot sampler;
+`LLAMA_SPEC_EXIT_LOG=FILE` writes each exit decision's 33 inputs and probability and `LLAMA_SPEC_CAP_LOG=FILE` each cap's 19 (the kit's
+`inkling2-exit-v1-check.txt` has rows to check an implementation of the exit against).
+
+The everyday requests at temperature 0, answers in tokens a second (no drafter / the shipped drafter, 4 drafts, no stop /
+with the kit and `-bs`):
+
+| | review | notes | review ÷ notes, shipped / kit |
+| --- | --- | --- | --- |
+| R9700, UD-Q4_K_XL whole | 64.1 / 69.1 / **92.9** | 64.3 / 82.7 / **96.6** | 0.84 / 0.96 |
+| RTX 4070 Ti, the hot spare at 6900 MiB | 23.9 / 32.5 / **39.4** | 23.8 / 38.4 / **42.1** | 0.85 / 0.93 |
+| one RX 480, the hot spare at 5000 MiB | 14.6 / 15.9 / **22.0** | 14.6 / 19.4 / **22.4** | 0.82 / 0.98 |
+
+The shipped drafter slows down on text it predicts badly (the review): it verifies four drafts every step, and on hard
+text most are rejected. The exit stops those drafts, so hard text runs almost as fast as easy text, and the kit's gain
+over no drafter is 1.8x the shipped drafter's on the review on the RTX 4070 Ti, and 2.0x at temperature 1.0. On the
+RX 480 the kit fits the 8 GB card (8.15 GB of VRAM at peak) with the cache's hits at 78.8% (80.2% with the shipped
+drafter).
 
 ## What a token waits on
 
