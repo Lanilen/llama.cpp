@@ -535,6 +535,14 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
 
     ggml_tensor * cur = build_layers(inp_tokens);
 
+    // Inkling's drafter (f_rnn) runs token graphs only as draft blocks, with the Markov state; a token graph without it
+    // is the context's reserve at n_ubatch tokens, every row an output (the context computes embeddings): its logits
+    // took n_ubatch x 200k floats, three times that with MoD's scatter (5.3 GB at -ub 2048), for a graph that never runs.
+    // Its rows are capped at the largest draft batch (8 sequences x 8 block positions).
+    if (hparams.dspark_f_rnn && !rnn_state && cur->ne[1] > 64) {
+        cur = ggml_view_2d(ctx0, cur, cur->ne[0], 64, cur->nb[1], 0);
+    }
+
     // MoD: the logits stay over the dictionary's slots when the Markov head runs (it scatters them at its end)
     build_logits(cur, model.mod_head && (!hparams.dspark_f_rnn || rnn_state));
 
