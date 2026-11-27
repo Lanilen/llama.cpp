@@ -43,14 +43,15 @@ drafter / with the kit):
 | | review | notes |
 | --- | --- | --- |
 | 1920X + R9700, the model whole | 64.1 / 69.1 / **92.9** | 64.3 / 82.7 / **96.6** |
-| 14600KF + RTX 4070 Ti, the hot spare at 6900 MiB | 23.9 / 32.5 / **39.4** | 23.8 / 38.4 / **42.1** |
+| 14600KF + RTX 4070 Ti, the hot spare at 8000 MiB, a minimal desktop | 35.1 / 56.9 / **59.7** | 35.9 / 55.3 / **63.6** |
 | 1920X + RX 480, the hot spare at 5000 MiB | 14.6 / 15.9 / **22.0** | 14.6 / 19.4 / **22.4** |
 
-At the preset's temperature 1.0 on the RTX 4070 Ti (medians of five passes): 22.9 / 28.7 / **34.6** (review),
-23.4 / 29.4 / **34.4** (notes): the kit's gain over no drafter is 2.0x and 1.8x the shipped drafter's there.
+At the preset's temperature 1.0 on the RTX 4070 Ti (medians of five passes): 34.9 / 42.3 / **51.4** (review),
+34.8 / 47.8 / **52.8** (notes): the kit's gain over no drafter is 2.2x and 1.4x the shipped drafter's there. With a full
+desktop session on the card every arm was about a third slower.
 
 **The RTX 4070 Ti's prompts**, released with the prefetch (`-b 2048 -ub 2048 --moe-cache-batch 512`, op offload on):
-the review's 3.6k tokens at 712–726 tok/s and the notes' 3.3k at 649–659, against 59–61 and 94–95 with the cache
+the review's 3.6k tokens at 723–729 tok/s and the notes' 3.3k at 648–651, against 67–68 and 117 with the cache
 kept; generation the same within a few percent.
 
 ## 2026-11-23: upstream merge

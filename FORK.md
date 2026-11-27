@@ -166,8 +166,8 @@ depends on its size:
   CPU's record of the picks, so a layer's upload runs while the GPU computes the layers before it. A looped model's
   later passes need `LLAMA_LOOP_EXPS_COPY=1`, which gives each pass its own copy of the experts and their scales
   (`LLAMA_LOOP_EXPS_COPY_MIN`: from that many tokens a batch); it also cuts Inkling 2 Mini's prompt buffer from 7.9 to
-  1.7 GB. On the 14600KF + RTX 4070 Ti, Inkling 2 Mini's 3.6k-token prompt reads at 712–726 tok/s released with the
-  prefetch, 466–472 without it and 59–61 with the cache kept.
+  1.7 GB. On the 14600KF + RTX 4070 Ti, Inkling 2 Mini's 3.6k-token prompt reads at 723–729 tok/s released with the
+  prefetch, 466–472 without it and 67–68 with the cache kept.
 
 A batch that keeps the cache doesn't swap experts, since its resident set was picked for generation. With
 `--moe-cache-jit N`, each layer uploads its missing experts that at least N of its tokens select, just before it runs,
@@ -259,10 +259,11 @@ target verifies every drafted token over its whole vocabulary.
   history; it lost live and is off by default.
 
 With `-bs` (the target's sampling on the GPU), on the everyday requests at temperature 0 (no drafter / the shipped
-drafter / with both): review 64.1 / 69.1 / **92.9** and notes 64.3 / 82.7 / **96.6** tok/s on the 1920X + R9700, 23.9 /
-32.5 / **39.4** and 23.8 / 38.4 / **42.1** on the 14600KF + RTX 4070 Ti, 14.6 / 15.9 / **22.0** and 14.6 / 19.4 /
+drafter / with both): review 64.1 / 69.1 / **92.9** and notes 64.3 / 82.7 / **96.6** tok/s on the 1920X + R9700, 35.1 /
+56.9 / **59.7** and 35.9 / 55.3 / **63.6** on the 14600KF + RTX 4070 Ti, 14.6 / 15.9 / **22.0** and 14.6 / 19.4 /
 **22.4** on the 1920X + one RX 480. The gain is largest where drafts land least: on hard text and at temperature 1.0
-(on the RTX 4070 Ti the kit's gain over no drafter is 2.0x the shipped drafter's on the review there).
+(the kit's gain over no drafter is 1.4–2.2x the shipped drafter's there); on text the shipped drafter already drafts
+well it is 5–15% ahead.
 
 ### The CPU's experts
 
@@ -563,7 +564,7 @@ GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 LLAMA_GRAPH_CACHE=8 \
 LLAMA_OFFLOAD_FAST=1 LLAMA_LOOP_EXPS_COPY=1 LLAMA_LOOP_EXPS_COPY_MIN=513 LLAMA_OFFLOAD_PREFETCH=1 \
 llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   -ngl 99 -ot _exps=CPU -t 6 -c 16384 -b 2048 -ub 2048 \
-  --moe-cache-mode hot-spare --moe-cache-mib 6900 --moe-cache-resize --moe-cache-batch 512 \
+  --moe-cache-mode hot-spare --moe-cache-mib 8000 --moe-cache-resize --moe-cache-batch 512 \
   --moe-cache-predictor inkling2-pred-v5.moepred --moe-cache-predictor-start inkling2-start-v5.moepred \
   --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8 \
   -md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 4 -ngld 99 \
@@ -571,8 +572,9 @@ llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   --spec-draft-exit-model inkling2-exit-v1.txt -bs
 ```
 
-On the everyday requests, answers at 39.4 (review) and 42.1 (notes) tokens a second, prompts at 687 and 635, 11.4 GB
-of VRAM at peak with a 0.55 GB desktop; without the drafter 23.9 and 23.8. Prompts above 512 tokens release the cache
+On the everyday requests, answers at 59.7 (review) and 63.6 (notes) tokens a second, prompts at 704–709 and 639–646,
+11.7 GB of VRAM at peak with a minimal desktop (0.1 GB); without the drafter 35.1 and 35.9. A full desktop session on
+the same card costs about a third of that. Prompts above 512 tokens release the cache
 and run with op offload at `-ub 2048` (`--no-op-offload` was needed when they kept it); the prefetch and the aliases
 make that release 1.5x faster. The predictor is for chat requests: for raw completion, leave out the two
 `--moe-cache-predictor` files. `-t 6` is the CPU's performance cores, and the cache size follows the free VRAM. The

@@ -162,7 +162,7 @@ GOMP_SPINCOUNT=30000000 GGML_CPU_MMID_FLAT=128 LLAMA_GRAPH_CACHE=8 \
 LLAMA_OFFLOAD_FAST=1 LLAMA_LOOP_EXPS_COPY=1 LLAMA_LOOP_EXPS_COPY_MIN=513 LLAMA_OFFLOAD_PREFETCH=1 \
 llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   -ngl 99 -ot _exps=CPU -t 6 -c 16384 -b 2048 -ub 2048 \
-  --moe-cache-mode hot-spare --moe-cache-mib 6900 --moe-cache-resize --moe-cache-batch 512 \
+  --moe-cache-mode hot-spare --moe-cache-mib 8000 --moe-cache-resize --moe-cache-batch 512 \
   --moe-cache-predictor inkling2-pred-v5.moepred --moe-cache-predictor-start inkling2-start-v5.moepred \
   --moe-cache-predictor-device Vulkan0 --moe-cache-refill 0 --moe-cache-predictor-answer-gain 8 \
   -md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 4 -ngld 99 \
@@ -170,21 +170,28 @@ llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
   --spec-draft-exit-model inkling2-exit-v1.txt -bs
 ```
 
-The two everyday requests, warm, two passes, the build of 2026-11-27 with a 6900 MiB cache (a 0.55 GB desktop on the
-card):
+The two everyday requests, warm, two passes, the build of 2026-11-27 with an 8000 MiB cache and a minimal desktop on
+the card (0.1 GB), PowerMizer on "Prefer Maximum Performance":
 
 | | review: answer, prompt | notes: answer, prompt | VRAM at peak |
 | --- | --- | --- | --- |
-| prompts kept (the settings above, no drafter) | 25.2–25.6, 59–61 tok/s | 24.3–25.2, 94–95 | 10.3 GB |
-| released, without the prefetch, no drafter | 23.0–25.3, 466–472 | 23.5–25.0, 412–425 | 10.7 GB |
-| released with the prefetch, no drafter | 23.9, 719 | 23.8, 653 | 10.4 GB |
-| + the shipped drafter | 32.5, 700 | 38.4, 635 | 11.3 GB |
-| + the drafter with the Draft Kit and `-bs` | **39.4, 687** | **42.1, 635** | 11.4 GB |
+| prompts kept (the settings above, no drafter) | 35.7–36.9, 67–68 tok/s | 36.4–37.1, 117 | 10.8 GB |
+| released with the prefetch, no drafter | 34.7–35.6, 723–729 | 35.8–35.9, 648–651 | 11.1 GB |
+| + the shipped drafter | 54.3–59.5, 704–706 | 54.3–56.3, 640–644 | 11.6 GB |
+| + the drafter with the Draft Kit and `-bs` | **59.6–59.8, 704–709** | **63.1–64.1, 639–646** | 11.7 GB |
 
-At the model's sampling (temperature 1.0, top-p 1.0, top-k 0; medians of five passes): 22.9 / 28.7 / **34.6** tok/s on
-the review and 23.4 / 29.4 / **34.4** on the notes, without a drafter / with the shipped one / with the kit.
-`--no-op-offload` is left out: with the cache released, op offload's buffers fit. A 12 GB card with a minimal desktop
-may take a larger cache with the drafter; 11.4 GB at 6900 MiB leaves about 0.9 GB.
+The prompts read 10.8x (the review) and 5.5x (the notes) faster released with the prefetch than kept; without the
+prefetch, released, they read at 466–472 and 412–425. Generation after a released prompt is about 3% slower than with
+the cache kept (the restore, still to look at). At the model's sampling (temperature 1.0, top-p 1.0, top-k 0; medians
+of five passes): 34.9 / 42.3 / **51.4** tok/s on the review and 34.8 / 47.8 / **52.8** on the notes, without a drafter
+/ with the shipped one / with the kit. `--no-op-offload` is left out: with the cache released, op offload's buffers
+fit. The cache: 6900 / 7500 / 8000 / 8500 MiB serve 87.6 / 89.7 / 91.0 / 92.3% of the selections with the kit, at
+10.9 / 11.5 / 11.7 / 11.8 GB, with answers the same within the runs' spread from 7500 up.
+
+**The desktop on the same GPU costs about a third of the speed** with the experts in RAM: with a full desktop session
+on the card (0.55 GB, the same PowerMizer setting) every arm generated about a third slower, 23.9 / 32.5 / 39.4 and
+23.8 / 38.4 / 42.1 tok/s at 6900 MiB, the prompts the same. A generated token is ~2,600 small dispatches, and the
+desktop's work (or its own power policy) lands between them.
 
 ## One RX 480: 1920X + RX 480
 
@@ -431,12 +438,15 @@ with the kit and `-bs`):
 | | review | notes | review ÷ notes, shipped / kit |
 | --- | --- | --- | --- |
 | R9700, UD-Q4_K_XL whole | 64.1 / 69.1 / **92.9** | 64.3 / 82.7 / **96.6** | 0.84 / 0.96 |
-| RTX 4070 Ti, the hot spare at 6900 MiB | 23.9 / 32.5 / **39.4** | 23.8 / 38.4 / **42.1** | 0.85 / 0.93 |
+| RTX 4070 Ti, the hot spare at 8000 MiB, a minimal desktop | 35.1 / 56.9 / **59.7** | 35.9 / 55.3 / **63.6** | 1.03 / 0.94 |
 | one RX 480, the hot spare at 5000 MiB | 14.6 / 15.9 / **22.0** | 14.6 / 19.4 / **22.4** | 0.82 / 0.98 |
 
-The shipped drafter slows down on text it predicts badly (the review): it verifies four drafts every step, and on hard
-text most are rejected. The exit stops those drafts, so hard text runs almost as fast as easy text, and the kit's gain
-over no drafter is 1.8x the shipped drafter's on the review on the RTX 4070 Ti, and 2.0x at temperature 1.0. On the
+The shipped drafter slows down on text it predicts badly: it verifies four drafts every step, and on hard text most
+are rejected. The exit stops those drafts, so hard text runs almost as fast as easy text. On text the shipped drafter
+already drafts well the kit is 5–15% ahead (the RTX 4070 Ti's answers, whose text at temperature 0 depends on the
+cache's residency, came out easy for it: 61–70% of its drafts accepted on the review); where text is hard or the
+sampling hot its gain over no drafter is 1.4–2.2x the shipped drafter's (the R9700's review: 5.7x; the RTX 4070 Ti at
+temperature 1.0: 2.2x on the review, 1.4x on the notes). On the
 RX 480 the kit fits the 8 GB card (8.15 GB of VRAM at peak) with the cache's hits at 78.8% (80.2% with the shipped
 drafter).
 

@@ -809,7 +809,7 @@ tokens a batch (above `--moe-cache-batch`, so that kept batches still find the c
 prompt buffer goes from 7.9 to 1.7 GB.
 
 On the 14600KF + RTX 4070 Ti, Inkling 2 Mini UD-Q4_K_XL with the cache released above 512 tokens at `-ub 2048`: the
-review's 3.6k-token prompt reads at 712–726 tok/s with the prefetch and the aliases, 466–472 without them; the
+review's 3.6k-token prompt reads at 723–729 tok/s with the prefetch and the aliases, 466–472 without them; the
 perplexity of released batches is the same to the last digit with and without them
 ([Inkling 2 Mini's guide](inkling2-mini.md#released-prompts-and-the-drafter-on-the-rtx-4070-ti)).
 
