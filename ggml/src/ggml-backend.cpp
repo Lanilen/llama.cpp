@@ -1291,6 +1291,9 @@ struct ggml_backend_sched {
     // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
     ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS]; // created on first use, NULL if the backend has no events
     bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
+
+    // backends that take host inputs with set_tensor_async, see ggml_backend_dev_caps
+    bool fast_async_host_input[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_prefetched;
     int prefetch_split;     // the split that reads the prefetched inputs
@@ -2244,6 +2247,15 @@ static ggml_backend_t ggml_backend_sched_copy_input(ggml_backend_sched_t sched, 
         }
     }
 
+    // without pipeline parallelism the input copy has a single slot, so it can be written in order on the split backend
+    ggml_backend_buffer_t input_buf = input->view_src ? input->view_src->buffer : input->buffer;
+    if (sched->fast_async_host_input[split_backend_id] && sched->events[split_backend_id][sched->cur_copy] == NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            ggml_backend_buffer_is_host(input_buf) && !ggml_backend_sched_is_host_weight(input) && ggml_nbytes(input) > 0) {
+        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+        return split_backend;
+    }
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2406,8 +2418,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t t_copy_us = tm ? ggml_time_us() : 0;
         ggml_backend_t pending[GGML_SCHED_MAX_BACKENDS];
         int n_pending = 0;
+        bool host_read_pending = false;
         for (int pass = 0; pass < 2; pass++) {
             if (pass == 1) {
+                // the host data of async copies can be overwritten by later splits or by the user after this function returns
+                if (host_read_pending) {
+                    ggml_backend_synchronize(split_backend);
+                }
                 // after the copies above, which may read host memory reused by the copies of the next split
                 // before the weights, whose copy callback may queue large uploads
                 ggml_backend_sched_prefetch_inputs(sched, split_id);
@@ -2418,7 +2435,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     continue;
                 }
                 ggml_backend_t b = ggml_backend_sched_copy_input(sched, split, input);
-                if (b != NULL && std::find(pending, pending + n_pending, b) == pending + n_pending) {
+                if (b == split_backend) {
+                    // an asynchronous copy from host memory (fast_async_host_input): synchronized after this pass, before
+                    // the weights, whose copy callback may queue large uploads on it
+                    host_read_pending = true;
+                } else if (b != NULL && std::find(pending, pending + n_pending, b) == pending + n_pending) {
                     pending[n_pending++] = b;
                 }
             }
@@ -2572,6 +2593,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+
+        struct ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(ggml_backend_get_device(backends[b]), &props);
+        sched->fast_async_host_input[b] = props.caps.fast_async_host_input && backends[b]->iface.set_tensor_async != NULL && !ggml_backend_is_meta(backends[b]);
 
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
