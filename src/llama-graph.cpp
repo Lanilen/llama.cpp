@@ -3420,7 +3420,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
     if (use_flash_attn) {
-        GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+        GGML_ASSERT(kq_b == nullptr && "Flash attention does not support dense KQ bias");
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
@@ -3460,7 +3460,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const int64_t dense_bytes = bias_indices->ne[0] * bias_indices->ne[1] * q->ne[2] * (int64_t) sizeof(float);
             ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
             const auto dev = model.dev_layer(il);
-            if ((!kv_rows && dense_bytes <= dense_max) || !cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
+            // (upstream #33053: without KQV offload the CPU runs the indexed bias itself)
+            if ((!kv_rows && dense_bytes <= dense_max) || !dev || (!cparams.offload_kqv && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) ||
+                    !ggml_backend_dev_supports_op(dev, cur)) {
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                 cur->src[3] = dense_bias_mask();
             } else if (kv_rows) {
