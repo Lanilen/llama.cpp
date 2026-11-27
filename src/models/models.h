@@ -1668,6 +1668,8 @@ struct llama_model_dflash : public llama_model_base {
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();
+        void          build_inject_ctx_mix();
+        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
         ggml_tensor * build_logits(ggml_tensor * cur);
@@ -1711,6 +1713,9 @@ struct llama_model_dflash : public llama_model_base {
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);
+
+    // DSpark block input from mask_embd, run by the base layers and the Mistral Large 4 graph
+    static ggml_tensor * build_dspark_inp_block(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp_tokens);
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
@@ -2574,6 +2579,12 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // the normalized state stacks of mix(), keyed by their tensors
+        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & list);
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
+
+        std::map<int64_t, ggml_tensor *> zero_sinks; // by head count
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
