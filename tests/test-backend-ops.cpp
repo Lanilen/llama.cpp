@@ -9468,7 +9468,7 @@ struct test_bias_mask : public test_case {
 
 // Inkling 2's SITU activation of the experts, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb), as build_moe_ffn
 // builds it from the halves of the merged gate_up; the Vulkan backend fuses it (SITU)
-struct test_situ : public test_case {
+struct test_inkling_situ : public test_case {
     const int64_t n_ff, n_used, n_tokens;
     const bool scaled; // gate_up is first multiplied by a scale for each expert slot and token (SITU_SCALE)
 
@@ -9483,7 +9483,7 @@ struct test_situ : public test_case {
         return VARS_TO_STR4(n_ff, n_used, n_tokens, scaled);
     }
 
-    test_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1, bool scaled = false)
+    test_inkling_situ(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1, bool scaled = false)
         : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens), scaled(scaled) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -9723,7 +9723,7 @@ struct test_ctrl_blend : public test_case {
 
 // Inkling 2's depth mix: attention over the earlier block outputs (normalized) and the current state, as
 // llama_model_inkling2::graph::mix builds it; the Vulkan backend fuses it for one token and for a ubatch (DEPTH_MIX)
-struct test_depth_mix : public test_case {
+struct test_inkling_depth_mix : public test_case {
     const int64_t n_embd, n_blocks, n_query, n_tokens;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9743,7 +9743,7 @@ struct test_depth_mix : public test_case {
         return VARS_TO_STR4(n_embd, n_blocks, n_query, n_tokens);
     }
 
-    test_depth_mix(int64_t n_embd = 2304, int64_t n_blocks = 4, int64_t n_query = 3, int64_t n_tokens = 1)
+    test_inkling_depth_mix(int64_t n_embd = 2304, int64_t n_blocks = 4, int64_t n_query = 3, int64_t n_tokens = 1)
         : n_embd(n_embd), n_blocks(n_blocks), n_query(n_query), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10977,8 +10977,6 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     const ggml_type type_KV;
     const float logit_softcap;
     const bool mask_row;    // query 0 of each stream sees no key
-    const bool causal;      // prefix of 0 per query, -inf after, distance bins
-    const int64_t n_kv_max; // sparse hint
     const bool causal;      // prefix of 0 per query, -inf after, distance bins
     const int64_t n_kv_max; // sparse hint
 
@@ -15616,13 +15614,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_bias_mask(17, 3, 100, 5));
     for (int64_t n_tokens : { 1, 3, 512 }) {
-        test_cases.emplace_back(new test_situ(1152, 8, n_tokens));
+        test_cases.emplace_back(new test_inkling_situ(1152, 8, n_tokens));
     }
-    test_cases.emplace_back(new test_situ(100, 3, 7));
+    test_cases.emplace_back(new test_inkling_situ(100, 3, 7));
     for (int64_t n_tokens : { 1, 3, 512 }) {
-        test_cases.emplace_back(new test_situ(1152, 8, n_tokens, true));
+        test_cases.emplace_back(new test_inkling_situ(1152, 8, n_tokens, true));
     }
-    test_cases.emplace_back(new test_situ(100, 3, 7, true));
+    test_cases.emplace_back(new test_inkling_situ(100, 3, 7, true));
     for (bool scaled : { true, false }) {
         for (int64_t n_tokens : { 1, 3, 512 }) {
             test_cases.emplace_back(new test_moe_sum(2304, 8, n_tokens, scaled));
@@ -15660,14 +15658,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_embd : { 64, 2304 }) {
         for (int64_t n_blocks : { 1, 4, 8 }) {
             for (int64_t n_query : { 1, 3 }) {
-                test_cases.emplace_back(new test_depth_mix(n_embd, n_blocks, n_query, 1));
+                test_cases.emplace_back(new test_inkling_depth_mix(n_embd, n_blocks, n_query, 1));
             }
         }
     }
     // a prompt's ubatch: the queries repeated for each token, fused too (the shader reads the one query)
-    test_cases.emplace_back(new test_depth_mix(2304, 4, 3, 5));
-    test_cases.emplace_back(new test_depth_mix(2304, 2, 1, 512));
-    test_cases.emplace_back(new test_depth_mix(2304, 1, 4, 512));
+    test_cases.emplace_back(new test_inkling_depth_mix(2304, 4, 3, 5));
+    test_cases.emplace_back(new test_inkling_depth_mix(2304, 2, 1, 512));
+    test_cases.emplace_back(new test_inkling_depth_mix(2304, 1, 4, 512));
 
     for (bool with_bias : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,
