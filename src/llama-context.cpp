@@ -892,6 +892,13 @@ void llama_context::sched_drop() {
     sched.reset();
 }
 
+void llama_context::graph_results_drop() {
+    gf_res_prev_active = nullptr;
+    for (auto & s : graph_slots) {
+        s.active = false;
+    }
+}
+
 void llama_context::graph_slots_clear() {
     for (auto & s : graph_slots) {
         ggml_backend_sched_synchronize(s.sched.get());
@@ -2081,6 +2088,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
+        sampling.kinds.erase(seq_id);
         return false;
     }
 
@@ -2095,9 +2103,25 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        std::vector<const llama_sampler_i *> kinds;
+        for (int32_t i = 0; i < llama_sampler_chain_n(sampler); ++i) {
+            kinds.push_back(llama_sampler_chain_get(sampler, i)->iface);
+        }
+        const auto it = sampling.kinds.find(seq_id);
+        const bool same = it != sampling.kinds.end() && it->second == kinds;
 
-        sched_need_reserve = true;
+        sampling.samplers[seq_id] = sampler;
+        sampling.kinds[seq_id]    = std::move(kinds);
+
+        if (same) {
+            // a chain of the same kinds as the one before (a new request): the scheduler's buffers already fit its
+            // graphs (one whose sizes differ, e.g. another top-k, is reallocated when it is allocated), but every
+            // cached graph refers to the old chain's tensors. A re-reserve here cost each request a new scheduler,
+            // the reserve graphs and every cached graph's first allocation again (~0.1 s of an R9700 prompt).
+            graph_results_drop();
+        } else {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -2110,11 +2134,20 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
 
         sampling.samplers.erase(seq_id);
+        sampling.kinds.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
+
+    if (sampling.kinds.count(seq_id) > 0) {
+        // the server drops a request's chain at its end and sets the next request's: keep the scheduler (a graph
+        // without the sampler fits its buffers) and remember the kinds, so that a chain of the same kinds is not a
+        // re-reserve either
+        graph_results_drop();
+        return true;
+    }
 
     sched_need_reserve = true;
 
