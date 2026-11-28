@@ -210,6 +210,9 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // the end of a sequence's prompt (its token count), before its prompt batches; 0: unknown
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*end*/) {}
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1179,6 +1182,37 @@ public:
         }
     }
 
+    // the prompt's end per sequence (set_prompt_end): an injection chunk entirely older than it by more than the draft's
+    // sliding window and a margin writes only the full-attention layers (llama_set_inject_skip_swa): the sliding-window
+    // layers' K/V of those rows is never read by a draft (LLAMA_DFLASH_INJECT_ALL=1 writes every layer, as before;
+    // LLAMA_DFLASH_INJECT_SWA_MARGIN tokens, 256)
+    std::vector<llama_pos> prompt_end;
+    int64_t n_inject_rows = 0;
+    int64_t n_inject_rows_skip_swa = 0;
+
+    void set_prompt_end(llama_seq_id seq_id, llama_pos end) override {
+        if (n_inject_rows > 0) {
+            LOG_INF("%s: the draft's injection so far: %lld rows, %lld of them without the sliding-window layers\n", __func__,
+                (long long) n_inject_rows, (long long) n_inject_rows_skip_swa);
+        }
+        if (seq_id >= 0) {
+            if ((size_t) seq_id >= prompt_end.size()) {
+                prompt_end.resize(seq_id + 1, 0);
+            }
+            prompt_end[seq_id] = end;
+        }
+    }
+
+    bool inject_skip_swa(llama_seq_id seq_id, llama_pos pos_last) const {
+        static const bool all = getenv("LLAMA_DFLASH_INJECT_ALL") && atoi(getenv("LLAMA_DFLASH_INJECT_ALL")) != 0;
+        static const int32_t margin = getenv("LLAMA_DFLASH_INJECT_SWA_MARGIN") ? std::max(0, atoi(getenv("LLAMA_DFLASH_INJECT_SWA_MARGIN"))) : 256;
+        const int32_t n_swa = llama_model_n_swa(llama_get_model(params.ctx_dft));
+        if (all || n_swa <= 0 || seq_id < 0 || (size_t) seq_id >= prompt_end.size() || prompt_end[seq_id] <= 0) {
+            return false;
+        }
+        return pos_last < prompt_end[seq_id] - n_swa - margin;
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1241,7 +1275,12 @@ public:
                         batch_inject.add_embd_row(row, pos_arr, seq_id, false);
                     }
 
+                    const bool skip_swa = inject_skip_swa(seq_id, batch_inject.tokens.back().pos[0]);
+                    llama_set_inject_skip_swa(ctx_dft, skip_swa);
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    llama_set_inject_skip_swa(ctx_dft, false);
+                    n_inject_rows += n_chunk;
+                    n_inject_rows_skip_swa += skip_swa ? n_chunk : 0;
                     if (rc != 0) {
                         LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                                 __func__, rc, (int) n_chunk, (int) offset);
@@ -1272,7 +1311,12 @@ public:
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                const bool skip_swa = inject_skip_swa(seq_id, batch_inject.tokens.back().pos[0]);
+                llama_set_inject_skip_swa(ctx_dft, skip_swa);
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                llama_set_inject_skip_swa(ctx_dft, false);
+                n_inject_rows += n_chunk;
+                n_inject_rows_skip_swa += skip_swa ? n_chunk : 0;
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -3933,6 +3977,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos end) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, end);
     }
 }
 

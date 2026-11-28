@@ -1229,6 +1229,11 @@ extern "C" {
     // chain multiple trained NextN heads. Default 0 (first head).
     LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+    // A draft context's injection batches (DFlash / DSpark: the target's features into the draft's K/V) write only the
+    // layers that are not sliding-window while set: for prompt rows older than any draft's window, whose K/V those layers
+    // never read. Graphs built with and without it are not reused for each other.
+    LLAMA_API void llama_set_inject_skip_swa(struct llama_context * ctx, bool value);
+
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 

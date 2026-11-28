@@ -975,6 +975,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.inject_skip_swa != other.cparams.inject_skip_swa) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

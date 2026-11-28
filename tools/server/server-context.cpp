@@ -4071,6 +4071,10 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
+                        if (spec) {
+                            common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->n_tokens());
+                        }
+
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
