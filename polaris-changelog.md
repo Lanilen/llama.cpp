@@ -3,6 +3,55 @@
 What changed in the fork's `polaris` branch at each landing and each upstream merge, with the measurements that
 accepted it, newest first. [FORK.md](FORK.md) describes the fork as it is; this file is its history.
 
+## 2026-11-28: upstream merge 6 (to 8e23278c7) and the weekend's engine work
+
+`polaris` 4d5a0e84c → the merge of `start-skip` on 928002879. Upstream's 180 commits from f4f6f2e7d to 8e23278c7
+(master that day) in 17 stages A–Q, merges never rebases, each branch in the fork's order (log: lab-jobs
+`fork/merges/`, ~/ClaudeCode/upstream-merge-6/plan.md). Kept or adapted at the collisions:
+- **Inkling 2's graph:** the fork's mix() layout (its Vulkan fused mix reads it; upstream #32855 puts the scores first),
+  upstream's clip via `ggml_l2_norm` (#32940) taken, and the Vulkan `CLIP_ROWS` fusion taught that form ([MUL,] L2_NORM,
+  SCALE: without it Inkling generated 4.2% slower on the 1920X + R9700); upstream's Vulkan FA compact bias (#32898
+  final) in place of the fork's early copy of it.
+- **Quant scales (#28898):** upstream applies a weight's scale inside the mat-mul and gives its MoE cache per-slot scale
+  banks; the fork keeps a MUL_MAT_ID's per-expert scale in the graph, gathered by expert id from one flat copy of the
+  layer's selected experts, so the hot spare's slots need no banks (measured before the merge: an op-level scale gains
+  nothing over it, the flat gather +1.8% on the R9700's 1-token step). `ggml_mul_mat_id` may build a scaled type without
+  its scale, and the loader probes an expert tensor's placement without it (upstream's Vulkan takes no scaled op until
+  its #29791, so the experts would have gone to the CPU). The MoD heads take the full matrix's scale
+  (`build_lora_mm_rows`).
+- **Recurrent states read in place (#30139):** Inkling's conv history reads the gathered copy (`build_rs` gathered):
+  in place, the fused conv's output shared memory with its input and the allocator check cancelled `SSM_CONV_SPLIT`
+  (Inkling's prompts -2.7% on the R9700).
+- Smaller: the async host-input copies (#30685) folded into the fork's copy hook; the Vulkan ADD_ID dispatch puts the
+  tokens past 65,535 in z (upstream's new 70,000-token test; its Vulkan ADD_ID has the same limit); `test-moe-cache`'s
+  fixture lists per-expert scales and keeps K/V scales at 1 (upstream's loader makes a scale only where the file has
+  one).
+
+The weekend's branches, merged on top:
+- **`bs-reserve`:** a request's sampler chain of the same kinds as the last one keeps the scheduler (with `-bs` every
+  request re-reserved it: Inkling's prompts on the R9700 -bs 1,916 → 2,014 tok/s).
+- **`spec-bs-fast`:** with backend sampling the host's candidates are filled only when read, and the rejection verify
+  reads the backend's probabilities where they are (probabilistic drafting at temp 1.0 +3.9-7.6% on the R9700).
+- **`pin-exps`:** experts in pinned host memory (`--load-mode none` with `-ot ...=CPU`) upload straight from where they
+  are, the offload copies and the cache's own (the restore 547 → 269 ms on the RTX 4070 Ti).
+- **`inject-swa`:** the drafter's injection writes only the full-attention layer for prompt rows no draft window reaches
+  (exact; under 1% on the everyday prompts).
+- **`start-skip`:** with `--moe-cache-resize` the start predictor skips a prompt whose later batches release the cache
+  (`llama_set_prompt_end`, `LLAMA_MOE_PREDICTOR_START_ALWAYS=1` = before), and llama-server prepares each context
+  checkpoint's buffer on a thread (`LLAMA_CKPT_PREFAULT`, `LLAMA_CKPT_TIMING`).
+
+**Checks.** `moe-check` full on the RTX 4070 Ti: every fork check, ops 24,479 / 24,479; upstream's
+test-quant-type-selection fails on upstream's own tree too, test-conversion-fp8 needs a newer torch than the lora env's.
+The lab acceptance (perseus, final df17fa87c): logits within rounding, splits, groups, norm, rdna, ink, speed (Flash-Next
+Q4 / Q6 step within ±1%), GLM; its ops reran on e70126235 (24,479 / 24,479 on the R9700 and an RX 480); the canary's
+Flash-Next and RX480x2 references re-recorded after the merge. Inkling's perplexity on the 4070 Ti within rounding
+(7.4312 vs 7.4454). Inkling whole on the R9700 (llama-bench, 3 passes): UD-Q4_K_XL pp512 2,107 vs 2,102-2,107, tg128
+64.81 vs 64.45-64.50; Q8_0 2,322 vs 2,350-2,357, 59.96 vs 59.93-60.10.
+
+**The RTX 4070 Ti's everyday requests** (Kallista's preset with the kit, minimal desktop): prompts review 713 → 747
+tok/s, notes 649 → 686 with the file mapped, **910 and 825 with `--load-mode none`** (answers 52.5 → 53.8 and 54.3 →
+56.0); docs/inkling2-mini.md has the table.
+
 ## 2026-11-27: Inkling 2 Mini's Draft Kit, the Ti's prompts, and four fixes
 
 `polaris` 9408fc66d → 2d124df1a (the integration branch `integ-1127`), with no upstream commits. Merged:

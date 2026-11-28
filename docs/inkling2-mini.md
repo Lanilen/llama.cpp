@@ -188,6 +188,24 @@ of five passes): 34.9 / 42.3 / **51.4** tok/s on the review and 34.8 / 47.8 / **
 fit. The cache: 6900 / 7500 / 8000 / 8500 MiB serve 87.6 / 89.7 / 91.0 / 92.3% of the selections with the kit, at
 10.9 / 11.5 / 11.7 / 11.8 GB, with answers the same within the runs' spread from 7500 up.
 
+**Pinned experts and the prompt's edges** (the landing of 2026-11-28). With `--load-mode none` the experts sit in
+pinned host memory (`-ot _exps=CPU` puts them in Vulkan_Host when the file isn't mapped) and the uploads read them
+where they are, without the staging copy (it costs ~15 GB of RAM: the experts are no longer the file's pages). The
+cache's start prediction skips a prompt whose later batches release the cache (the restore predicts for the answer),
+and the server prepares each context checkpoint's buffer ahead (`LLAMA_CKPT_PREFAULT`). The everyday requests with the
+kit, minimal desktop, warm, two passes each:
+
+| | review: prompt, answer, request | notes: prompt, answer, request |
+| --- | --- | --- |
+| the build of 2026-11-27 | 713 tok/s, 52.5, 27.9 s | 649, 54.3, 21.7 s |
+| this landing, the file mapped | 747, 51.9, 27.9 s | 686, 55.1, 21.1 s |
+| this landing, `--load-mode none` | **910, 53.8, 26.3 s** | **825, 56.0, 20.1 s** |
+
+The checkpoints themselves split each prompt (upstream #20288: at the last user message, and 4 + n_ubatch and 4 tokens
+before its end), and on the RTX 4070 Ti those splits are most of what a prompt costs past its batches:
+`--ctx-checkpoints 0` reads the same prompts 37-44% faster, but a follow-up that diverges inside the cached prompt (a
+template that drops the last turn's thinking) then reads the whole conversation again.
+
 **The desktop on the same GPU costs about a third of the speed** with the experts in RAM: with a full desktop session
 on the card (0.55 GB, the same PowerMizer setting) every arm generated about a third slower, 23.9 / 32.5 / 39.4 and
 23.8 / 38.4 / 42.1 tok/s at 6900 MiB, the prompts the same. A generated token is ~2,600 small dispatches, and the
@@ -407,6 +425,14 @@ the first 18 layer visits (the first six layers and the first pass). Inkling's p
 and on one RX 480 with the hot spare and the predictor, the build with the drafter's support gives the same hits,
 predictions and text as the build without it. A predictor that read a later layer would collide with the drafter's
 taps.
+
+**The drafter's reading of the prompt.** The drafter injects the target's hidden states into its K/V for every prompt
+token; its two sliding-window layers (1,024) only ever read the prompt's last window, so for a long prompt the server
+gives the drafter the prompt's end (`common_speculative_set_prompt_end`) and an injection chunk older than it by the
+window and a margin writes only the full-attention layer (`llama_set_inject_skip_swa`). Exact (the same drafts and
+answers to the hash on both cards); on the everyday 3.5k prompts a third of the rows skip and the prompts gain under 1%
+(+0.6% / +0.3% on the R9700). `LLAMA_DFLASH_INJECT_ALL=1` writes every layer, `LLAMA_DFLASH_INJECT_SWA_MARGIN=N` the
+margin (default 256).
 
 ### The Draft Kit: a dictionary and a learned exit
 

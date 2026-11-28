@@ -197,6 +197,7 @@ Each option also reads its `LLAMA_ARG_` variable (`LLAMA_ARG_MOE_CACHE_PREDICTOR
 | `LLAMA_MOE_PREDICTOR_ANSWER_CAP=N` | the answer cap when the option isn't given (default 0: all) |
 | `LLAMA_MOE_PREDICTOR_ANSWER_LOG=1` | a log line for each answer's start: the swaps the prediction asks for, and how many of them gain at least 1, 2, 4, ... 64 selections |
 | `LLAMA_MOE_PREDICTOR_START_SWAPS=N` | the most experts the text start uploads during a prompt (default 1600) |
+| `LLAMA_MOE_PREDICTOR_START_ALWAYS=1` | with `--moe-cache-resize`, the text start predicts also for a prompt whose later batches release the cache (by default it skips them: the restore after the prompt uploads the answer's experts, and the start's swaps would be undone; the server gives the prompt's end, `llama_set_prompt_end`) |
 | `LLAMA_MOE_PREDICTOR_TOPUP=N` | after a text start, the most swaps the answer's start makes (default 1000) |
 
 ## Results

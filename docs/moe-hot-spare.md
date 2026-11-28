@@ -1151,6 +1151,8 @@ predictor the staging halves of the uploads are 512 MiB each, as with `LLAMA_MOE
 | `LLAMA_OFFLOAD_PREFETCH_SLOTS=N` | with the prefetch: the slots in the ring (default 3) |
 | `LLAMA_LOOP_EXPS_COPY=1` | a looped model's later passes read their experts and scales through aliases, each pass its own copy (needed by the prefetch on such a model) |
 | `LLAMA_LOOP_EXPS_COPY_MIN=N` | with `LLAMA_LOOP_EXPS_COPY`: from N tokens a batch (default 32) |
+| `LLAMA_CKPT_PREFAULT=0` | llama-server: the next context checkpoint's state buffer is not prepared ahead (by default it is allocated and its pages touched on a thread while the batches compute: a fresh 164 MiB buffer faulted its pages in during the state copy, 100-470 ms a checkpoint on the RTX 4070 Ti, 17-22 ms into touched pages) |
+| `LLAMA_CKPT_TIMING=1` | llama-server: log each context checkpoint's wait for the devices and its target and draft state copies |
 | `GGML_CPU_OP_STATS=1` | at exit, per batch size, each CPU op's wall time, its threads' work, and MUL_MAT_ID's experts and GB/s by weight type |
 | `GGML_CPU_MMID_PREFETCH=R` | the CPU's MUL_MAT_ID prefetches its weights R rows ahead; slower on the 1920X, kept to measure other CPUs |
 
