@@ -2475,13 +2475,21 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    static const bool ckpt_timing = getenv("LLAMA_CKPT_TIMING") != nullptr;
+    const int64_t t0 = ggml_time_us();
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    const int64_t t1 = ggml_time_us();
 
     data_tgt.resize(ckpt_size);
+    const int64_t t2 = ggml_time_us();
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+    if (ckpt_timing) {
+        LOG_INF("%s: checkpoint target state: size %.1f ms, resize %.1f ms, data %.1f ms (%.1f MiB)\n", __func__,
+            (t1 - t0)/1e3, (t2 - t1)/1e3, (ggml_time_us() - t2)/1e3, ckpt_size/1048576.0);
     }
 }
 
