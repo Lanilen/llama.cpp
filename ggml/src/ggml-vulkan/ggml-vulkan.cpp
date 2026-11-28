@@ -14414,7 +14414,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_L2_NORM:
-        ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
+        if (ctx->fused_clip_rows) {
+            // clip_l2_pattern: L2_NORM, SCALE
+            ggml_vk_clip_rows(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_UNARY:
