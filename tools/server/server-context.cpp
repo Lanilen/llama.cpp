@@ -4074,6 +4074,7 @@ private:
                         if (spec) {
                             common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->n_tokens());
                         }
+                        llama_set_prompt_end(ctx_tgt, slot.task->n_tokens());
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

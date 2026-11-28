@@ -2079,6 +2079,12 @@ void llama_context::set_inject_skip_swa(bool value) {
     cparams.inject_skip_swa = value;
 }
 
+void llama_context::set_prompt_end(llama_pos end) {
+    if (moe_cache) {
+        moe_cache->set_prompt_end(end);
+    }
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -5610,6 +5616,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_inject_skip_swa(llama_context * ctx, bool value) {
     ctx->set_inject_skip_swa(value);
+}
+
+void llama_set_prompt_end(llama_context * ctx, llama_pos end) {
+    ctx->set_prompt_end(end);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

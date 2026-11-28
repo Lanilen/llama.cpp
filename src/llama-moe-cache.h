@@ -170,6 +170,10 @@ public:
     // predictor, a turn's first prompt ubatch uploads the experts it predicts from the turn's text while it computes
     void before_ubatch(const llama_token * tokens, int64_t n_tokens, int64_t pos0 = -1, int gen = -1);
 
+    // the end of the prompt being read (its last position + 1): with resize, the start predictor skips a prompt whose
+    // later batches release the cache
+    void set_prompt_end(llama_pos end);
+
     // hot spare mode with a predictor: the layers whose input it reads at the newest token of each ubatch, empty = none
     const std::vector<int32_t> & predictor_layers() const;
 

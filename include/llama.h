@@ -1234,6 +1234,10 @@ extern "C" {
     // never read. Graphs built with and without it are not reused for each other.
     LLAMA_API void llama_set_inject_skip_swa(struct llama_context * ctx, bool value);
 
+    // The end of the prompt about to be read (its last position + 1), for the MoE cache: with --moe-cache-resize its
+    // start predictor skips a prompt whose later batches release the cache anyway
+    LLAMA_API void llama_set_prompt_end(struct llama_context * ctx, llama_pos end);
+
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
