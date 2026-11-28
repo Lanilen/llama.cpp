@@ -171,6 +171,15 @@ static gguf_context_ptr fixture_gguf(const llm_arch arch, const bool mtp) {
             t.type = fixture_expert_type(il - n_dense, FIX_N_LAYER - n_dense, down, down ? FIX_N_FF_EXP : n_embd);
             ggml_format_name(&t, "blk.%" PRIu32 ".%s.weight", il, name);
             gguf_add_tensor(ret.get(), &t);
+            // a per-expert weight scale (as NVFP4's): the loader makes a scale only where the metadata lists one (upstream
+            // #28898), and the graph applies it by expert id, in the hot spare's slots as elsewhere
+            ggml_tensor ts;
+            memset(&ts, 0, sizeof(ggml_tensor));
+            ts.type  = GGML_TYPE_F32;
+            ts.ne[0] = FIX_N_EXPERT;
+            ts.ne[1] = ts.ne[2] = ts.ne[3] = 1;
+            ggml_format_name(&ts, "blk.%" PRIu32 ".%s.scale", il, name);
+            gguf_add_tensor(ret.get(), &ts);
         }
     }
     return ret;
@@ -184,9 +193,9 @@ static void fixture_tensor_data(struct ggml_tensor * tensor, void * userdata) {
         ggml_backend_tensor_set(tensor, zero.data(), 0, ggml_nbytes(tensor));
         return;
     }
-    // the loader creates a per-tensor "<weight>.scale" for many weights, and the graph applies every one it finds: a real
-    // file carries only the ones its model was trained with, so here they are 1 (the per-expert scales stay random)
-    if (tensor->type == GGML_TYPE_F32 && ggml_nelements(tensor) == 1 && strstr(tensor->name, ".scale") != nullptr) {
+    // a per-tensor scale (a weight's "<weight>.scale", the KV cache's k_scale / v_scale, which upstream applies in the
+    // attention since #28898) is 1, as in a file without them; the per-expert scales the metadata lists stay random
+    if (tensor->type == GGML_TYPE_F32 && ggml_nelements(tensor) == 1 && strstr(tensor->name, "scale") != nullptr) {
         const float one = 1.0f;
         ggml_backend_tensor_set(tensor, &one, 0, sizeof(one));
         return;
