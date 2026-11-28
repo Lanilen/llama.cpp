@@ -8376,12 +8376,14 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
 static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const bool with_scale = cgraph->nodes[node_idx]->op == GGML_OP_MUL;
     const int  o          = with_scale ? 1 : 0;
+    // clip_l2(_scale)_pattern: L2_NORM, SCALE after the optional MUL
+    const bool l2         = cgraph->nodes[node_idx + o]->op == GGML_OP_L2_NORM;
     const ggml_tensor * x     = with_scale ? cgraph->nodes[node_idx]->src[0] : cgraph->nodes[node_idx]->src[0];
     const ggml_tensor * s     = with_scale ? cgraph->nodes[node_idx]->src[1] : nullptr;
-    const ggml_tensor * scale = cgraph->nodes[node_idx + o + 3];
-    const ggml_tensor * fill  = cgraph->nodes[node_idx + o + 4];
-    const ggml_tensor * clamp = cgraph->nodes[node_idx + o + 6];
-    ggml_tensor       * dst   = cgraph->nodes[node_idx + o + 7];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + o + (l2 ? 1 : 3)];
+    const ggml_tensor * fill  = l2 ? nullptr : cgraph->nodes[node_idx + o + 4];
+    const ggml_tensor * clamp = l2 ? nullptr : cgraph->nodes[node_idx + o + 6];
+    ggml_tensor       * dst   = cgraph->nodes[node_idx + o + (l2 ? 1 : 7)];
     VK_LOG_DEBUG("ggml_vk_clip_rows(" << x << ", " << s << ", " << dst << ")");
 
     vk_pipeline pipeline = ctx->device->pipeline_clip_rows_f32;
@@ -8401,9 +8403,10 @@ static void ggml_vk_clip_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
         s ? get_misalign_bytes(ctx, s) / (uint32_t)sizeof(float) : 0u,
         get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
         s ? 1u : 0u,
-        ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1),
-        ggml_get_op_params_f32(fill, 0),
-        ggml_get_op_params_f32(clamp, 0), ggml_get_op_params_f32(clamp, 1),
+        l2 ? 1.0f : ggml_get_op_params_f32(scale, 0), l2 ? 0.0f : ggml_get_op_params_f32(scale, 1),
+        l2 ? ggml_get_op_params_f32(scale, 0) : ggml_get_op_params_f32(fill, 0),
+        l2 ? 0.0f : ggml_get_op_params_f32(clamp, 0), l2 ? 0.0f : ggml_get_op_params_f32(clamp, 1),
+        l2 ? 1u : 0u, l2 ? ggml_get_op_params_f32(cgraph->nodes[node_idx + o], 0) : 0.0f,
     };
 
     const uint32_t nr = (uint32_t)ggml_nrows(x);
@@ -15793,6 +15796,46 @@ static bool ggml_vk_can_fuse_clip_rows(const struct ggml_cgraph * cgraph, int no
     return true;
 }
 
+// clip_l2_scale_pattern (with_scale) or clip_l2_pattern at node_idx: the row clip as upstream writes it since #32940,
+// scale(l2_norm(c, eps), s) with no bias, under the same conditions as ggml_vk_can_fuse_clip_rows
+static bool ggml_vk_can_fuse_clip_l2(const struct ggml_cgraph * cgraph, int node_idx, bool with_scale) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_CLIP_ROWS") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const auto & pattern = with_scale ? clip_l2_scale_pattern : clip_l2_pattern;
+    const int o    = with_scale ? 1 : 0;
+    const int last = node_idx + (int) pattern.size() - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, pattern, { last })) {
+        return false;
+    }
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    const ggml_tensor * l2    = cgraph->nodes[node_idx + o];
+    const ggml_tensor * out   = cgraph->nodes[last];
+    const ggml_tensor * x     = first->src[0];
+    const ggml_tensor * c     = with_scale ? first : x;
+    if (l2->src[0] != c || out->src[0] != l2 || ggml_get_op_params_f32(out, 1) != 0.0f) {
+        return false;
+    }
+    for (int i = node_idx; i <= last; ++i) {
+        if (cgraph->nodes[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || !ggml_is_contiguous_rows(x) ||
+        !ggml_is_contiguous(out) || !ggml_are_same_shape(x, out)) {
+        return false;
+    }
+    if (with_scale) {
+        const ggml_tensor * s = first->src[1];
+        if (s->type != GGML_TYPE_F32 || s->nb[0] != sizeof(float) || s->ne[0] != x->ne[0] || !ggml_can_repeat(s, x) ||
+            !ggml_are_same_shape(first, x)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // conv_split_pattern (dyn: conv_split_dyn_pattern) at node_idx: the graph llama_model_inkling2::graph::convolve
 // builds, f32, a conv of 4 taps, x = concat(past, transpose(cur)) whose last columns go to a contiguous cell of the
 // state, the residual cur itself; GGML_VK_DISABLE_CONV_SPLIT turns it off (the plain conv then takes CONV_RES)
@@ -17025,6 +17068,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_clip_rows = true;
                 fusion_string = "CLIP_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_clip_l2(cgraph, i, true) || ggml_vk_can_fuse_clip_l2(cgraph, i, false)) {
+                ctx->num_additional_fused_ops = cgraph->nodes[i]->op == GGML_OP_MUL ? (int) clip_l2_scale_pattern.size() - 1
+                                                                                     : (int) clip_l2_pattern.size() - 1;
+                ctx->fused_clip_rows = true;
+                fusion_string = "CLIP_ROWS";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_bias_mask(cgraph, i)) {
                 ctx->num_additional_fused_ops = (int) bias_mask_pattern.size() - 1;
                 ctx->fused_bias_mask = true;
@@ -17740,7 +17789,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     for (const auto * pat : { &topk_moe_early_softmax_norm, &topk_moe_sigmoid_norm_bias, &topk_moe_sigmoid_norm_bias_eps,
                               &topk_moe_sqrt_softplus_norm_bias, &topk_moe_early_softmax, &topk_moe_late_softmax, &snake_pattern,
                               &mm_scale_unary_pattern, &mm_unary_pattern, &depth_mix_pattern, &clip_rows_scale_pattern,
-                              &clip_rows_pattern, &ssm_conv_res_scale_pattern, &concat_rms_norm_pattern,
+                              &clip_rows_pattern, &clip_l2_scale_pattern, &clip_l2_pattern, &ssm_conv_res_scale_pattern, &concat_rms_norm_pattern,
                               &rms_norm_mul_add_mul_pattern, &rms_norm_mul_add_pattern, &rms_norm_mul_rope_view_set_rows_pattern,
                               &rms_norm_view_set_rows_pattern, &rope_view_set_rows_pattern, &hc_post_gate_pattern }) {
         const int len = (int) pat->size();
@@ -17900,6 +17949,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             };
             bool kept = false;
             for (const auto * pat : { &depth_mix_pattern, &depth_mix_rep_pattern, &clip_rows_scale_pattern, &clip_rows_pattern,
+                                      &clip_l2_scale_pattern, &clip_l2_pattern,
                                       &ssm_conv_res_scale_pattern, &ctrl_blend_tanh_pattern, &ctrl_blend_pattern, &concat_rms_norm_pattern,
                                       &conv_split_dyn_pattern, &conv_split_pattern, &situ_scale_pattern, &situ_pattern, &bias_mask_pattern }) {
                 if (match_pattern(*pat, first_unused)) {
@@ -18070,6 +18120,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 (match_pattern(mm_unary_pattern, j) && ggml_vk_is_mm_unary_at(graph, j)) ||
                 match_pattern(depth_mix_pattern, j) ||
                 match_pattern(clip_rows_scale_pattern, j) || match_pattern(clip_rows_pattern, j) ||
+                match_pattern(clip_l2_scale_pattern, j) || match_pattern(clip_l2_pattern, j) ||
                 match_pattern(ssm_conv_res_scale_pattern, j) || match_pattern(concat_rms_norm_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||

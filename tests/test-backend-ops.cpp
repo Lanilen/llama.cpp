@@ -9423,6 +9423,7 @@ struct test_clip_rows : public test_case {
     const std::array<int64_t, 3> ne; // x: [head size, heads, tokens]
     const bool with_scale;
     const float threshold;
+    const bool l2; // as upstream writes it since #32940: scale(l2_norm(c, threshold), threshold)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9432,11 +9433,11 @@ struct test_clip_rows : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(ne, with_scale, threshold);
+        return VARS_TO_STR4(ne, with_scale, threshold, l2);
     }
 
-    test_clip_rows(std::array<int64_t, 3> ne = {128, 24, 1}, bool with_scale = true, float threshold = 2.0f)
-        : ne(ne), with_scale(with_scale), threshold(threshold) {}
+    test_clip_rows(std::array<int64_t, 3> ne = {128, 24, 1}, bool with_scale = true, float threshold = 2.0f, bool l2 = false)
+        : ne(ne), with_scale(with_scale), threshold(threshold), l2(l2) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
@@ -9445,6 +9446,11 @@ struct test_clip_rows : public test_case {
             ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
             ggml_set_name(scale, "scale");
             cur = ggml_mul(ctx, cur, scale);
+        }
+        if (l2) {
+            ggml_tensor * out = ggml_scale(ctx, ggml_l2_norm(ctx, cur, threshold), threshold);
+            ggml_set_name(out, "out");
+            return out;
         }
         ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
         norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
@@ -15665,7 +15671,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool with_scale : { true, false }) {
         for (std::array<int64_t, 3> ne : { std::array<int64_t, 3>{128, 24, 1}, {128, 8, 3}, {16, 24, 7}, {128, 24, 512} }) {
             for (float threshold : { 0.5f, 22.6f }) {
-                test_cases.emplace_back(new test_clip_rows(ne, with_scale, threshold));
+                for (bool l2 : { false, true }) {
+                    test_cases.emplace_back(new test_clip_rows(ne, with_scale, threshold, l2));
+                }
             }
         }
     }
