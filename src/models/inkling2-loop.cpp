@@ -53,7 +53,7 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     for (uint32_t il = core_start; il < core_end; ++il) {
         auto & l = loop_layers[il - core_start];
         // the q, k, v and ffn message queries
-        l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, 0);
+        l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, TENSOR_NO_SCALE);
         for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
             l.ctrl_down[c]   = create_tensor(tn(down[c],   "weight", il), {2*n_embd, rank}, 0);
             l.ctrl_gain[c]   = create_tensor(tn(gain[c],   "weight", il), {rank, n_embd}, 0);
@@ -95,12 +95,16 @@ void llama_model_inkling2_loop::make_exps_alias() const {
             a->data   = w->data;
             // a weight's scale (NVFP4's per-expert scales) is found by the weight's tensor (w_scales): the alias gets an
             // alias of the scale too, so that each pass also has a copy of its own (without it the passes ran unscaled)
-            if (ggml_tensor * ws = get_w_scale(w)) {
+            auto & scales = const_cast<llama_weight_scales &>(w_scales);
+            if (ggml_tensor * ws = scales.get(w)) {
                 ggml_tensor * as = ggml_dup_tensor(alias_ctx, ws);
                 ggml_format_name(as, "%s.slot%d", ws->name, il);
                 as->buffer = ws->buffer;
                 as->data   = ws->data;
-                const_cast<std::unordered_map<const ggml_tensor *, ggml_tensor *> &>(w_scales).emplace(a, as);
+                scales.scale.emplace(a, as);
+            }
+            if (ggml_tensor * xs = scales.get_input(w)) {
+                scales.input_scale.emplace(a, xs); // read by an op-level scale only, never written: shared
             }
             exps_alias[il][k] = a;
             n_made++;
