@@ -12,6 +12,7 @@ layout (push_constant) uniform parameter
     uint s02;
     uint s11;
     uint s21;
+    uint ne2;
 } p;
 
 #define BLOCK_SIZE 512
@@ -25,7 +26,10 @@ layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
 
 void main() {
     const uint i1 = gl_WorkGroupID.x;
-    const uint i2 = gl_WorkGroupID.y;
+    const uint i2 = gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y;
+    if (i2 >= p.ne2) {
+        return;
+    }
 
     const int i11 = data_c[i1 + i2 * p.s21];
 
