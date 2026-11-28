@@ -4,17 +4,6 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
-// MoD: a matrix of the dictionary's rows (llama-mod-dict.cpp) gets no scale of its own in the model's scale map; it
-// takes the full matrix's: a scalar applies to its rows as it is, a per-row scale would need the dictionary's rows
-static ggml_tensor * mod_rows_mm(const llm_graph_context & g, ggml_tensor * rows, ggml_tensor * full, ggml_tensor * cur) {
-    ggml_tensor * res = g.build_lora_mm(rows, cur);
-    if (ggml_tensor * s = g.get_weight_scale(full); s != nullptr && g.get_weight_scale(rows) == nullptr) {
-        GGML_ASSERT(ggml_nelements(s) == 1 && "MoD: a per-row weight scale of the full matrix is not supported");
-        res = ggml_mul(g.ctx0, res, s);
-    }
-    return res;
-}
-
 
 // DeepSeek-V4 DSpark backbone: stages are full DSV4 blocks, uniform sliding window (the draft KV ring)
 void llama_model_dflash::load_hparams_dsv4(llama_model_loader & ml) {
@@ -418,7 +407,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             markov = ggml_tanh(ctx0, chunk(2));
         }
 
-        ggml_tensor * bias = model.mod_w2 ? mod_rows_mm(g, model.mod_w2, w2, markov) : g.build_lora_mm(w2, markov); // [n_vocab_draft or K, n_blocks]
+        ggml_tensor * bias = model.mod_w2 ? g.build_lora_mm_rows(model.mod_w2, w2, markov) : g.build_lora_mm(w2, markov); // [n_vocab_draft or K, n_blocks]
         if (model.dspark_markov_w2_b) {
             bias = ggml_add(ctx0, bias, model.mod_w2 ? model.mod_w2_b : model.dspark_markov_w2_b);
         }

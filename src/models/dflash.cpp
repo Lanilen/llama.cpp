@@ -556,22 +556,11 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
     return cur;
 }
 
-// MoD: a matrix of the dictionary's rows (llama-mod-dict.cpp) gets no scale of its own in the model's scale map; it
-// takes the full matrix's: a scalar applies to its rows as it is, a per-row scale would need the dictionary's rows
-static ggml_tensor * mod_rows_mm(const llm_graph_context & g, ggml_tensor * rows, ggml_tensor * full, ggml_tensor * cur) {
-    ggml_tensor * res = g.build_lora_mm(rows, cur);
-    if (ggml_tensor * s = g.get_weight_scale(full); s != nullptr && g.get_weight_scale(rows) == nullptr) {
-        GGML_ASSERT(ggml_nelements(s) == 1 && "MoD: a per-row weight scale of the full matrix is not supported");
-        res = ggml_mul(g.ctx0, res, s);
-    }
-    return res;
-}
-
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur, bool mod_slots) {
     auto * output = get_lm_head(*this, model);
     if (model.mod_head) {
         // MoD: the head's rows of the dictionary, the logits scattered back to the vocabulary (-inf elsewhere)
-        cur = mod_rows_mm(*this, model.mod_head, output, cur);
+        cur = build_lora_mm_rows(model.mod_head, output, cur);
         if (mod_slots) {
             cb(cur, "result_output_slots", -1);
             res->t_logits = cur;

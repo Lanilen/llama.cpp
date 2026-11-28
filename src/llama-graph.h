@@ -1220,6 +1220,13 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur) const;
 
+    // build_lora_mm of a matrix of some of the rows of `full` (the MoD dictionary's heads, llama-mod-dict.cpp), which has
+    // no entry in the scale map: it takes the scale of `full` (a scalar; a per-row scale is refused)
+    ggml_tensor * build_lora_mm_rows(
+              ggml_tensor * rows,
+              ggml_tensor * full,
+              ggml_tensor * cur) const;
+
     // do mat_mul_id, while optionally apply lora and the weight scale (in the graph, gathered by expert id)
     // if slots is set, the experts are read from the MoE cache at these slots (see llama_moe_cache::build_lookup)
     // if ids_s is set, it selects the per-expert scales instead of ids, which may skip experts with -1; a 1-D ids_s is the

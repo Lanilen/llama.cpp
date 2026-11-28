@@ -1948,6 +1948,18 @@ llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
     return result;
 }
 
+ggml_tensor * llm_graph_context::build_lora_mm_rows(
+          ggml_tensor * rows,
+          ggml_tensor * full,
+          ggml_tensor * cur) const {
+    ggml_tensor * res = build_lora_mm(rows, cur);
+    if (ggml_tensor * s = get_weight_scale(full); s != nullptr && get_weight_scale(rows) == nullptr) {
+        GGML_ASSERT(ggml_nelements(s) == 1 && "a per-row weight scale of the full matrix is not supported");
+        res = ggml_mul(ctx0, res, s);
+    }
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
