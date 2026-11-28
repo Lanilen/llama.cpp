@@ -8,7 +8,8 @@
 //   n   = sqrt(sum(c*c))*norm_scale + norm_bias
 //   dst = c*clamp(threshold/n, clamp_lo, clamp_hi)
 //
-// the graph's MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP and MUL in one pass, one workgroup a row
+// the graph's MUL, SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP and MUL in one pass, one workgroup a row; or, with l2,
+// the same clip as upstream writes it since #32940, MUL, L2_NORM and SCALE: dst = c*threshold/max(n, l2_eps)
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 128;
 
@@ -32,6 +33,8 @@ layout(push_constant) uniform parameter
     float threshold;
     float clamp_lo;
     float clamp_hi;
+    uint l2;
+    float l2_eps;
 } p;
 
 layout(binding = 0) readonly buffer X {float data_x[];};
@@ -74,8 +77,14 @@ void main() {
         barrier();
     }
 
-    const float n = sqrt(sums[0]) * p.norm_scale + p.norm_bias;
-    const float f = clamp(p.threshold / n, p.clamp_lo, p.clamp_hi);
+    float f;
+    if (p.l2 != 0) {
+        // as L2_NORM, then SCALE: c*(1/max(n, eps))*threshold
+        f = (1.0f / max(sqrt(sums[0]), p.l2_eps)) * p.threshold;
+    } else {
+        const float n = sqrt(sums[0]) * p.norm_scale + p.norm_bias;
+        f = clamp(p.threshold / n, p.clamp_lo, p.clamp_hi);
+    }
 
     [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
         float c = data_x[x_base + i0];
