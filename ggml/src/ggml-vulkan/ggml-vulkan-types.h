@@ -639,6 +639,9 @@ static constexpr std::initializer_list<ggml_op> clip_rows_scale_pattern { GGML_O
     GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> clip_rows_pattern { GGML_OP_SQR, GGML_OP_SUM_ROWS,
     GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+// the same clip as upstream writes it since #32940: scale(l2_norm(c, eps), s) = c*s/max(|c|, eps)
+static constexpr std::initializer_list<ggml_op> clip_l2_scale_pattern { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
+static constexpr std::initializer_list<ggml_op> clip_l2_pattern { GGML_OP_L2_NORM, GGML_OP_SCALE };
 // the edges after the leading MUL, as {dst, src slot, src} with the indices of clip_rows_pattern
 static constexpr std::initializer_list<std::array<int, 3>> clip_rows_edges {
     { 1, 0, 0 }, // sum_rows->src[0] == sqr

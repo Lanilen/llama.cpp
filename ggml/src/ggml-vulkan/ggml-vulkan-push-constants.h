@@ -251,6 +251,8 @@ struct vk_op_clip_rows_push_constants {
     float threshold;
     float clamp_lo;
     float clamp_hi;
+    uint32_t l2;    // the l2_norm form: dst = c*threshold/max(n, l2_eps) (upstream #32940)
+    float l2_eps;
 };
 
 struct vk_op_ctrl_blend_push_constants {
