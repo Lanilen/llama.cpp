@@ -421,6 +421,10 @@ private:
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
 
+        // each sequence's chain as its samplers' kinds (iface): a new chain of the same kinds builds the same graph
+        // shape, so set_sampler keeps the scheduler and rebuilds only the graphs (the server makes a chain a request)
+        std::map<llama_seq_id, std::vector<const llama_sampler_i *>> kinds;
+
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
@@ -485,6 +489,7 @@ private:
     graph_slot *           graph_slot_for(const llama_ubatch & ubatch);
     void                   graph_slots_clear();
     void                   sched_drop();   // the main scheduler and the slots
+    void                   graph_results_drop();   // no cached graph is reused: the next batch builds its graph again
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
