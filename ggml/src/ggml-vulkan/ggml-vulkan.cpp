@@ -11480,7 +11480,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         } break;
     case GGML_OP_ADD_ID:
         {
-            elements = { (uint32_t)ne01, (uint32_t)ne02, 1 };
+            // a workgroup per row and token; the tokens past the device's y limit (65535: upstream's 70000-token
+            // test, #33162) continue in z
+            const uint32_t max_y = ctx->device->properties.limits.maxComputeWorkGroupCount[1];
+            elements = { (uint32_t)ne01, std::min((uint32_t)ne02, max_y), CEIL_DIV((uint32_t)ne02, max_y) };
         } break;
     case GGML_OP_SET_ROWS:
         {
@@ -11876,6 +11879,7 @@ void ggml_vk_add_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
         (uint32_t)src0->nb[2] / src0_type_size,
         (uint32_t)src1->nb[1] / src1_type_size,
         (uint32_t)src2->nb[1] / src2_type_size,
+        (uint32_t)dst->ne[2],
     });
 }
 

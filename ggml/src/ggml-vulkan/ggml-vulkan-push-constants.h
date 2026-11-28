@@ -590,6 +590,7 @@ struct vk_op_add_id_push_constants {
     uint32_t s02;
     uint32_t s11;
     uint32_t s21;
+    uint32_t ne2; // the tokens: past maxComputeWorkGroupCount[1] they continue in z
 };
 
 struct vk_op_rope_push_constants {
