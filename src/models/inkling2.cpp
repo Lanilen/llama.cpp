@@ -364,7 +364,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+    // the gathered copy, not the cache read in place (upstream #30139): the Vulkan backend's fused conv (SSM_CONV_SPLIT)
+    // reads the history and writes the new state into the same cells, and the in-place read made its output share memory
+    // with its input, so the fusion was cancelled (Inkling's prompts on the 1920X + R9700 -2.7%)
+    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs, nullptr, /* gathered = */ true);
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
 
     ggml_tensor * inpSA = cur;
