@@ -357,6 +357,9 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
     cb(inp_g, "inp_g_embeddings", -1);
 
     for (int il = 0; il < n_layer; ++il) {
+        if (cparams.inject_skip_swa && use_iswa && hparams.is_swa(il)) {
+            continue; // rows no draft's window reaches (llama_set_inject_skip_swa)
+        }
         const auto & layer = model.layers[il];
 
         ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
@@ -411,6 +414,9 @@ void llama_model_dflash::graph_base::build_inject_ctx_mix() {
     }
 
     for (int il = 0; il < n_layer; ++il) {
+        if (cparams.inject_skip_swa && use_iswa && hparams.is_swa(il)) {
+            continue; // rows no draft's window reaches (llama_set_inject_skip_swa)
+        }
         const auto & layer = model.layers[il];
         GGML_ASSERT(layer.dflash_ctx_mix && "DFlash draft without fc requires per-layer ctx_mix");
 

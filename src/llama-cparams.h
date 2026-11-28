@@ -21,6 +21,7 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+    bool     inject_skip_swa = false; // a draft's injection batch writes only the layers that are not sliding-window (see llama_set_inject_skip_swa)
 
     float rope_freq_base;
     float rope_freq_scale;

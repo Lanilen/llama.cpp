@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include <future>
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -265,6 +266,28 @@ struct server_batch {
 };
 
 struct server_slot {
+    // the next context checkpoint's target state buffer, allocated and its pages touched on a thread while the batches
+    // compute: a fresh buffer faults its pages in during the state copy (164 MiB took 100-470 ms on the RTX 4070 Ti,
+    // ~17 ms into touched pages); LLAMA_CKPT_PREFAULT=0 allocates in the copy as before
+    std::future<common_state_data> ckpt_spare;
+    size_t ckpt_spare_size = 0;
+
+    void ckpt_prefault(size_t size) {
+        static const bool on = !getenv("LLAMA_CKPT_PREFAULT") || atoi(getenv("LLAMA_CKPT_PREFAULT")) != 0;
+        if (!on || size < (32u << 20) || ckpt_spare.valid()) {
+            return;
+        }
+        ckpt_spare_size = size;
+        ckpt_spare = std::async(std::launch::async, [size]() {
+            common_state_data d;
+            d.resize(size);
+            for (size_t k = 0; k < size; k += 4096) {
+                d[k] = 0; // touch every page
+            }
+            return d;
+        });
+    }
+
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -2738,7 +2761,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if ((*it)->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                        it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
                 }
@@ -2748,6 +2771,11 @@ private:
         auto ckpt = std::make_shared<common_prompt_checkpoint>();
         auto & cur = *ckpt;
 
+        // the spare is the size of a checkpoint past the sliding window: one near the prompt's start is small
+        if (slot.ckpt_spare.valid() && slot.prompt.n_tokens() - n_tokens_cur >= 512) {
+            cur.data_tgt = slot.ckpt_spare.get();
+        }
+
         cur.id_task = id_task;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -2755,12 +2783,30 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        // LLAMA_CKPT_TIMING=1: the checkpoint's wait for the devices and its copies, apart
+        static const bool ckpt_timing = getenv("LLAMA_CKPT_TIMING") != nullptr;
+        const int64_t t_ck0 = ggml_time_us();
+        if (ckpt_timing) {
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) {
+                llama_synchronize(ctx_dft);
+            }
+        }
+        const int64_t t_ck1 = ggml_time_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_ck2 = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (ckpt_timing) {
+            SLT_INF(slot, "checkpoint timing: sync %.1f ms, target %.1f ms (%.1f MiB), draft %.1f ms (%.1f MiB)\n",
+                (t_ck1 - t_ck0)/1e3, (t_ck2 - t_ck1)/1e3, cur.data_tgt.size()/1048576.0, (ggml_time_us() - t_ck2)/1e3, cur.data_dft.size()/1048576.0);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         slot.prompt.checkpoints.push_back(std::move(ckpt));
+
+        // the next one's buffer, while the next batches compute
+        slot.ckpt_prefault(slot.prompt.checkpoints.back()->data_tgt.size());
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -4070,6 +4116,11 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+
+                        if (spec) {
+                            common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->n_tokens());
+                        }
+                        llama_set_prompt_end(ctx_tgt, slot.task->n_tokens());
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

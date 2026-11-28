@@ -806,6 +806,8 @@ struct llama_moe_cache::impl {
     size_t   lent_slots = 0;    // slots lent, over all lends and groups
     int64_t  t_lend_us = 0;
     int64_t  n_ubatch = 0;  // ubatches computed (before_ubatch), the jit fills the maps once per ubatch and layer
+    llama_pos prompt_end = 0; // the running prompt's end (set_prompt_end), 0: unknown
+    int64_t  n_start_skipped = 0; // start predictions skipped because the prompt's next batches release the cache
     jit_stats jit_st;
     static inline const bool offload_check = getenv("LLAMA_OFFLOAD_FAST_CHECK") && atoi(getenv("LLAMA_OFFLOAD_FAST_CHECK")) != 0;
     struct offload_part {
@@ -814,9 +816,11 @@ struct llama_moe_cache::impl {
         size_t offset, n;
     };
     std::vector<offload_part> offload_parts;
+    size_t n_direct_uploads = 0; // the cache's expert uploads straight from pinned host experts
     struct offload_stats {
         size_t  checked = 0, bad = 0;
         size_t  bytes = 0, uploads = 0, finishes = 0;
+        size_t  direct = 0; // uploads straight from pinned host experts (no staging copy)
         size_t  verify_checked = 0, verify_bad = 0; // LLAMA_MOE_CACHE_VERIFY, see verify_resident
         int64_t t_wait_us = 0; // waiting for a half's uploads before reusing it
         int64_t t_copy_us = 0; // the copies to the staging memory at the end of a tensor
@@ -1588,6 +1592,14 @@ struct llama_moe_cache::impl {
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const size_t expert_size = l.experts[ip]->nb[2];
             if (bg) {
+                // an expert in the device's pinned host memory (-ot _exps=CPU --load-mode none puts them in its host
+                // buffer type) uploads from where it is: no staging copy, no half to wait for
+                const uint8_t * pinned = (const uint8_t *) l.experts[ip]->data + e*expert_size;
+                if (d.upload_bg(d.backend, g.banks[ip], pinned, s*expert_size, expert_size)) {
+                    d.bg_recorded = true;
+                    n_direct_uploads++;
+                    continue;
+                }
                 // a full half is submitted, the other half is reused once its uploads are done
                 if (d.staging_used + expert_size > half_size) {
                     const int64_t t0_us = ggml_time_us();
@@ -2066,6 +2078,13 @@ struct llama_moe_cache::impl {
         }
         turn_seen = true;
         if (!predictor_start || released || tokens == nullptr || start_swaps == 0 || tok_embd == nullptr) {
+            return;
+        }
+        // with resize, a prompt whose later batches are large releases the cache before its answer, and the restore
+        // uploads the answer's predicted experts then: the start's swaps would only be undone
+        static const bool start_always = getenv("LLAMA_MOE_PREDICTOR_START_ALWAYS") && atoi(getenv("LLAMA_MOE_PREDICTOR_START_ALWAYS")) != 0;
+        if (resize && !start_always && pos0 >= 0 && prompt_end > 0 && prompt_end - (pos0 + n_tokens) > hot_batch) {
+            n_start_skipped++;
             return;
         }
         const int64_t t_start_us = ggml_time_us();
@@ -3212,6 +3231,17 @@ struct llama_moe_cache::impl {
         if (drain) {
             ggml_backend_synchronize(backend);
         }
+        // experts in the device's pinned host memory (-ot ...=Vulkan_Host) upload from where they are: no staging
+        if (d.upload_bg && d.upload_bg(backend, dst, src, offset, size)) {
+            d.bg_recorded = true;
+            if (offload_check) {
+                offload_parts.push_back({ dst, src, offset, size });
+            }
+            offload_st.bytes += size;
+            offload_st.uploads++;
+            offload_st.direct++;
+            return true;
+        }
         const size_t half_size = d.staging_size/2;
         static const size_t job_size = 16*1024*1024; // the copy threads take the copies in pieces of this size
         bool first = true;
@@ -3389,6 +3419,12 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST: %.2f GiB of host experts in %zu uploads for %zu tensors; %.2f s waiting for a half's "
                 "uploads, %.2f s copying at the end of a tensor\n", offload_st.bytes/1073741824.0, offload_st.uploads, offload_st.finishes,
                 offload_st.t_wait_us/1e6, offload_st.t_copy_us/1e6);
+            if (n_direct_uploads > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: %zu expert uploads of the cache straight from pinned host experts\n", n_direct_uploads);
+            }
+            if (offload_st.direct > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST: %zu of the uploads straight from pinned host experts\n", offload_st.direct);
+            }
             if (offload_check) {
                 LLAMA_LOG_INFO("llama_moe_cache: LLAMA_OFFLOAD_FAST_CHECK: %zu parts read back, %zu differ\n", offload_st.checked, offload_st.bad);
             }
@@ -3453,6 +3489,9 @@ struct llama_moe_cache::impl {
                     - spare_restore.t_sync_us)/1000.0/n_restores : 0.0);
         }
         if (predictor) {
+            if (n_start_skipped > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %lld prompt starts skipped (their later batches release the cache)\n", (long long) n_start_skipped);
+            }
             LLAMA_LOG_INFO("llama_moe_cache: hot spare, predictor: %zu predictions, %.2f ms each%s\n",
                 n_pred, n_pred > 0 ? t_pred_us/1000.0/n_pred : 0.0,
                 answer_cap > 0 ? format(" (an answer's start without a text start: at most %zu swaps)", answer_cap).c_str() : "");
@@ -3547,6 +3586,10 @@ void llama_moe_cache::prepare_batch(int64_t n_tokens) {
 
 void llama_moe_cache::update(int64_t n_tokens, int64_t pos0, int gen) {
     pimpl->update(n_tokens, pos0, gen);
+}
+
+void llama_moe_cache::set_prompt_end(llama_pos end) {
+    pimpl->prompt_end = end;
 }
 
 void llama_moe_cache::before_ubatch(const llama_token * tokens, int64_t n_tokens, int64_t pos0, int gen) {
